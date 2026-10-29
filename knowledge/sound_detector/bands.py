@@ -9,6 +9,11 @@ so it ports to C++ as ~300 lines with zero dependencies.
 
 import numpy as np
 
+try:
+    import mod
+except ImportError:
+    mod = None
+
 FS = 16000
 CENTERS = (100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300)  # 2/3 octave
 Q = 1.2
@@ -137,13 +142,27 @@ def classify(x, fs=FS):
     if f["rms_db"] < -50:
         return "silence", f
     if f["fades"] == 0:
-        # nothing fades: stationary. Flat spectrum -> hiss, peaks -> drone/pad.
+        # no fades of >= 20 dB.  A dense mix's decays are often shallow,
+        # so the beat clock is the vote that separates "stationary music"
+        # from "stationary hiss".
+        if mod is not None:
+            for c in CENTERS:
+                freq, conf = mod.beat(_env(_filt(x, *_bp(c), n=512)))
+                if conf > 0.3 and freq > 0:
+                    return "music", f
         return ("noise" if f["band_std"] < 4.5 else "music"), f
     # voice: a handful of harmonics, all fading at once -> many short descents
     # music: many freqs fading at staggered times -> few short descents
     # measured on this box: voice ~12 short/11 total, music ~1 short/3 total
     if f["short_fades"] > f["fades"] * 0.33:
         return "voice", f
+    # a syllable clock is the vote that survives voice-over-music
+    # (unison fades break down when a song overlays a voice)
+    if mod is not None:
+        for c in CENTERS:
+            freq, conf = mod.syllables(_env(_filt(x, *_bp(c), n=512)))
+            if conf > 0.3 and 3.0 <= freq <= 8.0:
+                return "voice", f
     if f["fades"] >= 2:
         return "music", f
     return ("voice" if f["spread_hz"] > 700 else "music"), f
