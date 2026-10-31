@@ -206,6 +206,124 @@ static Result build_dynamic_masks(Band *bands,int env_count,int *frame_count,int
     *frame_count=frames; *labels_out=labels; return Result::success();
 }
 
+/*
+ * Deterministic speech-event grammar.
+ *
+ * This is deliberately not a trained classifier. It detects two primitive
+ * acoustic events:
+ *   C: a sufficiently energetic, mostly aperiodic, high-ZCR/high-band event
+ *   V: a periodic interval with a broad, non-flat resonant spectral envelope
+ * A V event is accepted only when a C event occurs nearby in time. This
+ * encodes a weak consonant-vowel ordering prior, not a phoneme recognizer.
+ */
+static const int SPEECH_HOP = 160;       // 10 ms
+static const int SPEECH_FRAME = 400;     // 25 ms
+struct SpeechFrame { float rms, periodicity, zcr, high_ratio, resonance; int consonant, vowel; };
+static float sample_rms(const float *x, int start, int count) {
+    double e=0; for(int i=0;i<count;i++){double v=x[start+i];e+=v*v;}
+    return (float)sqrt(e/count);
+}
+static float frame_periodicity(const float *x,int start,int count) {
+    double best=0.0, energy=0.0;
+    for(int i=0;i<count;i++){double v=x[start+i];energy+=v*v;}
+    if(energy<1e-9) return 0.0f;
+    const int min_lag=SAMPLE_RATE/400, max_lag=SAMPLE_RATE/75;
+    for(int lag=min_lag;lag<=max_lag && lag<count/2;lag++) {
+        double c=0,a=0,b=0;
+        for(int i=0;i<count-lag;i++){double u=x[start+i],v=x[start+i+lag];c+=u*v;a+=u*u;b+=v*v;}
+        double d=sqrt(a*b); if(d>1e-12 && c/d>best) best=c/d;
+    }
+    return (float)best;
+}
+static float frame_zcr(const float *x,int start,int count) {
+    int crossings=0; for(int i=1;i<count;i++) if((x[start+i]>=0)!=(x[start+i-1]>=0)) crossings++;
+    return (float)crossings/(count-1);
+}
+static float envelope_resonance(Band *bands,int env_start,int env_count) {
+    float e[BAND_COUNT]; double total=0;
+    for(int b=0;b<BAND_COUNT;b++) {
+        int a=env_start, z=env_start+env_count; double q=0;
+        if(z>0) { if(a<0)a=0; for(int i=a;i<z;i++){double v=bands[b].envelope[i];q+=v*v;} }
+        e[b]=(float)sqrt(q/(env_count>0?env_count:1)); total+=e[b];
+    }
+    if(total<1e-8) return 0.0f;
+    /* Count broad local maxima above the mean envelope level. */
+    int peaks=0; float mean=(float)(total/BAND_COUNT);
+    for(int b=2;b<BAND_COUNT-2;b++)
+        if(e[b]>e[b-1] && e[b]>=e[b+1] && e[b]>mean*1.35f) peaks++;
+    /* Two or more resonant regions are more vowel-like than a flat spectrum. */
+    return peaks>=2 ? fminf(1.0f,(float)peaks/5.0f) : 0.0f;
+}
+static Result build_speech_mask(const Audio *audio,Band *bands,int env_count,int *count_out,unsigned char **mask_out,int *cv_pairs_out) {
+    if(audio->count<SPEECH_FRAME) FAIL("input is too short for speech-event analysis (need at least 25 ms)");
+    const int frames=1+(audio->count-SPEECH_FRAME)/SPEECH_HOP;
+    SpeechFrame *feat=new(std::nothrow) SpeechFrame[frames];
+    unsigned char *mask=new(std::nothrow) unsigned char[frames];
+    if(!feat||!mask){delete[] feat;delete[] mask;FAIL("out of memory allocating speech-event analysis");}
+    float max_rms=0.0f;
+    for(int f=0;f<frames;f++) {
+        int start=f*SPEECH_HOP;
+        SpeechFrame *v=&feat[f];
+        v->rms=sample_rms(audio->samples,start,SPEECH_FRAME);
+        if(v->rms>max_rms)max_rms=v->rms;
+        v->periodicity=frame_periodicity(audio->samples,start,SPEECH_FRAME);
+        v->zcr=frame_zcr(audio->samples,start,SPEECH_FRAME);
+        int es=start/DECIMATE, ec=SPEECH_FRAME/DECIMATE;
+        double high=0.0,all=0.0;
+        for(int b=0;b<BAND_COUNT;b++) {
+            double q=0; for(int k=0;k<ec && es+k<env_count;k++){double a=bands[b].envelope[es+k];q+=a*a;}
+            if(q<0)q=0;
+            all+=q; if(center_hz(b)>=2500.0f)high+=q;
+        }
+        v->high_ratio=all>1e-16?(float)(high/all):0.0f;
+        v->resonance=envelope_resonance(bands,es,ec);
+        v->consonant=0; v->vowel=0; mask[f]=0;
+    }
+    const float floor_rms=fmaxf(0.0008f,max_rms*0.025f);
+    for(int f=0;f<frames;f++) {
+        SpeechFrame *v=&feat[f];
+        if(v->rms<floor_rms) continue;
+        /* C: aperiodic, noisy articulation. ZCR threshold also catches many
+           fricatives; high-band energy rejects most low-frequency thumps. */
+        v->consonant=(v->periodicity<0.32f && v->zcr>0.075f && v->high_ratio>0.10f);
+        /* V: periodic voicing plus a non-flat resonant envelope. */
+        v->vowel=(v->periodicity>0.38f && v->resonance>=0.40f);
+    }
+    int pairs=0, consonants=0, vowels=0;
+    for(int f=0;f<frames;f++){if(feat[f].consonant)consonants++;if(feat[f].vowel)vowels++;}
+    const int reach=22; /* +/- 220 ms */
+    for(int f=0;f<frames;f++) if(feat[f].vowel) {
+        int found=-1,dist=reach+1;
+        for(int d=1;d<=reach;d++) {
+            int a=f-d,b=f+d;
+            if(a>=0 && feat[a].consonant && d<dist){found=a;dist=d;}
+            if(b<frames && feat[b].consonant && d<dist){found=b;dist=d;}
+        }
+        if(found>=0) {
+            pairs++;
+            /* Keep the consonant-vowel transition and a small coarticulation
+               margin on either side; adjacent accepted vowels join naturally. */
+            int lo=found<f?found:f, hi=found>f?found:f;
+            lo=lo>2?lo-2:0; hi=hi+3<frames?hi+3:frames-1;
+            for(int k=lo;k<=hi;k++) mask[k]=1;
+        }
+    }
+    /* Fill short holes and soften the binary event track at the sample stage. */
+    for(int f=1;f+1<frames;f++) if(mask[f-1] && mask[f+1]) mask[f]=1;
+    delete[] feat;
+    *count_out=frames; *mask_out=mask; *cv_pairs_out=pairs;
+    fprintf(stderr,"speech events: C=%d V=%d paired-V=%d\n",consonants,vowels,pairs);
+    return Result::success();
+}
+static float speech_gate_at(const unsigned char *mask,int frames,int sample) {
+    float p=((float)sample-0.5f*SPEECH_FRAME)/SPEECH_HOP;
+    if(p<=0.0f)return mask[0]?1.0f:0.0f;
+    int f=(int)floorf(p); float t=p-f;
+    if(f>=frames-1)return mask[frames-1]?1.0f:0.0f;
+    float a=mask[f]?1.0f:0.0f,b=mask[f+1]?1.0f:0.0f;
+    return a+(b-a)*t;
+}
+
 /* Linearly interpolate frame masks so group changes do not click. */
 static float mask_at(const int *labels,int frames,int band,int group,int sample) {
     float env_pos=(float)sample/DECIMATE;
@@ -237,8 +355,9 @@ static Result write_wav(const char *path,const float *samples,int count) {
 }
 
 int main(int argc,char **argv) {
-    if(argc<2){fprintf(stderr,"usage: %s input.wav [output_prefix]\n",argv[0]);return 2;}
-    const char *prefix=argc>2?argv[2]:"voice";
+    if(argc<2){fprintf(stderr,"usage: %s input.wav [output_prefix] [--raw]\n",argv[0]);return 2;}
+    const char *prefix="voice"; bool use_speech_gate=true;
+    for(int a=2;a<argc;a++) { if(!strcmp(argv[a],"--raw"))use_speech_gate=false; else prefix=argv[a]; }
     Audio audio={0,NULL}; Result r=load_wav(argv[1],&audio);
     if(!r.ok){fprintf(stderr,"error at line %d: %s\n",r.error.line,r.error.message);return 1;}
     const int env_count=(audio.count-1)/DECIMATE+1;
@@ -248,6 +367,9 @@ int main(int argc,char **argv) {
     int frames=0; int *labels=NULL;
     r=build_dynamic_masks(bands,env_count,&frames,&labels);
     if(!r.ok){fprintf(stderr,"error at line %d: %s\n",r.error.line,r.error.message);for(int b=0;b<BAND_COUNT;b++){delete[] bands[b].signal;delete[] bands[b].envelope;}delete[] audio.samples;return 1;}
+    int speech_frames=0,cv_pairs=0; unsigned char *speech_mask=NULL;
+    r=build_speech_mask(&audio,bands,env_count,&speech_frames,&speech_mask,&cv_pairs);
+    if(!r.ok){fprintf(stderr,"error at line %d: %s\n",r.error.line,r.error.message);delete[] labels;for(int b=0;b<BAND_COUNT;b++){delete[] bands[b].signal;delete[] bands[b].envelope;}delete[] audio.samples;return 1;}
     bool present[MAX_GROUPS]={};
     for(int f=0;f<frames;f++)for(int b=0;b<BAND_COUNT;b++){int g=labels[f*BAND_COUNT+b];if(g>=0&&g<MAX_GROUPS)present[g]=true;}
     int groups=0;for(int g=0;g<MAX_GROUPS;g++)if(present[g])groups++;
@@ -255,6 +377,8 @@ int main(int argc,char **argv) {
     printf("filterbank: %d logarithmic bands, %.0f-%.0f Hz, Q=%.1f\n",BAND_COUNT,MIN_HZ,MAX_HZ,Q);
     printf("local grouping: %.0f ms windows, %.0f ms hop, correlation threshold %.2f\n",1000.0*FRAME/ENV_RATE,1000.0*HOP/ENV_RATE,CORR_THRESHOLD);
     printf("tracked group IDs: %d\n",groups);
+    printf("speech event grammar: %d consonant-vowel pair candidates, %d analysis frames\n",cv_pairs,speech_frames);
+    printf("speech gate: %s (use --raw for ungated band groups)\n",use_speech_gate?"C-V sequence":"disabled");
     float *mix=new(std::nothrow) float[audio.count];
     if(!mix){fprintf(stderr,"error: out of memory allocating output\n");}
     else {
@@ -264,7 +388,7 @@ int main(int argc,char **argv) {
                 bool belongs=false;for(int f=0;f<frames;f++)if(labels[f*BAND_COUNT+b]==g){belongs=true;break;}
                 if(!belongs) continue;
                 members++;
-                for(int s=0;s<audio.count;s++) mix[s]+=bands[b].signal[s]*mask_at(labels,frames,b,g,s);
+                for(int s=0;s<audio.count;s++) mix[s]+=bands[b].signal[s]*mask_at(labels,frames,b,g,s)*(use_speech_gate?speech_gate_at(speech_mask,speech_frames,s):1.0f);
             }
             char path[512];snprintf(path,sizeof(path),"%s_group_%02d.wav",prefix,g);
             r=write_wav(path,mix,audio.count);
@@ -273,6 +397,7 @@ int main(int argc,char **argv) {
         }
         delete[] mix;
     }
+    delete[] speech_mask;
     delete[] labels;
     for(int b=0;b<BAND_COUNT;b++){delete[] bands[b].signal;delete[] bands[b].envelope;}
     delete[] audio.samples;
