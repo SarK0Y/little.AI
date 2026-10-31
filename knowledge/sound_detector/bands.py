@@ -99,12 +99,45 @@ def _fades(env, fs=FS, min_drop_db=20.0, min_ms=20.0, max_ms=2000.0,
     return durs
 
 
+def _movmean(x, k, axis=-1):
+    """Moving average of width k along axis, edge-padded at the start."""
+    x = np.moveaxis(x, axis, -1)
+    k = max(1, min(int(k), x.shape[-1]))
+    c = np.cumsum(x, -1, dtype=float)
+    c = np.concatenate([np.zeros(c.shape[:-1] + (1,)), c], -1)
+    s = (c[..., k:] - c[..., :-k]) / k
+    out = np.empty(x.shape[:-1] + (x.shape[-1],), dtype=float)
+    out[..., :k - 1] = s[..., :1]
+    out[..., k - 1:] = s
+    return np.moveaxis(out, -1, axis)
+
+
+def coherence(env, fs=FS, hp_s=1.0):
+    """WIDE modulation: how much the band envelopes vary *together*.
+
+    Not a clock.  Real speech has no detectable periodicity in one window
+    (verified: 20/50/100/200 ms detrend, per band and on the shared
+    component, all zero hits), but it does have the property the core idea
+    always claimed: n frequencies carrying ONE modulation.  So measure the
+    common variation directly -- high-pass each envelope (1 s, keeps >=1 Hz),
+    z-normalize, median pairwise correlation.
+
+        voice / one source     0.85-0.99    dense mix / hiss   0.26-0.56
+    """
+    k = hp_s * fs
+    d = env - _movmean(env, k, axis=-1)
+    d = d / (d.std(axis=-1, keepdims=True) + 1e-12)
+    c = d @ d.T / d.shape[-1]
+    iu = np.triu_indices(len(c), 1)
+    return float(np.median(c[iu]))
+
+
 def features(x, fs=FS):
     x = np.asarray(x, dtype=float)
     rms_db = 20 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-12)
     if rms_db < -50:
         return {"rms_db": rms_db, "band_std": 0.0, "spread_hz": 0.0,
-                "fade_ms": None, "fade_fast": None, "fades": 0,
+                "coh": 0.0, "fade_ms": None, "fade_fast": None, "fades": 0,
                 "short_fades": 0, "fades_per_band": {}}
 
     bands = np.stack([_filt(x, *_bp(f), n=512) for f in CENTERS])
@@ -129,6 +162,7 @@ def features(x, fs=FS):
         "rms_db": rms_db,
         "band_std": band_std,
         "spread_hz": spread,
+        "coh": coherence(env, fs),
         "fade_ms": float(np.median(fades)) if fades else None,
         "fade_fast": float(np.mean(np.array(fades) < 150)) if fades else None,
         "fades": len(fades),
@@ -141,6 +175,19 @@ def classify(x, fs=FS):
     f = features(x, fs)
     if f["rms_db"] < -50:
         return "silence", f
+    # WIDE modulation first: voice is n freqs carrying ONE modulation, and
+    # that needs no clock.  coh >= 0.7 means the bands share their variation
+    # (voice 0.85-0.99, dense mix 0.33-0.56, hiss 0.26-0.43).
+    if f["coh"] >= 0.7:
+        # shared modulation: is it one source fading in unison (voice) or a
+        # chord / one instrument where each note decays on its own?
+        if f["short_fades"] > f["fades"] * 0.33:
+            return "voice", f
+        return "music", f
+    # No shared modulation -> cannot be voice, whatever the fades say.
+    # (This branch used to call dense pop "voice": its short per-band ripples
+    # passed the unison test.  A mix whose bands don't vary together isn't
+    # one source, so the fade ratio is meaningless there.)
     if f["fades"] == 0:
         # no fades of >= 20 dB.  A dense mix's decays are often shallow,
         # so the beat clock is the vote that separates "stationary music"
@@ -151,21 +198,7 @@ def classify(x, fs=FS):
                 if conf > 0.3 and freq > 0:
                     return "music", f
         return ("noise" if f["band_std"] < 4.5 else "music"), f
-    # voice: a handful of harmonics, all fading at once -> many short descents
-    # music: many freqs fading at staggered times -> few short descents
-    # measured on this box: voice ~12 short/11 total, music ~1 short/3 total
-    if f["short_fades"] > f["fades"] * 0.33:
-        return "voice", f
-    # a syllable clock is the vote that survives voice-over-music
-    # (unison fades break down when a song overlays a voice)
-    if mod is not None:
-        for c in CENTERS:
-            freq, conf = mod.syllables(_env(_filt(x, *_bp(c), n=512)))
-            if conf > 0.3 and 3.0 <= freq <= 8.0:
-                return "voice", f
-    if f["fades"] >= 2:
-        return "music", f
-    return ("voice" if f["spread_hz"] > 700 else "music"), f
+    return "music", f
 
 
 def load_wav(path, fs=FS):
@@ -219,8 +252,8 @@ if __name__ == "__main__":
             label, f = classify(load_wav(path))
             fade = f"{f['fade_ms']:.0f}" if f["fade_ms"] else "-"
             fast = f"{f['fade_fast']:.2f}" if f["fade_fast"] is not None else "-"
-            print(f"{path}: {label}  fade={fade}ms fast={fast} "
-                  f"n={f['fades']} spread={f['spread_hz']:.0f}Hz "
+            print(f"{path}: {label}  coh={f['coh']:.2f} fade={fade}ms "
+                  f"fast={fast} n={f['fades']} spread={f['spread_hz']:.0f}Hz "
                   f"flat={f['band_std']:.1f}dB rms={f['rms_db']:.1f}dB")
         raise SystemExit
 
@@ -241,7 +274,8 @@ if __name__ == "__main__":
         fade = f"{f['fade_ms']:.0f}" if f["fade_ms"] else "-"
         fast = f"{f['fade_fast']:.2f}" if f["fade_fast"] is not None else "-"
         print(
-            f"{name:9s} -> {label:8s} fade={fade:>4s}ms fast={fast:4s} "
+            f"{name:9s} -> {label:8s} coh={f['coh']:.2f} "
+            f"fade={fade:>4s}ms fast={fast:4s} "
             f"n={f['fades']:2d} spread={f['spread_hz']:5.0f}Hz "
             f"flat={f['band_std']:4.1f}dB rms={f['rms_db']:6.1f}dB"
         )
@@ -254,4 +288,7 @@ if __name__ == "__main__":
     # the two claims this probe exists to test
     assert out["voice"]["fade_ms"] < out["music"]["fade_ms"], "voice releases should be shorter"
     assert out["voice"]["spread_hz"] > out["music"]["spread_hz"], "voice should be spectrally wider"
+    # wide modulation: the bands of a voice vary together, noise doesn't
+    assert out["voice"]["coh"] >= 0.7, "voice should share one modulation"
+    assert out["noise"]["coh"] < 0.7, "independent bands shouldn't correlate"
     print("ok")
