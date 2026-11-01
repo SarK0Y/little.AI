@@ -354,12 +354,155 @@ static Result write_wav(const char *path,const float *samples,int count) {
     return Result::success();
 }
 
+
+/*
+ * Experimental tonal-music destruction pass.
+ *
+ * A 1024-sample Hann STFT is used to find narrow spectral peaks that remain
+ * at approximately the same frequency for a sustained interval. Such peaks
+ * are softly attenuated. Short-lived and frequency-moving structures are
+ * retained. This is deliberately a conservative, deterministic heuristic:
+ * sustained vowels and some instruments can still be confused.
+ */
+static const int FFT_SIZE = 1024;
+static const int FFT_BINS = FFT_SIZE/2 + 1;
+static const int FFT_HOP = 256;
+static const int TONAL_RADIUS = 16; /* 512 ms on either side */
+
+static void fft(float *re, float *im, bool inverse) {
+    int j=0;
+    for(int i=1;i<FFT_SIZE;i++) {
+        int bit=FFT_SIZE>>1;
+        for(;j&bit;bit>>=1) j^=bit;
+        j^=bit;
+        if(i<j) { float t=re[i];re[i]=re[j];re[j]=t; t=im[i];im[i]=im[j];im[j]=t; }
+    }
+    for(int len=2;len<=FFT_SIZE;len<<=1) {
+        const float angle=(inverse?2.0f:-2.0f)*PI_F/len;
+        const float wr0=cosf(angle), wi0=sinf(angle);
+        for(int i=0;i<FFT_SIZE;i+=len) {
+            float wr=1.0f,wi=0.0f;
+            for(int k=0;k<len/2;k++) {
+                int a=i+k,b=a+len/2;
+                float vr=re[b]*wr-im[b]*wi, vi=re[b]*wi+im[b]*wr;
+                re[b]=re[a]-vr; im[b]=im[a]-vi;
+                re[a]+=vr; im[a]+=vi;
+                float nw=wr*wr0-wi*wi0; wi=wr*wi0+wi*wr0; wr=nw;
+            }
+        }
+    }
+    if(inverse) for(int i=0;i<FFT_SIZE;i++){re[i]/=FFT_SIZE;im[i]/=FFT_SIZE;}
+}
+
+static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
+    const int frames=(audio->count+FFT_HOP-1)/FFT_HOP+1;
+    const int padded=audio->count+FFT_SIZE;
+    float *magnitudes=new(std::nothrow) float[(size_t)frames*FFT_BINS];
+    unsigned char *peaks=new(std::nothrow) unsigned char[(size_t)frames*FFT_BINS];
+    float *re=new(std::nothrow) float[FFT_SIZE];
+    float *im=new(std::nothrow) float[FFT_SIZE];
+    float *out=new(std::nothrow) float[padded];
+    float *weight=new(std::nothrow) float[padded];
+    if(!magnitudes||!peaks||!re||!im||!out||!weight) {
+        delete[] magnitudes;delete[] peaks;delete[] re;delete[] im;delete[] out;delete[] weight;
+        FAIL("out of memory allocating tonal-destruction STFT");
+    }
+    memset(peaks,0,(size_t)frames*FFT_BINS);
+    const float pi=PI_F;
+    for(int f=0;f<frames;f++) {
+        int base=f*FFT_HOP;
+        for(int n=0;n<FFT_SIZE;n++) {
+            int src=base+n-FFT_SIZE/2;
+            float x=(src>=0&&src<audio->count)?audio->samples[src]:0.0f;
+            float w=0.5f-0.5f*cosf(2.0f*pi*n/(FFT_SIZE-1));
+            re[n]=x*w;im[n]=0.0f;
+        }
+        fft(re,im,false);
+        double sum=0.0;
+        for(int b=0;b<FFT_BINS;b++) {
+            float m=sqrtf(re[b]*re[b]+im[b]*im[b]);
+            magnitudes[(size_t)f*FFT_BINS+b]=m;sum+=m;
+        }
+        float mean=(float)(sum/FFT_BINS);
+        /* A narrow local maximum is a candidate musical partial. */
+        for(int b=3;b<FFT_BINS-3;b++) {
+            float m=magnitudes[(size_t)f*FFT_BINS+b];
+            float side=0.0f;
+            for(int d=2;d<=4;d++) side+=magnitudes[(size_t)f*FFT_BINS+b-d]+magnitudes[(size_t)f*FFT_BINS+b+d];
+            side/=6.0f;
+            if(m>mean*2.0f && m>side*2.0f && m>magnitudes[(size_t)f*FFT_BINS+b-1] && m>=magnitudes[(size_t)f*FFT_BINS+b+1])
+                peaks[(size_t)f*FFT_BINS+b]=1;
+        }
+    }
+    memset(out,0,sizeof(float)*padded);memset(weight,0,sizeof(float)*padded);
+    int suppressed=0;
+    for(int f=0;f<frames;f++) {
+        for(int n=0;n<FFT_SIZE;n++){re[n]=0.0f;im[n]=0.0f;}
+        int base=f*FFT_HOP;
+        for(int n=0;n<FFT_SIZE;n++) {
+            int src=base+n-FFT_SIZE/2;
+            float x=(src>=0&&src<audio->count)?audio->samples[src]:0.0f;
+            float w=0.5f-0.5f*cosf(2.0f*pi*n/(FFT_SIZE-1));
+            re[n]=x*w;im[n]=0.0f;
+        }
+        fft(re,im,false);
+        for(int b=0;b<FFT_BINS;b++) {
+            float original=sqrtf(re[b]*re[b]+im[b]*im[b]);
+            int lo=f-TONAL_RADIUS;if(lo<0)lo=0;
+            int hi=f+TONAL_RADIUS+1;if(hi>frames)hi=frames;
+            int hits=0,total=0;
+            for(int tf=lo;tf<hi;tf++) {bool hit=false;for(int db=-1;db<=1;db++){int q=b+db;if(q>=0&&q<FFT_BINS&&peaks[(size_t)tf*FFT_BINS+q])hit=true;}if(hit)hits++;total++;}
+            float persistence=total?(float)hits/total:0.0f;
+            float amount=(total>=20 && persistence>0.62f)?fminf(0.88f,(persistence-0.62f)*2.2f):0.0f;
+            if(amount>0.05f)suppressed++;
+            float scale=(original>1e-12f)?(1.0f-amount):1.0f;
+            re[b]*=scale; im[b]*=scale;
+            if(b>0&&b<FFT_SIZE/2){re[FFT_SIZE-b]=re[b];im[FFT_SIZE-b]=-im[b];}
+        }
+        fft(re,im,true);
+        for(int n=0;n<FFT_SIZE;n++) {
+            int dst=base+n;
+            if(dst>=padded)continue;
+            float w=0.5f-0.5f*cosf(2.0f*pi*n/(FFT_SIZE-1));
+            out[dst]+=re[n]*w;weight[dst]+=w*w;
+        }
+    }
+    float *result=new(std::nothrow) float[audio->count];
+    if(!result){delete[] magnitudes;delete[] peaks;delete[] re;delete[] im;delete[] out;delete[] weight;FAIL("out of memory allocating tonal-destruction output");}
+    for(int i=0;i<audio->count;i++) {int k=i+FFT_SIZE/2;result[i]=weight[k]>1e-8f?out[k]/weight[k]:audio->samples[i];}
+    char voice_path[512], damaged_path[512];
+    snprintf(voice_path,sizeof(voice_path),"%s_voice_candidate.wav",prefix);
+    snprintf(damaged_path,sizeof(damaged_path),"%s_removed_tones.wav",prefix);
+    Result wr=write_wav(voice_path,result,audio->count);
+    if(wr.ok) {
+        float *removed=new(std::nothrow) float[audio->count];
+        if(removed) {for(int i=0;i<audio->count;i++)removed[i]=audio->samples[i]-result[i];wr=write_wav(damaged_path,removed,audio->count);delete[] removed;}
+    }
+    if(wr.ok) {
+        printf("tonal destruction: %d STFT frames, %d Hz bin spacing, %d suppressed frame-bin decisions\n",frames,SAMPLE_RATE/FFT_SIZE,suppressed);
+        printf("wrote %s (candidate after stable-tone suppression)\n",voice_path);
+        printf("wrote %s (removed component; listen for what was destroyed)\n",damaged_path);
+    }
+    delete[] result;delete[] magnitudes;delete[] peaks;delete[] re;delete[] im;delete[] out;delete[] weight;
+    return wr;
+}
+
 int main(int argc,char **argv) {
-    if(argc<2){fprintf(stderr,"usage: %s input.wav [output_prefix] [--raw]\n",argv[0]);return 2;}
-    const char *prefix="voice"; bool use_speech_gate=true;
-    for(int a=2;a<argc;a++) { if(!strcmp(argv[a],"--raw"))use_speech_gate=false; else prefix=argv[a]; }
+    if(argc<2){fprintf(stderr,"usage: %s input.wav [output_prefix] [--legacy [--raw]]\n",argv[0]);return 2;}
+    const char *prefix="voice"; bool use_speech_gate=true, legacy=false;
+    for(int a=2;a<argc;a++) {
+        if(!strcmp(argv[a],"--raw"))use_speech_gate=false;
+        else if(!strcmp(argv[a],"--legacy"))legacy=true;
+        else prefix=argv[a];
+    }
     Audio audio={0,NULL}; Result r=load_wav(argv[1],&audio);
     if(!r.ok){fprintf(stderr,"error at line %d: %s\n",r.error.line,r.error.message);return 1;}
+    if(!legacy) {
+        r=destroy_stable_tones(&audio,prefix);
+        if(!r.ok) fprintf(stderr,"error at line %d: %s\n",r.error.line,r.error.message);
+        delete[] audio.samples;
+        return r.ok?0:1;
+    }
     const int env_count=(audio.count-1)/DECIMATE+1;
     Band bands[BAND_COUNT]={};
     r=make_filterbank(&audio,bands,env_count);
@@ -403,4 +546,3 @@ int main(int argc,char **argv) {
     delete[] audio.samples;
     return 0;
 }
-

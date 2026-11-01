@@ -1,56 +1,43 @@
 # voice_extractor
 
-Experimental, deterministic speech-region extraction using a narrow
-filterbank, time-varying modulation groups, and a primitive consonant/vowel
-(C/V) event gate.
+A deterministic experiment in **destroying persistent musical tones** and
+listening to what remains. Instead of trying to identify a speaker or learn a
+voice from examples, the default pass looks for narrow spectral peaks that
+remain near the same frequency over time, then softly attenuates them.
 
-**Design constraint:** this implementation deliberately avoids trained
-statistical models, neural networks, training corpora, and reference-voice
-databases. It uses explicit signal-processing measurements and hand-chosen
-thresholds. It is a research prototype, not a production speech/music
-separator.
+**No neural networks, training data, statistical model, or reference-voice
+database is used.** All decisions are explicit signal-processing rules.
+This is an experimental filter, not a reliable speech/music separator.
 
-## What it tries to detect
+## Current experiment: stable-tone destruction
 
-Speech is not merely a set of frequencies that rise and fall together. It is
-an evolving sequence of articulatory events: noisy or constricted consonant
-regions, voiced resonant vowel regions, and transitions between them.
+The default path is:
 
-The current implementation approximates two event classes:
+1. Read PCM16 mono 16 kHz RIFF/WAVE audio.
+2. Analyze overlapping 1024-sample Hann-window frames (64 ms) with a 256-sample
+   hop (16 ms), using an in-source radix-2 FFT.
+3. In each frame, mark narrow local spectral peaks that stand clearly above
+   their nearby spectral surroundings and the frame's average magnitude.
+4. Follow each frequency bin through a temporal neighbourhood. A peak is
+   considered persistent when a peak remains within that bin or its immediate
+   neighbours for more than 62% of a sufficiently long neighbourhood.
+5. Softly attenuate persistent peaks (up to 88%) while retaining transient or
+   frequency-moving components.
+6. Reconstruct the remaining signal with Hann overlap-add.
 
-- **C — consonant-like:** an energetic frame with weak periodicity, a high
-  zero-crossing rate, and a relatively strong high-frequency component.
-- **V — vowel-like:** a periodic frame whose filterbank envelope has at least
-  two broad local peaks. Those peaks are only a crude resonance/formant
-  proxy; they are not accurate LPC formant estimates.
+The pass writes two files:
 
-A V frame is retained when a C frame occurs within 220 ms on either side.
-The accepted region is expanded slightly to preserve transitions and
-coarticulation. **Important:** this first version uses temporal proximity, not
-strict directional C-before-V grammar, and it does not recognize phonemes,
-syllables, words, or speakers.
+- `<prefix>_voice_candidate.wav` — original audio after stable narrow peaks
+  have been attenuated. This is only a *candidate*; it is not guaranteed to
+  contain voice alone.
+- `<prefix>_removed_tones.wav` — the component removed by subtracting the
+  candidate from the original. Listen to this too: it shows what the filter
+  classified as persistent tonal material.
 
-## Signal path
-
-1. Read PCM16, mono, 16 kHz RIFF/WAVE audio.
-2. Split the signal into 48 logarithmically spaced band-pass filters covering
-   70 Hz–7.2 kHz, with Q = 6.
-3. Track each band's rectified, smoothed amplitude envelope (8 ms smoothing),
-   decimated to 2 kHz.
-4. Every 100 ms, analyze a 1.2 s local envelope window. Bands with sufficiently
-   similar local envelope movement are grouped using complete-link Pearson
-   correlation (threshold 0.55). Group IDs are tracked between windows by
-   shared-band overlap, so membership can change over time.
-5. Independently analyze 25 ms waveform frames at 10 ms intervals. For each
-   frame, measure:
-   - normalized autocorrelation periodicity over the 75–400 Hz pitch range;
-   - zero-crossing rate;
-   - energy ratio in filterbank bands centered at or above 2.5 kHz;
-   - a simple count of broad peaks in the filterbank envelope.
-6. Apply hand-written C/V rules and construct a soft speech gate by
-   interpolating the event mask between analysis frames.
-7. Sum each tracked frequency group into its own PCM16 WAV file, optionally
-   applying the speech gate.
+The important heuristic is temporal stability, not simply narrow bandwidth.
+A voice also contains narrow harmonics, and an instrument can have broadband
+attacks. The filter therefore requires persistence over time rather than
+removing every narrow frequency component.
 
 ## Build
 
@@ -60,12 +47,12 @@ Requires a C++17 compiler and `make`.
 make clean && make
 ```
 
-The Makefile uses `-O2 -std=c++17 -Wall -Wextra -Wpedantic` by default.
+The default Makefile flags are `-O2 -std=c++17 -Wall -Wextra -Wpedantic`.
 
 ## Input format
 
-The input must be **16-bit PCM, mono, 16,000 Hz WAV**. Convert other formats
-with ffmpeg:
+Input must be **16-bit PCM, mono, 16,000 Hz WAV**. Convert other formats with
+ffmpeg:
 
 ```sh
 ffmpeg -i input.ext -ar 16000 -ac 1 -c:a pcm_s16le input_16k.wav
@@ -74,73 +61,63 @@ ffmpeg -i input.ext -ar 16000 -ac 1 -c:a pcm_s16le input_16k.wav
 ## Run
 
 ```sh
-# Speech-event gate enabled (default); output files use voice_group_NN.wav
+# New stable-tone destruction experiment
 ./voice_extractor input_16k.wav
 
-# Choose an output prefix; the parent directory must already exist
-./voice_extractor input_16k.wav ./out/voice
+# Choose an output prefix (the parent directory must already exist)
+./voice_extractor input_16k.wav ./out/test
 
-# Disable the C/V gate and hear the dynamic modulation groups alone
-./voice_extractor input_16k.wav ./out/raw --raw
+# Run the previous modulation-group + C/V experiment instead
+./voice_extractor input_16k.wav ./out/legacy --legacy
+
+# Previous experiment without its C/V gate
+./voice_extractor input_16k.wav ./out/legacy_raw --legacy --raw
 ```
 
-The output directory is not created automatically. For example, create it
-before using `./out/voice`:
+Create output directories yourself, for example `mkdir -p out`.
 
-```sh
-mkdir -p out
-```
+## Initial parameters
 
-Each output is named `<prefix>_group_00.wav`, `<prefix>_group_01.wav`, etc.
-The program prints the number of tracked groups and the detected C, V, and
-paired-V event counts. Group IDs are heuristic frequency-group tracks; they
-are **not verified speaker identities**. A single speaker may produce
-multiple groups, and multiple sources may be merged.
-
-## Current thresholds
-
-The initial values are intentionally visible in `voice_extractor.cpp` so
-they can be tuned against real recordings:
-
-| Measurement | Current rule |
+| Parameter | Value |
 |---|---:|
-| C-frame periodicity | < 0.32 |
-| C-frame zero-crossing rate | > 0.075 |
-| C-frame high-band energy ratio | > 0.10 |
-| V-frame periodicity | > 0.38 |
-| V-frame resonance score | >= 0.40 |
-| C-to-V temporal search | +/- 220 ms |
-| Event analysis frame / hop | 25 ms / 10 ms |
-| Grouping window / hop | 1.2 s / 100 ms |
-| Group envelope correlation | >= 0.55 |
+| FFT size | 1024 samples (64 ms) |
+| FFT hop | 256 samples (16 ms) |
+| Frequency-bin spacing | 15.625 Hz |
+| Peak search | local maximum, 2x nearby spectral average, 2x frame mean |
+| Persistence neighbourhood | +/- 16 frames (about 512 ms each side) |
+| Required persistence | > 62% |
+| Maximum attenuation | 88% |
+| Reconstruction | Hann overlap-add |
 
-The C/V thresholds also require frame RMS above a relative/absolute noise
-floor. The high-band ratio is calculated from filterbank envelope energy,
-not from a separate FFT classifier.
+These are starting values for listening experiments, not validated optimal
+settings.
 
-## Limitations and next experiments
+## What can go wrong
 
-This is a deliberately small first test of an acoustic-event grammar. Expect
-false positives and false negatives:
+- Sustained vowels can be classified as stable tones and partially removed.
+- Vibrato, tremolo, distortion, and pitch bends can make instruments appear
+  less stable and let them survive.
+- Drums and other broadband/percussive instruments are not targeted by this
+  first pass.
+- Dense chords create overlapping peaks and spectral leakage.
+- A stable note shorter than the persistence window may survive; a sustained
+  voice note may be attenuated.
+- This pass does not explicitly model consonants, formants, syllables, or
+  speaker identity.
 
-- Percussion, pick attacks, distortion, and noisy instruments can resemble C
-  events.
-- Sustained pitched instruments can resemble V events.
-- Voiced consonants may fail the current C rule; weak vowels may fail the V
-  rule; whispered speech lacks the periodicity expected by this V detector.
-- Fricatives and plosives have different time/frequency shapes, but are
-  currently treated as one broad C class.
-- The filterbank peak count is not robust formant tracking. LPC or another
-  explicit spectral-envelope estimator may improve the vowel test without
-  requiring a learned model or database.
-- The current C/V test checks for a nearby consonant-like frame on either
-  side of a vowel-like frame. A future version should test directional event
-  sequences, transition shape, and repeated syllable-like patterns.
-- Singing vocals, heavily processed voices, overlapping speakers, and dense
-  music remain difficult cases.
+## Listening experiment
 
-For listening tests, compare the default gated output with `--raw`. Use
-isolated speech, instrumental music, speech over music, and music with
-singing. Listen for both missed speech and music leaking through. Change one
-threshold at a time and keep examples of each failure; the goal is to improve
-the physical rules, not to hide errors behind a trained classifier.
+Listen to both generated files at matched playback volume:
+
+1. `*_voice_candidate.wav`
+2. `*_removed_tones.wav`
+
+Try instrumental music, isolated speech, speech over music, and singing over
+instrumental music. The key question is whether stable musical partials move
+into the removed file while speech articulation remains intelligible in the
+candidate. Keep the original alongside both outputs; do not judge only by
+waveform appearance.
+
+The older dynamic modulation-group and consonant/vowel experiment remains
+available with `--legacy` for comparison. Its source is retained in the same
+file, so the two approaches can be compared without losing the previous work.
