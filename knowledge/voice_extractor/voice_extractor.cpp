@@ -368,6 +368,9 @@ static const int FFT_SIZE = 1024;
 static const int FFT_BINS = FFT_SIZE/2 + 1;
 static const int FFT_HOP = 256;
 static const int TONAL_RADIUS = 16; /* 512 ms on either side */
+static const float LOW_CUT_START_HZ = 90.0f;
+static const float LOW_CUT_END_HZ = 180.0f;
+static const float LOW_CUT_FLOOR = 0.08f; /* retain 8% below the cutoff */
 
 static void fft(float *re, float *im, bool inverse) {
     int j=0;
@@ -399,15 +402,20 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
     const int padded=audio->count+FFT_SIZE;
     float *magnitudes=new(std::nothrow) float[(size_t)frames*FFT_BINS];
     unsigned char *peaks=new(std::nothrow) unsigned char[(size_t)frames*FFT_BINS];
+    float *spectral_flux=new(std::nothrow) float[frames];
+    float *spectral_flatness=new(std::nothrow) float[frames];
     float *re=new(std::nothrow) float[FFT_SIZE];
     float *im=new(std::nothrow) float[FFT_SIZE];
     float *out=new(std::nothrow) float[padded];
     float *weight=new(std::nothrow) float[padded];
-    if(!magnitudes||!peaks||!re||!im||!out||!weight) {
-        delete[] magnitudes;delete[] peaks;delete[] re;delete[] im;delete[] out;delete[] weight;
+    if(!magnitudes||!peaks||!spectral_flux||!spectral_flatness||!re||!im||!out||!weight) {
+        delete[] magnitudes;delete[] peaks;delete[] spectral_flux;delete[] spectral_flatness;
+        delete[] re;delete[] im;delete[] out;delete[] weight;
         FAIL("out of memory allocating tonal-destruction STFT");
     }
     memset(peaks,0,(size_t)frames*FFT_BINS);
+    memset(spectral_flux,0,sizeof(float)*frames);
+    memset(spectral_flatness,0,sizeof(float)*frames);
     const float pi=PI_F;
     for(int f=0;f<frames;f++) {
         int base=f*FFT_HOP;
@@ -424,6 +432,25 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
             magnitudes[(size_t)f*FFT_BINS+b]=m;sum+=m;
         }
         float mean=(float)(sum/FFT_BINS);
+        /* Spectral flux catches abrupt broadband attacks such as clicks and
+         * claps. Flatness rejects attacks dominated by one narrow tone. */
+        double positive_flux=0.0, previous_energy=1e-12, log_sum=0.0, arithmetic_sum=0.0;
+        int first_bin=5;
+        for(int b=first_bin;b<FFT_BINS;b++) {
+            float m=magnitudes[(size_t)f*FFT_BINS+b];
+            arithmetic_sum+=m;
+            log_sum+=logf(fmaxf(m,1e-12f));
+            if(f>0) {
+                float prev=magnitudes[(size_t)(f-1)*FFT_BINS+b];
+                if(m>prev) positive_flux+=(double)(m-prev);
+                previous_energy+=prev;
+            }
+        }
+        spectral_flux[f]=(float)(positive_flux/previous_energy);
+        const int flat_bins=FFT_BINS-first_bin;
+        const float arithmetic=(float)(arithmetic_sum/flat_bins);
+        spectral_flatness[f]=arithmetic>1e-12f
+            ? expf((float)(log_sum/flat_bins))/arithmetic : 0.0f;
         /* A narrow local maximum is a candidate musical partial. */
         for(int b=3;b<FFT_BINS-3;b++) {
             float m=magnitudes[(size_t)f*FFT_BINS+b];
@@ -453,9 +480,36 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
             int hits=0,total=0;
             for(int tf=lo;tf<hi;tf++) {bool hit=false;for(int db=-1;db<=1;db++){int q=b+db;if(q>=0&&q<FFT_BINS&&peaks[(size_t)tf*FFT_BINS+q])hit=true;}if(hit)hits++;total++;}
             float persistence=total?(float)hits/total:0.0f;
-            float amount=(total>=20 && persistence>0.62f)?fminf(0.88f,(persistence-0.62f)*2.2f):0.0f;
-            if(amount>0.05f)suppressed++;
-            float scale=(original>1e-12f)?(1.0f-amount):1.0f;
+            float tonal_amount=(total>=20 && persistence>0.62f)?fminf(0.88f,(persistence-0.62f)*2.2f):0.0f;
+
+            /* Aggressive low-end cut: strongest below 90 Hz, fading to full
+             * level by 180 Hz. This targets kick/bass rumble but can thin
+             * low male voices, so a little sub-cut energy is retained. */
+            const float hz=(float)b*SAMPLE_RATE/FFT_SIZE;
+            float low_gain=1.0f;
+            if(hz<LOW_CUT_START_HZ) low_gain=LOW_CUT_FLOOR;
+            else if(hz<LOW_CUT_END_HZ) {
+                float t=(hz-LOW_CUT_START_HZ)/(LOW_CUT_END_HZ-LOW_CUT_START_HZ);
+                low_gain=LOW_CUT_FLOOR+(1.0f-LOW_CUT_FLOOR)*t;
+            }
+
+            /* Isolated broadband attacks: require a strong positive spectral
+             * flux, a rapid flux drop in the following frame, and a fairly
+             * noise-like spectrum. This is intentionally capped because
+             * speech plosives can resemble clicks. */
+            float attack_amount=0.0f;
+            if(f+1<frames && spectral_flux[f]>0.42f &&
+               spectral_flux[f+1]<spectral_flux[f]*0.58f &&
+               spectral_flatness[f]>0.12f) {
+                attack_amount=fminf(0.72f,(spectral_flux[f]-0.42f)*0.9f);
+            }
+            /* Avoid removing the low-frequency body of an attack twice; the
+             * low-cut handles kick energy, while transient suppression is
+             * focused on the upper spectrum where claps/clicks are broad. */
+            float transient_gain=1.0f;
+            if(hz>=900.0f && hz<=7600.0f) transient_gain=1.0f-attack_amount;
+            float scale=(original>1e-12f)?(1.0f-tonal_amount)*low_gain*transient_gain:1.0f;
+            if(tonal_amount>0.05f || low_gain<0.99f || transient_gain<0.99f) suppressed++;
             re[b]*=scale; im[b]*=scale;
             if(b>0&&b<FFT_SIZE/2){re[FFT_SIZE-b]=re[b];im[FFT_SIZE-b]=-im[b];}
         }
@@ -468,7 +522,7 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
         }
     }
     float *result=new(std::nothrow) float[audio->count];
-    if(!result){delete[] magnitudes;delete[] peaks;delete[] re;delete[] im;delete[] out;delete[] weight;FAIL("out of memory allocating tonal-destruction output");}
+    if(!result){delete[] magnitudes;delete[] peaks;delete[] spectral_flux;delete[] spectral_flatness;delete[] re;delete[] im;delete[] out;delete[] weight;FAIL("out of memory allocating tonal-destruction output");}
     for(int i=0;i<audio->count;i++) {int k=i+FFT_SIZE/2;result[i]=weight[k]>1e-8f?out[k]/weight[k]:audio->samples[i];}
     char voice_path[512], damaged_path[512];
     snprintf(voice_path,sizeof(voice_path),"%s_voice_candidate.wav",prefix);
@@ -479,11 +533,14 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
         if(removed) {for(int i=0;i<audio->count;i++)removed[i]=audio->samples[i]-result[i];wr=write_wav(damaged_path,removed,audio->count);delete[] removed;}
     }
     if(wr.ok) {
-        printf("tonal destruction: %d STFT frames, %d Hz bin spacing, %d suppressed frame-bin decisions\n",frames,SAMPLE_RATE/FFT_SIZE,suppressed);
-        printf("wrote %s (candidate after stable-tone suppression)\n",voice_path);
+        printf("destruction: %d STFT frames, %d Hz bin spacing, %d attenuated frame-bin decisions\n",frames,SAMPLE_RATE/FFT_SIZE,suppressed);
+        printf("low cut: %.0f Hz strongly attenuated, fading to full level at %.0f Hz\n",LOW_CUT_START_HZ,LOW_CUT_END_HZ);
+        printf("transient suppression: isolated broadband attacks, capped at 72%%\n");
+        printf("wrote %s (candidate after tonal, low-end and transient suppression)\n",voice_path);
         printf("wrote %s (removed component; listen for what was destroyed)\n",damaged_path);
     }
-    delete[] result;delete[] magnitudes;delete[] peaks;delete[] re;delete[] im;delete[] out;delete[] weight;
+    delete[] result;delete[] magnitudes;delete[] peaks;delete[] spectral_flux;delete[] spectral_flatness;
+    delete[] re;delete[] im;delete[] out;delete[] weight;
     return wr;
 }
 
