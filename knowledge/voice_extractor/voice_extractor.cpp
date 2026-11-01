@@ -370,7 +370,7 @@ static const int FFT_HOP = 256;
 static const int TONAL_RADIUS = 16; /* 512 ms on either side */
 static const float LOW_CUT_START_HZ = 90.0f;
 static const float LOW_CUT_END_HZ = 180.0f;
-static const float LOW_CUT_FLOOR = 0.08f; /* retain 8% below the cutoff */
+static const float LOW_CUT_FLOOR = 0.0f; /* fully remove sub-90 Hz energy */
 
 static void fft(float *re, float *im, bool inverse) {
     int j=0;
@@ -404,18 +404,31 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
     unsigned char *peaks=new(std::nothrow) unsigned char[(size_t)frames*FFT_BINS];
     float *spectral_flux=new(std::nothrow) float[frames];
     float *spectral_flatness=new(std::nothrow) float[frames];
+    float *low_flux=new(std::nothrow) float[frames];
+    float *mid_flux=new(std::nothrow) float[frames];
+    float *high_flux=new(std::nothrow) float[frames];
+    float *low_energy=new(std::nothrow) float[frames];
+    float *mid_energy=new(std::nothrow) float[frames];
+    float *high_energy=new(std::nothrow) float[frames];
+    float *clap_gain=new(std::nothrow) float[frames];
+    unsigned char *drum_mask=new(std::nothrow) unsigned char[frames];
     float *re=new(std::nothrow) float[FFT_SIZE];
     float *im=new(std::nothrow) float[FFT_SIZE];
     float *out=new(std::nothrow) float[padded];
     float *weight=new(std::nothrow) float[padded];
-    if(!magnitudes||!peaks||!spectral_flux||!spectral_flatness||!re||!im||!out||!weight) {
+    if(!magnitudes||!peaks||!spectral_flux||!spectral_flatness||!low_flux||!mid_flux||!high_flux||!low_energy||!mid_energy||!high_energy||!clap_gain||!drum_mask||!re||!im||!out||!weight) {
         delete[] magnitudes;delete[] peaks;delete[] spectral_flux;delete[] spectral_flatness;
+        delete[] low_flux;delete[] mid_flux;delete[] high_flux;delete[] low_energy;delete[] mid_energy;delete[] high_energy;delete[] clap_gain;delete[] drum_mask;
         delete[] re;delete[] im;delete[] out;delete[] weight;
         FAIL("out of memory allocating tonal-destruction STFT");
     }
     memset(peaks,0,(size_t)frames*FFT_BINS);
     memset(spectral_flux,0,sizeof(float)*frames);
     memset(spectral_flatness,0,sizeof(float)*frames);
+    memset(low_flux,0,sizeof(float)*frames);memset(mid_flux,0,sizeof(float)*frames);memset(high_flux,0,sizeof(float)*frames);
+    memset(low_energy,0,sizeof(float)*frames);memset(mid_energy,0,sizeof(float)*frames);memset(high_energy,0,sizeof(float)*frames);
+    for(int f=0;f<frames;f++) clap_gain[f]=1.0f;
+    memset(drum_mask,0,(size_t)frames);
     const float pi=PI_F;
     for(int f=0;f<frames;f++) {
         int base=f*FFT_HOP;
@@ -435,18 +448,24 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
         /* Spectral flux catches abrupt broadband attacks such as clicks and
          * claps. Flatness rejects attacks dominated by one narrow tone. */
         double positive_flux=0.0, previous_energy=1e-12, log_sum=0.0, arithmetic_sum=0.0;
+        double lf=0.0,mf=0.0,hf=0.0,lp=1e-9,mp=1e-9,hp=1e-9;
+        double le=0.0,me=0.0,he=0.0;
         int first_bin=5;
         for(int b=first_bin;b<FFT_BINS;b++) {
             float m=magnitudes[(size_t)f*FFT_BINS+b];
             arithmetic_sum+=m;
             log_sum+=logf(fmaxf(m,1e-12f));
-            if(f>0) {
-                float prev=magnitudes[(size_t)(f-1)*FFT_BINS+b];
-                if(m>prev) positive_flux+=(double)(m-prev);
-                previous_energy+=prev;
-            }
+            float prev=f>0?magnitudes[(size_t)(f-1)*FFT_BINS+b]:0.0f;
+            if(f>0 && m>prev) positive_flux+=(double)(m-prev);
+            if(f>0) previous_energy+=prev;
+            const float hz=(float)b*SAMPLE_RATE/FFT_SIZE;
+            if(hz<250.0f) { le+=m; if(m>prev)lf+=(m-prev); if(f>0)lp+=prev; }
+            else if(hz<900.0f) { me+=m; if(m>prev)mf+=(m-prev); if(f>0)mp+=prev; }
+            else { he+=m; if(m>prev)hf+=(m-prev); if(f>0)hp+=prev; }
         }
         spectral_flux[f]=(float)(positive_flux/previous_energy);
+        low_flux[f]=(float)(lf/lp);mid_flux[f]=(float)(mf/mp);high_flux[f]=(float)(hf/hp);
+        low_energy[f]=(float)le;mid_energy[f]=(float)me;high_energy[f]=(float)he;
         const int flat_bins=FFT_BINS-first_bin;
         const float arithmetic=(float)(arithmetic_sum/flat_bins);
         spectral_flatness[f]=arithmetic>1e-12f
@@ -460,6 +479,109 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
             if(m>mean*2.0f && m>side*2.0f && m>magnitudes[(size_t)f*FFT_BINS+b-1] && m>=magnitudes[(size_t)f*FFT_BINS+b+1])
                 peaks[(size_t)f*FFT_BINS+b]=1;
         }
+    }
+    /*
+     * Seed-envelope modulation recovery.
+     * Select a few isolated, dynamically varying bins as clean modulation
+     * references. A matched target bin keeps its own STFT carrier/content;
+     * only its gain envelope is borrowed from the seed.
+     */
+    const int MAX_SEEDS=8;
+    float *seed_env=new(std::nothrow) float[(size_t)frames*MAX_SEEDS];
+    int *mod_seed=new(std::nothrow) int[FFT_BINS];
+    int *mod_lag=new(std::nothrow) int[FFT_BINS];
+    if(!seed_env||!mod_seed||!mod_lag) {
+        delete[] seed_env;delete[] mod_seed;delete[] mod_lag;
+        delete[] magnitudes;delete[] peaks;delete[] spectral_flux;delete[] spectral_flatness;
+        delete[] low_flux;delete[] mid_flux;delete[] high_flux;delete[] low_energy;delete[] mid_energy;delete[] high_energy;delete[] clap_gain;delete[] drum_mask;
+        delete[] re;delete[] im;delete[] out;delete[] weight;
+        FAIL("out of memory allocating modulation recovery");
+    }
+    for(int b=0;b<FFT_BINS;b++){mod_seed[b]=-1;mod_lag[b]=0;}
+    float seed_score[FFT_BINS]={};
+    for(int b=4;b<FFT_BINS-4;b++) {
+        float hz=(float)b*SAMPLE_RATE/FFT_SIZE;
+        if(hz<180.0f||hz>7000.0f)continue;
+        double sum=0.0,sum2=0.0,contrast=0.0;int peak_hits=0;
+        for(int f=0;f<frames;f++) {
+            float v=magnitudes[(size_t)f*FFT_BINS+b];
+            sum+=v;sum2+=(double)v*v;
+            float side=0.5f*(magnitudes[(size_t)f*FFT_BINS+b-2]+magnitudes[(size_t)f*FFT_BINS+b+2]);
+            contrast+=v/(side+1e-8f);
+            if(peaks[(size_t)f*FFT_BINS+b])peak_hits++;
+        }
+        double mean=sum/frames;
+        double cv=mean>1e-10?sqrt(fmax(0.0,sum2/frames-mean*mean))/mean:0.0;
+        float peak_rate=(float)peak_hits/frames;
+        float isolation=(float)(contrast/frames);
+        /* Reject stationary partials and broadband/noisy bins. */
+        if(isolation>1.35f&&cv>0.22&&peak_rate<0.62f)
+            seed_score[b]=(isolation-1.0f)*(float)fmin(cv,1.5);
+    }
+    int seed_bins[MAX_SEEDS],seed_count=0;
+    for(int n=0;n<MAX_SEEDS;n++) {
+        int best=-1;float score=0.0f;
+        for(int b=4;b<FFT_BINS-4;b++) {
+            if(seed_score[b]<=score)continue;
+            bool spaced=true;for(int j=0;j<seed_count;j++)if(abs(b-seed_bins[j])<4)spaced=false;
+            if(spaced){best=b;score=seed_score[b];}
+        }
+        if(best<0)break;
+        seed_bins[seed_count++]=best;seed_score[best]=0.0f;
+    }
+    for(int j=0;j<seed_count;j++) {
+        int b=seed_bins[j];double mean=0.0;
+        for(int f=0;f<frames;f++){float v=magnitudes[(size_t)f*FFT_BINS+b];seed_env[(size_t)f*MAX_SEEDS+j]=v;mean+=v;}
+        mean/=frames;
+        for(int f=0;f<frames;f++) {
+            float v=seed_env[(size_t)f*MAX_SEEDS+j]/(float)(mean+1e-8);
+            float smooth=v;int count=1;
+            if(f>0){smooth+=seed_env[(size_t)(f-1)*MAX_SEEDS+j]/(float)(mean+1e-8);count++;}
+            if(f+1<frames){smooth+=seed_env[(size_t)(f+1)*MAX_SEEDS+j]/(float)(mean+1e-8);count++;}
+            seed_env[(size_t)f*MAX_SEEDS+j]=fminf(1.0f,fmaxf(0.15f,smooth/count));
+        }
+    }
+    int modulation_targets=0;
+    for(int b=4;b<FFT_BINS-2;b++) {
+        bool is_seed=false;for(int j=0;j<seed_count;j++)if(seed_bins[j]==b)is_seed=true;
+        if(is_seed)continue;
+        float best_corr=0.0f;int best_seed=-1,best_lag=0;
+        for(int j=0;j<seed_count;j++)for(int lag=-2;lag<=2;lag++) {
+            int begin=lag<0?-lag:0,end=frames-(lag>0?lag:0),n=end-begin;
+            if(n<32)continue;
+            double mx=0.0,my=0.0;
+            for(int f=begin;f<end;f++){mx+=magnitudes[(size_t)f*FFT_BINS+b];my+=seed_env[(size_t)(f+lag)*MAX_SEEDS+j];}
+            mx/=n;my/=n;double cross=0.0,ex=0.0,ey=0.0;
+            for(int f=begin;f<end;f++){
+                double x=magnitudes[(size_t)f*FFT_BINS+b]-mx;
+                double y=seed_env[(size_t)(f+lag)*MAX_SEEDS+j]-my;
+                cross+=x*y;ex+=x*x;ey+=y*y;
+            }
+            double den=sqrt(ex*ey);float corr=den>1e-16?(float)(cross/den):0.0f;
+            if(corr>best_corr){best_corr=corr;best_seed=j;best_lag=lag;}
+        }
+        if(best_corr>=0.72f){mod_seed[b]=best_seed;mod_lag[b]=best_lag;modulation_targets++;}
+    }
+
+    /* Classify percussion only after every frame's features are available. */
+    for(int f=0;f+1<frames;f++) {
+        bool clap=(high_flux[f]>0.48f && mid_flux[f]>0.34f &&
+                   spectral_flatness[f]>0.18f &&
+                   high_flux[f+1]<high_flux[f]*0.88f &&
+                   spectral_flux[f]>0.30f);
+        bool drum=(low_flux[f]>0.72f && low_energy[f]>(mid_energy[f]+high_energy[f])*0.12f &&
+                   low_flux[f+1]<low_flux[f]*0.90f);
+        if(clap) {
+            /* Strong initial cut, slow recovery, then a smooth release.
+               Total window: 32-frame hold/recovery + 20-frame release. */
+            for(int k=0;k<52 && f+k<frames;k++) {
+                float g;
+                if(k<32) g=0.02f+0.33f*(float)k/31.0f;
+                else g=0.35f+0.65f*(float)(k-32)/19.0f;
+                if(g<clap_gain[f+k]) clap_gain[f+k]=g;
+            }
+        }
+        if(drum) for(int k=f;k<frames && k<f+6;k++) drum_mask[k]=1;
     }
     memset(out,0,sizeof(float)*padded);memset(weight,0,sizeof(float)*padded);
     int suppressed=0;
@@ -480,11 +602,11 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
             int hits=0,total=0;
             for(int tf=lo;tf<hi;tf++) {bool hit=false;for(int db=-1;db<=1;db++){int q=b+db;if(q>=0&&q<FFT_BINS&&peaks[(size_t)tf*FFT_BINS+q])hit=true;}if(hit)hits++;total++;}
             float persistence=total?(float)hits/total:0.0f;
-            float tonal_amount=(total>=20 && persistence>0.62f)?fminf(0.88f,(persistence-0.62f)*2.2f):0.0f;
+            /* Persistent narrow partials are treated as instrumental and removed
+               completely, rather than merely turned down. */
+            float tonal_amount=(total>=20 && persistence>0.62f)?1.0f:0.0f;
 
-            /* Aggressive low-end cut: strongest below 90 Hz, fading to full
-             * level by 180 Hz. This targets kick/bass rumble but can thin
-             * low male voices, so a little sub-cut energy is retained. */
+            /* Fully remove sub-90 Hz energy; fade back to full level by 180 Hz. */
             const float hz=(float)b*SAMPLE_RATE/FFT_SIZE;
             float low_gain=1.0f;
             if(hz<LOW_CUT_START_HZ) low_gain=LOW_CUT_FLOOR;
@@ -493,22 +615,21 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
                 low_gain=LOW_CUT_FLOOR+(1.0f-LOW_CUT_FLOOR)*t;
             }
 
-            /* Isolated broadband attacks: require a strong positive spectral
-             * flux, a rapid flux drop in the following frame, and a fairly
-             * noise-like spectrum. This is intentionally capped because
-             * speech plosives can resemble clicks. */
-            float attack_amount=0.0f;
-            if(f+1<frames && spectral_flux[f]>0.42f &&
-               spectral_flux[f+1]<spectral_flux[f]*0.58f &&
-               spectral_flatness[f]>0.12f) {
-                attack_amount=fminf(0.72f,(spectral_flux[f]-0.42f)*0.9f);
-            }
-            /* Avoid removing the low-frequency body of an attack twice; the
-             * low-cut handles kick energy, while transient suppression is
-             * focused on the upper spectrum where claps/clicks are broad. */
+            /* Claps receive a deep, long attenuation with a gradual release.
+             * Speech plosives can still resemble attacks, so clap decisions
+             * require simultaneous mid/high-band flux and spectral flatness. */
             float transient_gain=1.0f;
-            if(hz>=900.0f && hz<=7600.0f) transient_gain=1.0f-attack_amount;
-            float scale=(original>1e-12f)?(1.0f-tonal_amount)*low_gain*transient_gain:1.0f;
+            if(hz>=250.0f && hz<=8000.0f)
+                transient_gain=fminf(transient_gain,clap_gain[f]);
+            if(drum_mask[f] && hz>=35.0f && hz<=420.0f) {
+                transient_gain=fminf(transient_gain,0.10f);
+            }
+            float modulation_gain=1.0f;
+            if(mod_seed[b]>=0&&tonal_amount<0.5f) {
+                int sf=f+mod_lag[b];if(sf<0)sf=0;if(sf>=frames)sf=frames-1;
+                modulation_gain=seed_env[(size_t)sf*MAX_SEEDS+mod_seed[b]];
+            }
+            float scale=(original>1e-12f)?(1.0f-tonal_amount)*low_gain*transient_gain*modulation_gain:1.0f;
             if(tonal_amount>0.05f || low_gain<0.99f || transient_gain<0.99f) suppressed++;
             re[b]*=scale; im[b]*=scale;
             if(b>0&&b<FFT_SIZE/2){re[FFT_SIZE-b]=re[b];im[FFT_SIZE-b]=-im[b];}
@@ -522,25 +643,50 @@ static Result destroy_stable_tones(const Audio *audio,const char *prefix) {
         }
     }
     float *result=new(std::nothrow) float[audio->count];
-    if(!result){delete[] magnitudes;delete[] peaks;delete[] spectral_flux;delete[] spectral_flatness;delete[] re;delete[] im;delete[] out;delete[] weight;FAIL("out of memory allocating tonal-destruction output");}
+    if(!result){delete[] magnitudes;delete[] peaks;delete[] spectral_flux;delete[] spectral_flatness;
+        delete[] low_flux;delete[] mid_flux;delete[] high_flux;delete[] low_energy;delete[] mid_energy;delete[] high_energy;delete[] clap_gain;delete[] drum_mask;
+        delete[] re;delete[] im;delete[] out;delete[] weight;delete[] seed_env;delete[] mod_seed;delete[] mod_lag;
+        FAIL("out of memory allocating tonal-destruction output");}
     for(int i=0;i<audio->count;i++) {int k=i+FFT_SIZE/2;result[i]=weight[k]>1e-8f?out[k]/weight[k]:audio->samples[i];}
     char voice_path[512], damaged_path[512];
     snprintf(voice_path,sizeof(voice_path),"%s_voice_candidate.wav",prefix);
     snprintf(damaged_path,sizeof(damaged_path),"%s_removed_tones.wav",prefix);
-    Result wr=write_wav(voice_path,result,audio->count);
-    if(wr.ok) {
-        float *removed=new(std::nothrow) float[audio->count];
-        if(removed) {for(int i=0;i<audio->count;i++)removed[i]=audio->samples[i]-result[i];wr=write_wav(damaged_path,removed,audio->count);delete[] removed;}
+
+    /* Preserve the actual removed component, then normalize only the candidate. */
+    float *removed=new(std::nothrow) float[audio->count];
+    if(!removed) {
+        delete[] result;delete[] magnitudes;delete[] peaks;delete[] spectral_flux;delete[] spectral_flatness;
+        delete[] low_flux;delete[] mid_flux;delete[] high_flux;delete[] low_energy;delete[] mid_energy;delete[] high_energy;delete[] clap_gain;delete[] drum_mask;
+        delete[] re;delete[] im;delete[] out;delete[] weight;delete[] seed_env;delete[] mod_seed;delete[] mod_lag;
+        FAIL("out of memory allocating removed-component output");
     }
+    float candidate_peak=0.0f;
+    for(int i=0;i<audio->count;i++) {
+        removed[i]=audio->samples[i]-result[i];
+        float a=fabsf(result[i]);
+        if(a>candidate_peak) candidate_peak=a;
+    }
+    const float normalization_gain=(candidate_peak>1.0e-6f)?(0.95f/candidate_peak):1.0f;
+    for(int i=0;i<audio->count;i++) result[i]*=normalization_gain;
+
+    Result wr=write_wav(voice_path,result,audio->count);
+    if(wr.ok) wr=write_wav(damaged_path,removed,audio->count);
+    delete[] removed;
     if(wr.ok) {
         printf("destruction: %d STFT frames, %d Hz bin spacing, %d attenuated frame-bin decisions\n",frames,SAMPLE_RATE/FFT_SIZE,suppressed);
         printf("low cut: %.0f Hz strongly attenuated, fading to full level at %.0f Hz\n",LOW_CUT_START_HZ,LOW_CUT_END_HZ);
-        printf("transient suppression: isolated broadband attacks, capped at 72%%\n");
-        printf("wrote %s (candidate after tonal, low-end and transient suppression)\n",voice_path);
+        int clap_frames=0,drum_frames=0;for(int f=0;f<frames;f++){if(clap_gain[f]<0.999f)clap_frames++;if(drum_mask[f])drum_frames++;}
+        printf("percussion suppression: %d clap-like frames (250-8000 Hz), %d drum-like frames (35-420 Hz)\n",clap_frames,drum_frames);
+        printf("percussion attenuation: claps start at 98%% reduction with a 832 ms recovery/release; drums at 90%% reduction\n");
+        printf("modulation recovery: %d seed bins, %d matched target bins (correlation >= 0.72)\n",seed_count,modulation_targets);
+        printf("voice candidate peak normalization: %.3fx gain (target peak 0.95)\n",normalization_gain);
+        printf("wrote %s (peak-normalized candidate after suppression)\n",voice_path);
         printf("wrote %s (removed component; listen for what was destroyed)\n",damaged_path);
     }
     delete[] result;delete[] magnitudes;delete[] peaks;delete[] spectral_flux;delete[] spectral_flatness;
+    delete[] low_flux;delete[] mid_flux;delete[] high_flux;delete[] low_energy;delete[] mid_energy;delete[] high_energy;delete[] clap_gain;delete[] drum_mask;
     delete[] re;delete[] im;delete[] out;delete[] weight;
+    delete[] seed_env;delete[] mod_seed;delete[] mod_lag;
     return wr;
 }
 
