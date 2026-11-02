@@ -354,8 +354,6 @@ The benchmark writes contaminated WAV files and `results.json` into the output d
 
 ## Run reconstruction
 
-After the reconstruction source and Makefile target are available:
-
 ```sh
 ./voice_template_reconstruct \
     template.wav \
@@ -391,6 +389,7 @@ Do not judge separation quality from correlation or SI-SDR alone. Listen to both
 
 - Synthetic contamination benchmark: implemented and run.
 - Baseline metrics: available in the benchmark `results.json`.
-- Log/time-shift reconstruction: experimental implementation planned.
+- Log/time-shift reconstruction: experimental implementation in
+  `voice_template_reconstruct`.
 - Reconstruction output quality: not yet validated.
 

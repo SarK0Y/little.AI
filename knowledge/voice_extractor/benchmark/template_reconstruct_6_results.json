@@ -1,0 +1,15 @@
+{
+  "method": "template log/time-shift soft mask",
+  "formula": "Y[i] = ln(sum_{k=bottom}^{top} (S[i+k]+S[i+k+shift])/2 + eps)",
+  "feature_bottom": 0,
+  "feature_top": 7,
+  "shift_frames": 4,
+  "epsilon": 1e-10,
+  "z_threshold": 1.5,
+  "mask_strength": 0.35,
+  "mask_floor": 0.05,
+  "correlation": 0.913228,
+  "si_sdr_db": 7.01009,
+  "residual_rms": 0.00497197,
+  "average_mask": 0.84365
+}

@@ -1,4 +1,3 @@
-```cpp
 #include <sndfile.h>
 #include <fftw3.h>
 
@@ -31,14 +30,14 @@ struct Audio {
 struct Spectrogram {
     int frames = 0;
     int bins = NFFT / 2 + 1;
-    vector<Complex> data;
+    vector<double> data; // interleaved real/imaginary
 
-    Complex* at(int frame, int bin) {
-        return data.data() + frame * bins + bin;
+    double* at(int frame, int bin) {
+        return data.data() + size_t(frame * bins + bin) * 2;
     }
 
-    const Complex* at(int frame, int bin) const {
-        return data.data() + frame * bins + bin;
+    const double* at(int frame, int bin) const {
+        return data.data() + size_t(frame * bins + bin) * 2;
     }
 };
 
@@ -156,7 +155,7 @@ vector<double> hann_window() {
 Spectrogram stft(const Audio& audio) {
     Spectrogram s;
     s.frames = int(audio.x.size() / HOP) + 1;
-    s.data.resize(s.frames * s.bins);
+    s.data.resize(size_t(s.frames) * s.bins * 2);
 
     auto window = hann_window();
 
@@ -244,7 +243,7 @@ Audio istft(const Spectrogram& s, int sr, size_t length) {
     return audio;
 }
 
-double magnitude(const Complex* z) {
+double magnitude(const double* z) {
     return hypot(z[0], z[1]);
 }
 
@@ -386,5 +385,4 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-```
 

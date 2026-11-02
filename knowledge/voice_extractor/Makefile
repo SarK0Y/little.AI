@@ -2,7 +2,7 @@ CXX      ?= c++
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -Wpedantic
 LDFLAGS  ?=
 
-TARGETS := voice_extractor voice_reconstruct voice_template_benchmark voice_template_recovery
+TARGETS := voice_extractor voice_reconstruct voice_template_benchmark voice_template_recovery voice_template_reconstruct
 
 SOURCE   := voice_extractor.cpp
 OBJECTS  := $(SOURCE:.cpp=.o)
@@ -13,10 +13,13 @@ BENCHMARK_OBJECT := $(BENCHMARK_SOURCE:.cpp=.o)
 RECOVERY_SOURCE := voice_template_recovery.cpp
 RECOVERY_OBJECT := $(RECOVERY_SOURCE:.cpp=.o)
 
+RECONSTRUCT_SOURCE := voice_template_reconstruct.cpp
+RECONSTRUCT_OBJECT := $(RECONSTRUCT_SOURCE:.cpp=.o)
+
 INPUT  ?= template.wav
 OUTDIR ?= benchmark
 
-.PHONY: all clean benchmark run-benchmark recovery run-recovery run-all-recoveries
+.PHONY: all clean benchmark run-benchmark recovery run-recovery run-all-recoveries reconstruct run-reconstruct
 
 all: $(TARGETS)
 
@@ -40,6 +43,14 @@ voice_template_recovery: $(RECOVERY_OBJECT)
 
 recovery: voice_template_recovery
 
+voice_template_reconstruct: $(RECONSTRUCT_OBJECT)
+	$(CXX) $(LDFLAGS) -o $@ $^ -lsndfile -lfftw3 -lm
+
+reconstruct: voice_template_reconstruct
+
+run-reconstruct: voice_template_reconstruct
+	./voice_template_reconstruct $(INPUT) $(OUTDIR)/contaminated_sir_-12.wav $(OUTDIR)/template_reconstruct_-12
+
 run-recovery: voice_template_recovery
 	./voice_template_recovery $(INPUT) $(OUTDIR)/contaminated_sir_-12.wav $(OUTDIR)/recovery_-12
 
@@ -58,7 +69,8 @@ run-all-recoveries: voice_template_recovery
 clean:
 	$(RM) $(TARGETS) $(OBJECTS) 
 		template_reconstruct.o 
-		$(BENCHMARK_OBJECT) 
-		$(RECOVERY_OBJECT)
+#		$(BENCHMARK_OBJECT) 
+#		$(RECOVERY_OBJECT)
+#		$(RECONSTRUCT_OBJECT)
 	rm -rf $(OUTDIR)
 
