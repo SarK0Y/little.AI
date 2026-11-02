@@ -1,5 +1,5 @@
 {
-  "input": "/home/evg/Music/template.wav",
+  "input": "./template.wav",
   "sample_rate": 16000,
   "samples": 1232000,
   "noise_type": "synthetic broadband harmonic percussion",
