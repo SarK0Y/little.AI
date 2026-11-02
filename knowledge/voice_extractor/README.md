@@ -205,10 +205,19 @@ The clean template supplies the actual sound character:
 Template frames are analyzed every 10 ms using 25 ms windows. The matching
 stage compares the strongest local spectral peak in each of 18 frequency
 bands and adds a small continuity cost
-to discourage rapid frame-to-frame switching. The selected template LPC
-envelope is excited by a pulse train at the source pitch for voiced frames,
-or deterministic noise for unvoiced/uncertain frames. The result is a newly
-synthesized signal; no source waveform samples are copied or mixed into it.
+to discourage rapid frame-to-frame switching. The selected template LPC envelope is excited by a smooth harmonic glottal-like
+signal at the source pitch for voiced frames, or deterministic noise for
+unvoiced/uncertain frames. The result is a newly synthesized signal; no source
+waveform samples are copied or mixed into it.
+
+The synthesis stage uses **reflection coefficients** rather than interpolating
+raw LPC coefficients. Reflection coefficients are bounded and interpolated
+between adjacent template frames, then converted back into a stable LPC filter.
+This avoids the unstable-filter problem in the first prototype. The voiced
+excitation is a multi-harmonic periodic waveform rather than a one-sample
+impulse, and the output level is normalized by RMS (with a peak limiter) rather
+than allowing one isolated spike to set the entire file's gain. Non-finite and
+runaway filter samples are guarded before WAV writing.
 
 ### Build and run
 

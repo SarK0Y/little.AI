@@ -1,0 +1,44 @@
+{
+  "input": "/home/evg/Music/template.wav",
+  "sample_rate": 16000,
+  "samples": 1232000,
+  "noise_type": "synthetic broadband harmonic percussion",
+  "results": [
+    {
+      "sir_db": 12.000000,
+      "correlation": 0.969881,
+      "si_sdr_db": 12.001580,
+      "log_feature_mae": 0.755659,
+      "contaminated_wav": "benchmark/contaminated_sir_12.wav"
+    },
+    {
+      "sir_db": 6.000000,
+      "correlation": 0.894066,
+      "si_sdr_db": 6.003150,
+      "log_feature_mae": 1.063846,
+      "contaminated_wav": "benchmark/contaminated_sir_6.wav"
+    },
+    {
+      "sir_db": 0.000000,
+      "correlation": 0.707361,
+      "si_sdr_db": 0.006281,
+      "log_feature_mae": 1.452909,
+      "contaminated_wav": "benchmark/contaminated_sir_0.wav"
+    },
+    {
+      "sir_db": -6.000000,
+      "correlation": 0.448577,
+      "si_sdr_db": -5.987474,
+      "log_feature_mae": 1.930705,
+      "contaminated_wav": "benchmark/contaminated_sir_-6.wav"
+    },
+    {
+      "sir_db": -12.000000,
+      "correlation": 0.244279,
+      "si_sdr_db": -11.975026,
+      "log_feature_mae": 2.490058,
+      "contaminated_wav": "benchmark/contaminated_sir_-12.wav"
+    }
+  ],
+  "note": "Contamination metrics only. No source recovery is claimed."
+}

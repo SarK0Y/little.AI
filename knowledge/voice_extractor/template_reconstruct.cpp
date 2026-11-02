@@ -26,6 +26,7 @@ struct Audio { std::vector<float> x; };
 struct FrameModel {
     float feat[FEATURE_BANDS]{};
     float a[LPC_ORDER+1]{};
+    float reflection[LPC_ORDER+1]{};
     float residual=0.0f, rms=0.0f, probability=0.0f;
     bool voiced=false;
 };
@@ -101,21 +102,51 @@ static void spectrum_features(const float* x,float* feat) {
     float mean=0; for(float v: std::vector<float>(feat,feat+FEATURE_BANDS)) mean+=v;
     mean/=FEATURE_BANDS; for(int b=0;b<FEATURE_BANDS;b++) feat[b]-=mean;
 }
-static float lpc_analyze(const float* x,float* a) {
-    float y[WIN]; for(int n=0;n<WIN;n++) y[n]=x[n]-0.97f*(n?x[n-1]:0);
+static float lpc_analyze(const float* x,float* a,float* reflection) {
+    // Analyse the pre-emphasized signal. Reflection coefficients are retained
+    // separately so neighbouring template frames can be interpolated without
+    // destabilising the all-pole synthesis filter.
+    float y[WIN];
+    for(int n=0;n<WIN;n++) y[n]=x[n]-0.97f*(n?x[n-1]:0.0f);
     double r[LPC_ORDER+1]={};
-    for(int lag=0;lag<=LPC_ORDER;lag++) for(int n=lag;n<WIN;n++) r[lag]+=(double)y[n]*y[n-lag];
-    a[0]=1.0f; float prev[LPC_ORDER+1]={1.0f};
-    double err=r[0]+1e-12;
+    for(int lag=0;lag<=LPC_ORDER;lag++)
+        for(int n=lag;n<WIN;n++) r[lag]+=(double)y[n]*y[n-lag];
+
+    float prev[LPC_ORDER+1]={};
+    a[0]=1.0f;
+    prev[0]=1.0f;
+    double err=std::max(r[0],1e-12);
     for(int i=1;i<=LPC_ORDER;i++) {
-        double acc=r[i]; for(int j=1;j<i;j++) acc+=prev[j]*r[i-j];
-        double k=-acc/err; if(k>0.97)k=0.97;if(k< -0.97)k=-0.97;
-        for(int j=1;j<i;j++) a[j]=prev[j]+(float)k*prev[i-j];
-        a[i]=(float)k; for(int j=1;j<=i;j++)prev[j]=a[j];
-        err*=1.0-k*k; if(err<1e-12)err=1e-12;
+        double acc=r[i];
+        for(int j=1;j<i;j++) acc+=(double)prev[j]*r[i-j];
+        double k=-acc/err;
+        // A little margin from |k|=1 prevents extremely sharp, fragile poles.
+        k=std::max(-0.88,std::min(0.88,k));
+        reflection[i]=(float)k;
+        float next[LPC_ORDER+1]={};
+        next[0]=1.0f;
+        for(int j=1;j<i;j++) next[j]=prev[j]+(float)k*prev[i-j];
+        next[i]=(float)k;
+        for(int j=0;j<=i;j++) prev[j]=next[j];
+        err*=1.0-k*k;
+        err=std::max(err,1e-12);
     }
-    double gain=std::sqrt(err/WIN);
-    return (float)gain;
+    for(int i=0;i<=LPC_ORDER;i++) a[i]=prev[i];
+    return (float)std::sqrt(err/WIN);
+}
+
+static void lpc_from_reflection(const float* reflection,float* a) {
+    float prev[LPC_ORDER+1]={};
+    prev[0]=1.0f;
+    for(int i=1;i<=LPC_ORDER;i++) {
+        float k=std::max(-0.88f,std::min(0.88f,reflection[i]));
+        float next[LPC_ORDER+1]={};
+        next[0]=1.0f;
+        for(int j=1;j<i;j++) next[j]=prev[j]+k*prev[i-j];
+        next[i]=k;
+        for(int j=0;j<=i;j++) prev[j]=next[j];
+    }
+    for(int i=0;i<=LPC_ORDER;i++) a[i]=prev[i];
 }
 static float estimate_pitch(const float* x,float& confidence) {
     // Autocorrelation pitch tracker over the singer range (75-500 Hz).
@@ -145,7 +176,7 @@ static bool build_template(const Audio& t,std::vector<FrameModel>& alphabet) {
     for(int center=WIN/2;center<(int)t.x.size();center+=HOP) {
         get_frame(t,center,frame); FrameModel m;
         spectrum_features(frame,feat); std::memcpy(m.feat,feat,sizeof(feat));
-        m.residual=lpc_analyze(frame,m.a);
+        m.residual=lpc_analyze(frame,m.a,m.reflection);
         double rms=0;for(float v:frame)rms+=(double)v*v;m.rms=(float)std::sqrt(rms/WIN);
         float conf=0; m.voiced=estimate_pitch(frame,conf)>0 && conf>0.30f;
         if(m.rms>0.003f) { alphabet.push_back(m); if(m.voiced)voiced++; }
@@ -174,79 +205,140 @@ static bool reconstruct(const Audio& source,const std::vector<FrameModel>& alpha
     for(int f=0;f<frames;f++) {
         get_frame(source,f*HOP,frame);
         pitch[f]=estimate_pitch(frame,conf[f]);
-        double e=0;for(float v:frame)e+=(double)v*v;rms[f]=(float)std::sqrt(e/WIN);
+        double e=0.0;
+        for(float v:frame)e+=(double)v*v;
+        rms[f]=(float)std::sqrt(e/WIN);
         spectrum_features(frame,&features[(size_t)f*FEATURE_BANDS]);
     }
-    // Fill short pitch gaps and smooth only the contour, retaining vibrato.
-    for(int f=1;f<frames-1;f++) if(pitch[f]==0 && pitch[f-1]>0 && pitch[f+1]>0) pitch[f]=0.5f*(pitch[f-1]+pitch[f+1]);
+
+    // Bridge only one-frame pitch gaps; do not smear note changes or vibrato.
+    for(int f=1;f<frames-1;f++)
+        if(pitch[f]==0.0f && pitch[f-1]>0.0f && pitch[f+1]>0.0f)
+            pitch[f]=0.5f*(pitch[f-1]+pitch[f+1]);
+
     std::vector<int> chosen(frames,0);
     int previous=-1;
     for(int f=0;f<frames;f++) {
-        float best=1e30f; int bi=0;
+        float best=1e30f;
+        int bi=0;
         for(int j=0;j<(int)alphabet.size();j++) {
             float d=distance(&features[(size_t)f*FEATURE_BANDS],alphabet[j].feat);
-            // Template occurrence prior plus continuity penalty discourages
-            // frame-to-frame formant flicker without freezing the alphabet.
-            float cost=d + 0.10f*(-std::log(alphabet[j].probability+1e-9f));
+            float cost=d+0.10f*(-std::log(alphabet[j].probability+1e-9f));
             if(previous>=0 && j!=previous) cost+=0.025f;
             if(cost<best){best=cost;bi=j;}
         }
-        chosen[f]=bi; previous=bi;
+        chosen[f]=bi;
+        previous=bi;
     }
+
     std::vector<float> out(source.x.size(),0.0f);
-    float filter_state[LPC_ORDER+1]={}; float phase=0.0f; unsigned int rng=0x6d2b79f5u;
-    float source_rms_mean=0;for(float v:rms)source_rms_mean+=v;source_rms_mean/=std::max(1,frames);
-    int voiced_frames=0;
-    float deemph=0.0f;
-    for(size_t i=0;i<out.size();i++) {
-        int f=std::min(frames-1,(int)i/HOP);
-        int next=std::min(frames-1,f+1);
-        float blend=(float)(i%HOP)/(float)HOP;
+    float filter_state[LPC_ORDER+1]={};
+    float deemphasis_state=0.0f;
+    float phase=0.0f;
+    unsigned int rng=0x6d2b79f5u;
+    double source_rms_sum=0.0;
+    for(float v:rms) source_rms_sum+=v;
+    const float source_rms_mean=(float)(source_rms_sum/std::max(1,frames));
+    double template_rms_sum=0.0;
+    for(const auto& m:alphabet) template_rms_sum+=m.rms;
+    const float template_rms=(float)(template_rms_sum/alphabet.size());
+
+    // Stable, frame-wise LPC interpolation: interpolate reflection coefficients,
+    // then rebuild a stable predictor. Never interpolate raw LPC poles directly.
+    for(int f=0;f<frames;f++) {
+        const int next=std::min(frames-1,f+1);
         const FrameModel& m=alphabet[chosen[f]];
         const FrameModel& mn=alphabet[chosen[next]];
-        float f0=pitch[f]*(1.0f-blend)+pitch[next]*blend;
-        float cf=conf[f]*(1.0f-blend)+conf[next]*blend;
-        if(f0>0.0f && cf>0.20f) {
-            if(i%HOP==0 && pitch[f]>0.0f) voiced_frames++;
-            phase+=f0/SR;
-            float exc=0.0f;
-            if(phase>=1.0f){phase-=1.0f;exc=1.0f;}
-            float level=std::sqrt(std::max(0.00002f,rms[f]*(1.0f-blend)+rms[next]*blend)/(source_rms_mean+1e-6f));
-            level=std::max(0.35f,std::min(1.8f,level));
-            float residual=m.residual*(1.0f-blend)+mn.residual*blend;
-            float y=exc;
-            for(int k=1;k<=LPC_ORDER;k++) {
-                float ak=m.a[k]*(1.0f-blend)+mn.a[k]*blend;
-                y-=ak*filter_state[k];
+        float reflection[LPC_ORDER+1]={};
+        for(int k=1;k<=LPC_ORDER;k++)
+            reflection[k]=0.5f*(m.reflection[k]+mn.reflection[k]);
+        float a[LPC_ORDER+1]={};
+        lpc_from_reflection(reflection,a);
+        const float residual=std::max(1e-5f,0.5f*(m.residual+mn.residual));
+
+        const int begin=f*HOP;
+        const int finish=std::min((int)out.size(),begin+HOP);
+        for(int i=begin;i<finish;i++) {
+            const float blend=(float)(i-begin)/(float)HOP;
+            const float f0=pitch[f]*(1.0f-blend)+pitch[next]*blend;
+            const float cf=conf[f]*(1.0f-blend)+conf[next]*blend;
+            const float source_level=rms[f]*(1.0f-blend)+rms[next]*blend;
+            float level=source_level/(source_rms_mean+1e-6f);
+            level=std::max(0.30f,std::min(1.8f,level));
+
+            float excitation=0.0f;
+            if(f0>0.0f && cf>0.20f) {
+                // A smooth harmonic glottal-flow pulse, not a one-sample impulse.
+                phase+=std::max(60.0f,std::min(500.0f,f0))/(float)SR;
+                phase-=std::floor(phase);
+                for(int h=1;h<=10;h++)
+                    excitation+=std::cos(2.0f*PI*(float)h*phase)/(float)(h*h);
+                excitation*=1.55f; // approximately unit-ish excitation RMS
+            } else {
+                rng^=rng<<13; rng^=rng>>17; rng^=rng<<5;
+                excitation=((int)(rng>>8)-8388608)/8388608.0f;
+                excitation*=0.30f;
             }
-            for(int k=LPC_ORDER;k>1;k--)filter_state[k]=filter_state[k-1];
+
+            float y=excitation*residual;
+            for(int k=1;k<=LPC_ORDER;k++) y-=a[k]*filter_state[k];
+            if(!std::isfinite(y)) y=0.0f;
+            // Bound the recursive state so malformed template frames cannot run away.
+            y=std::max(-2.0f,std::min(2.0f,y));
+            for(int k=LPC_ORDER;k>1;k--) filter_state[k]=filter_state[k-1];
             filter_state[1]=y;
-            deemph=y+0.97f*deemph;
-            out[i]=deemph*residual*level*2.8f;
-        } else {
-            rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;
-            float exc=((int)(rng>>8)-8388608)/8388608.0f*0.22f;
-            float y=exc;
-            for(int k=1;k<=LPC_ORDER;k++) {
-                float ak=m.a[k]*(1.0f-blend)+mn.a[k]*blend;
-                y-=ak*filter_state[k];
-            }
-            for(int k=LPC_ORDER;k>1;k--)filter_state[k]=filter_state[k-1];
-            filter_state[1]=y;
-            deemph=y+0.97f*deemph;
-            out[i]=deemph*m.residual*0.8f;
+            float sample=y+0.97f*deemphasis_state;
+            if(!std::isfinite(sample)) sample=0.0f;
+            sample=std::max(-2.0f,std::min(2.0f,sample));
+            deemphasis_state=sample;
+            out[i]=sample*level;
         }
     }
-    float peak=0;
-    for(float v:out)peak=std::max(peak,std::fabs(v));
-    float gain=peak>1e-6f?0.90f/peak:1.0f;
-    for(float& v:out)v*=gain;
-    if(!write_wav(output,out)){std::fprintf(stderr,"cannot write %s\n",output);return false;}
-    std::printf("source analysis: %d frames, %d voiced/pitched frames\n",frames,voiced_frames);
-    std::printf("reconstruction: source pitch/vibrato retained where pitch tracking is confident; template LPC timbre; source waveform not mixed\n");
-    std::printf("output peak normalization: %.3fx (target 0.90)\n",gain);
+
+    // Loudness is set by RMS, not by a single isolated peak. This avoids the
+    // previous failure where a nearly silent file was amplified to a 0.90 peak.
+    double energy=0.0;
+    for(float v:out) {
+        if(!std::isfinite(v)) return false;
+        energy+=(double)v*v;
+    }
+    const float measured_rms=(float)std::sqrt(energy/std::max<size_t>(1,out.size()));
+    if(!(measured_rms>1e-6f) || !std::isfinite(measured_rms)) {
+        std::fprintf(stderr,"reconstruction failed: synthesis produced no usable signal (RMS %.8g)\n",measured_rms);
+        return false;
+    }
+    const float target_rms=std::max(0.025f,std::min(0.075f,template_rms*1.8f));
+    const float gain=std::max(0.1f,std::min(20.0f,target_rms/measured_rms));
+    float peak=0.0f;
+    for(float& v:out) {
+        v*=gain;
+        peak=std::max(peak,std::fabs(v));
+    }
+    if(peak>0.95f) {
+        const float limiter=0.95f/peak;
+        for(float& v:out) v=std::tanh(v*limiter*1.35f)/std::tanh(1.35f);
+    }
+    if(!write_wav(output,out)) {
+        std::fprintf(stderr,"cannot write %s\n",output);
+        return false;
+    }
+    double final_energy=0.0;
+    int active=0;
+    float final_peak=0.0f;
+    for(float v:out) {
+        final_energy+=(double)v*v;
+        final_peak=std::max(final_peak,std::fabs(v));
+        if(std::fabs(v)>0.01f) active++;
+    }
+    const float final_rms=(float)std::sqrt(final_energy/std::max<size_t>(1,out.size()));
+    std::printf("source analysis: %d frames; pitch contour retained where tracking is confident\n",frames);
+    std::printf("stable LPC synthesis: reflection-coefficient interpolation; harmonic voiced excitation; noise-shaped unvoiced excitation\n");
+    std::printf("template RMS %.5f; output RMS %.5f; peak %.5f; active samples %.1f%%\n",
+                template_rms,final_rms,final_peak,100.0f*(float)active/std::max<size_t>(1,out.size()));
+    std::printf("source waveform is not mixed into output\n");
     return true;
 }
+
 int main(int argc,char** argv) {
     if(argc<4){std::fprintf(stderr,"usage: %s source.wav clean_template.wav output.wav\n",argv[0]);return 2;}
     Audio source,templ;
@@ -256,3 +348,4 @@ int main(int argc,char** argv) {
     if(!build_template(templ,alphabet))return 1;
     return reconstruct(source,alphabet,argv[3])?0:1;
 }
+

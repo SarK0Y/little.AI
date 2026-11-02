@@ -1,0 +1,11 @@
+; loading "/usr/share/audacity/nyquist/init.lsp"
+Set *default-sf-dir* to "/tmp/" in fileio.lsp
+AutoNorm feature is on.
+Default sound file is evgeney-temp.wav.
+system.lsp : *RUNTIME-PATH* = /usr/share/audacity/nyquist/  
+
+Nyquist -- A Language for Sound Synthesis and Composition
+    Copyright (c) 1991,1992,1995,2007-2012 by Roger B. Dannenberg
+    Version 3.09
+
+; loading "/usr/share/audacity/nyquist/aud-do-support.lsp"
