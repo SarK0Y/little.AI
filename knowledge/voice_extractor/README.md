@@ -257,3 +257,140 @@ and incomplete results.
 
 The original `voice_extractor` remains available and unchanged as the
 destructive-filtering experiment. `voice_reconstruct` is a separate path.
+
+# Log/time-shift vocal reconstruction experiment
+
+This experiment tests a time-shifted logarithmic feature derived from a clean voice template and a contaminated recording.
+
+It is a separate experimental path from:
+
+- `voice_extractor` — destructive filtering and modulation-coherence experiment.
+- `voice_reconstruct` — template-powered voice synthesis.
+- `voice_separate` — template-guided source-preserving separation.
+
+## Feature concept
+
+For a signal \(S\), the proposed feature is:
+
+\[
+Y[i]=\ln\left(
+\sum_{k=b}^{t}
+\frac{S[i+k]+S[i+k+\text{shift}]}{2}
++\epsilon
+\right)
+\]
+
+The `shift` parameter represents a time shift, not a frequency shift.
+
+For STFT-based processing, this operation is evaluated independently for each frequency bin over time. A small epsilon prevents taking the logarithm of zero.
+
+The feature is intended to describe local temporal structure. It does not uniquely identify voice: percussion, harmonics, and other instruments may produce similar features.
+
+## Synthetic percussion benchmark
+
+The benchmark contaminates a clean vocal template with synthetic percussion at several signal-to-interference ratios (SIRs).
+
+The generated test cases include:
+
+| SIR | Meaning |
+|---:|---|
+| +12 dB | Voice dominates |
+| +6 dB | Voice is stronger |
+| 0 dB | Equal voice and interference power |
+| −6 dB | Interference is stronger |
+| −12 dB | Strong interference |
+
+The benchmark produces:
+
+- `clean.wav` — original template
+- `synth_percussion.wav` — generated percussion
+- `contaminated_sir_*.wav` — contaminated test recordings
+- `results.json` — baseline measurements
+
+The baseline measurements describe the contaminated input. They are not evidence that reconstruction has succeeded.
+
+## Log/time-shift reconstruction
+
+The planned `voice_template_reconstruct` executable uses the clean template to calculate a reference log/time-shift feature and compares it with the contaminated recording.
+
+The reconstruction experiment should report:
+
+- Correlation with the clean template
+- SI-SDR
+- Residual RMS
+- Feature parameters
+- Average applied mask or reconstruction statistics
+
+The reconstruction and residual outputs should both be retained for listening tests.
+
+**Experimental limitation:** Log/time-shift feature similarity alone cannot reliably distinguish voice from percussion. This is a deterministic DSP experiment, not a validated vocal separator.
+
+## Build requirements
+
+The benchmark and reconstruction experiments use C++17, libsndfile, and FFTW3.
+
+On Debian/Ubuntu, install the development packages:
+
+```sh
+sudo apt install build-essential libsndfile1-dev libfftw3-dev
+```
+
+Build the project:
+
+```sh
+make clean
+make
+```
+
+## Run the benchmark
+
+```sh
+mkdir -p benchmark
+
+./voice_template_benchmark template.wav benchmark
+```
+
+The benchmark writes contaminated WAV files and `results.json` into the output directory.
+
+## Run reconstruction
+
+After the reconstruction source and Makefile target are available:
+
+```sh
+./voice_template_reconstruct \
+    template.wav \
+    benchmark/contaminated_sir_-12.wav \
+    benchmark/template_reconstruct_-12
+```
+
+The intended output files are:
+
+```text
+benchmark/template_reconstruct_-12_reconstructed.wav
+benchmark/template_reconstruct_-12_residual.wav
+benchmark/template_reconstruct_-12_results.json
+```
+
+The output prefix's parent directory must already exist.
+
+## Listening and evaluation
+
+Compare the following at matched playback volume:
+
+1. Original clean template
+2. Synthetic percussion
+3. Contaminated input
+4. Reconstructed candidate
+5. Residual
+
+Repeat the test at each SIR. Listen for vocal harmonics and consonants that may be attenuated, and percussion that may leak into the reconstruction.
+
+Do not judge separation quality from correlation or SI-SDR alone. Listen to both output components and compare them with the original recordings.
+
+## Current status
+
+- Synthetic contamination benchmark: implemented and run.
+- Baseline metrics: available in the benchmark `results.json`.
+- Log/time-shift reconstruction: experimental implementation planned.
+- Reconstruction output quality: not yet validated.
+
