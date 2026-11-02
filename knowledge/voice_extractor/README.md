@@ -393,3 +393,125 @@ Do not judge separation quality from correlation or SI-SDR alone. Listen to both
   `voice_template_reconstruct`.
 - Reconstruction output quality: not yet validated.
 
+# Voice Template Profile Transfer
+
+Experimental C++ tool for locating vocal-like fragments in a target recording
+using a template WAV, estimating a local duration/speed ratio, and applying a
+template-derived amplitude envelope to the matched target fragments.
+
+## What it does
+
+The program has two modes:
+
+1. **`profile`** — scans `template.wav` for active regions, searches the target
+   for spectrally similar regions, and writes fragment boundaries, landmark
+   times, a speed estimate, and a cosine-similarity score to JSON.
+2. **`transfer`** — reads the JSON profile, transfers a template-derived
+   amplitude envelope onto the matched target fragments, and writes a WAV.
+   Samples outside matched fragments are zero (silence).
+
+This is an experimental DSP prototype, not a reliable vocal separator.
+
+## Important limitations
+
+- The current descriptor is a coarse log-spectral-envelope proxy. It is **not**
+  proper LPC formant tracking and cannot reliably identify a singer, word, or
+  phrase by itself.
+- A high similarity score is not proof that the match is correct. Listen to the
+  target and inspect the JSON before running transfer.
+- The output preserves the target waveform inside accepted fragments and
+  changes its amplitude envelope. It does not synthesize a new voice or perform
+  pitch-preserving time stretching.
+- The reported speed ratio is an average interval ratio:
+  `template_interval_duration / target_interval_duration`.
+  Values above 1 mean the target interval is shorter/faster than the template.
+- Sample rates must match. Resample either WAV first if necessary.
+- Input is converted to mono by averaging channels.
+
+## Requirements
+
+Linux (or another platform with compatible development packages), a C++17
+compiler, `libsndfile`, and FFTW3.
+
+On Debian/Ubuntu:
+
+```bash
+sudo apt install build-essential libsndfile1-dev libfftw3-dev
+```
+
+## Build
+
+```bash
+make
+```
+
+This builds:
+
+```text
+voice_template_profile_transfer
+```
+
+## Usage
+
+### 1. Create the fragment profile
+
+```bash
+./voice_template_profile_transfer profile \
+    template.wav target.wav voice_profile.json
+```
+
+The output JSON includes each accepted fragment's:
+
+- template start/end time
+- target start/end time
+- template and target landmark A/B
+- `speed_ratio_template_over_target`
+- `time_scale_target_over_template`
+- `confidence_cosine`
+
+The matcher uses a conservative similarity cutoff in this prototype. If the
+JSON contains no fragments, the matcher did not accept any candidates.
+
+### 2. Apply the envelope profile
+
+```bash
+./voice_template_profile_transfer transfer \
+    template.wav target.wav voice_profile.json target_vocal_profile.wav
+```
+
+Only the accepted target fragments are written; the rest of the output is
+silence.
+
+## Make variables
+
+The Makefile provides convenience targets:
+
+```bash
+make profile
+make run-profile TEMPLATE=template.wav TARGET=target.wav PROFILE_JSON=voice_profile.json
+
+make run-transfer TEMPLATE=template.wav TARGET=target.wav \
+    PROFILE_JSON=voice_profile.json OUTPUT=target_vocal_profile.wav
+```
+
+Defaults:
+
+| Variable | Default |
+|---|---|
+| `TEMPLATE` | `template.wav` |
+| `TARGET` | `target.wav` |
+| `PROFILE_JSON` | `voice_profile.json` |
+| `OUTPUT` | `target_vocal_profile.wav` |
+
+## Suggested workflow
+
+1. Start with a short, clean template phrase.
+2. Use a target containing the same or acoustically similar vocal material.
+3. Generate `voice_profile.json`.
+4. Check every fragment boundary and confidence score manually.
+5. Run transfer only after the matches look reasonable.
+6. Listen to the output and compare it with the original target.
+
+For different lyrics or substantially different articulation, formant/spectral
+matching may fail. The next development step should be robust formant tracking
+and multi-landmark alignment, with a user-reviewable match threshold.
