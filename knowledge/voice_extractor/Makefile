@@ -4,7 +4,7 @@ LDFLAGS  ?=
 
 TARGETS := voice_extractor voice_reconstruct \
            voice_template_benchmark voice_template_recovery \
-           voice_template_reconstruct voice_template_profile_transfer
+           voice_template_reconstruct voice_music_self_template
 
 SOURCE   := voice_extractor.cpp
 OBJECTS  := $(SOURCE:.cpp=.o)
@@ -12,17 +12,14 @@ OBJECTS  := $(SOURCE:.cpp=.o)
 BENCHMARK_OBJECT := voice_template_benchmark.o
 RECOVERY_OBJECT  := voice_template_recovery.o
 RECONSTRUCT_OBJECT := voice_template_reconstruct.o
-PROFILE_TRANSFER_OBJECT := voice_template_profile_transfer.o
+MUSIC_SELF_TEMPLATE_OBJECT := voice_music_self_template.o
 
-INPUT       ?= template.wav
-OUTDIR      ?= benchmark
-TARGET_WAV  ?= target.wav
-PROFILE_JSON ?= voice_profile.json
-OUTPUT      ?= profile_transfer.wav
+INPUT  ?= template.wav
+OUTDIR ?= benchmark
 
 .PHONY: all clean benchmark run-benchmark recovery run-recovery \
         run-all-recoveries reconstruct run-reconstruct run-all-reconstructs \
-        profile-transfer run-profile run-transfer
+        music-self-template run-music-self-template
 
 all: $(TARGETS)
 
@@ -75,28 +72,23 @@ run-all-reconstructs: voice_template_reconstruct
 			$(OUTDIR)/template_reconstruct_$$sir || exit $$?; \
 	done
 
-# Template-guided vocal-fragment profile transfer.
-# Requires libsndfile and FFTW3:
-#   sudo apt install libsndfile1-dev libfftw3-dev
-voice_template_profile_transfer: $(PROFILE_TRANSFER_OBJECT)
+
+# DB-free music structure / stereo analysis prototype.
+# Produces Mid/Side, stereo-unique, frequency-band WAVs, plus a repeat report.
+# Dependencies: libsndfile + FFTW3
+voice_music_self_template: $(MUSIC_SELF_TEMPLATE_OBJECT)
 	$(CXX) $(LDFLAGS) -o $@ $^ -lsndfile -lfftw3 -lm
 
-profile-transfer: voice_template_profile_transfer
+music-self-template: voice_music_self_template
 
-# Detect matching vocal fragments and write the profile JSON.
 # Example:
-#   make run-profile INPUT=template.wav TARGET_WAV=target.wav PROFILE_JSON=voice_profile.json
-run-profile: voice_template_profile_transfer
-	./voice_template_profile_transfer profile \
-		$(INPUT) $(TARGET_WAV) $(PROFILE_JSON)
+#   make run-music-self-template INPUT=stereo_song.wav
+#   make run-music-self-template INPUT=stereo_song.wav PREFIX=analysis REPORT=repeats.json
+PREFIX ?= stereo_analysis
+REPORT ?= $(PREFIX)_repeats.json
 
-# Apply the saved profile to matched fragments; unmatched sections become silence.
-# Example:
-#   make run-transfer INPUT=template.wav TARGET_WAV=target.wav \
-#       PROFILE_JSON=voice_profile.json OUTPUT=matched_vocals.wav
-run-transfer: voice_template_profile_transfer
-	./voice_template_profile_transfer transfer \
-		$(INPUT) $(TARGET_WAV) $(PROFILE_JSON) $(OUTPUT)
+run-music-self-template: voice_music_self_template
+	./voice_music_self_template $(INPUT) $(PREFIX) $(REPORT)
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
@@ -104,5 +96,5 @@ run-transfer: voice_template_profile_transfer
 clean:
 	$(RM) $(TARGETS) $(OBJECTS) \
 		template_reconstruct.o \
-		$(BENCHMARK_OBJECT) $(RECOVERY_OBJECT) $(RECONSTRUCT_OBJECT) \
-		$(PROFILE_TRANSFER_OBJECT)
+		$(BENCHMARK_OBJECT) $(RECOVERY_OBJECT) $(RECONSTRUCT_OBJECT)
+
