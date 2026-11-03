@@ -224,6 +224,109 @@ void write_report(const std::string& path, int sr, size_t frames,
     f << "  ]\n}\n";
 }
 
+
+// --- Reference-band experiment ------------------------------------------------
+// A low conditional entropy rate is a *candidate* property, not proof of music:
+// sustained vocals and stationary noise can also be predictable. We therefore
+// report it separately from beat-periodicity and cross-band temporal coherence.
+struct Biquad { double b0,b1,b2,a1,a2,x1=0,x2=0,y1=0,y2=0; };
+Biquad make_bandpass(double fc, double sr, double q) {
+    const double w=2.0*PI*fc/sr, alpha=std::sin(w)/(2.0*q), c=std::cos(w);
+    const double a0=1.0+alpha;
+    return {alpha/a0,0.0,-alpha/a0,-2.0*c/a0,(1.0-alpha)/a0};
+}
+double tick(Biquad& b,double x) {
+    const double y=b.b0*x+b.b1*b.x1+b.b2*b.x2-b.a1*b.y1-b.a2*b.y2;
+    b.x2=b.x1;b.x1=x;b.y2=b.y1;b.y1=y;return y;
+}
+double pearson(const std::vector<double>& a,const std::vector<double>& b) {
+    const size_t n=std::min(a.size(),b.size()); if(n<8)return 0.0;
+    double ma=0,mb=0;for(size_t i=0;i<n;i++){ma+=a[i];mb+=b[i];}ma/=n;mb/=n;
+    double xy=0,xx=0,yy=0;for(size_t i=0;i<n;i++){double x=a[i]-ma,y=b[i]-mb;xy+=x*y;xx+=x*x;yy+=y*y;}
+    return (xx>1e-18&&yy>1e-18)?xy/std::sqrt(xx*yy):0.0;
+}
+// Shannon entropy of the transition distribution between quantized envelope
+// states, normalized to [0,1]. This is an entropy-rate proxy, not source entropy.
+double transition_entropy(const std::vector<double>& env) {
+    constexpr int Q=8; if(env.size()<16)return 1.0;
+    double lo=*std::min_element(env.begin(),env.end()),hi=*std::max_element(env.begin(),env.end());
+    if(hi-lo<1e-12)return 0.0;
+    int counts[Q][Q]{};int row[Q]{};int total=0;
+    auto quant=[&](double x){return std::clamp((int)((x-lo)/(hi-lo)*Q),0,Q-1);};
+    for(size_t i=1;i<env.size();i++){int a=quant(env[i-1]),b=quant(env[i]);counts[a][b]++;row[a]++;total++;}
+    double h=0;
+    for(int a=0;a<Q;a++) if(row[a]) {
+        double pa=(double)row[a]/total, conditional=0;
+        for(int b=0;b<Q;b++)if(counts[a][b]){double p=(double)counts[a][b]/row[a];conditional-=p*std::log2(p);}
+        h+=pa*conditional;
+    }
+    return std::clamp(h/std::log2((double)Q),0.0,1.0);
+}
+// Beat-like periodicity: strongest normalized envelope autocorrelation in
+// roughly 60-240 BPM. It is intentionally not a beat detector.
+double beat_periodicity(const std::vector<double>& env,double env_rate) {
+    if(env.size()<32)return 0.0;
+    double mean=std::accumulate(env.begin(),env.end(),0.0)/env.size();
+    double energy=0;for(double x:env)energy+=(x-mean)*(x-mean);if(energy<1e-18)return 0;
+    int minlag=std::max(1,(int)(env_rate*0.25)), maxlag=std::min((int)env.size()/2,(int)(env_rate*1.0));
+    double best=0;
+    for(int lag=minlag;lag<=maxlag;lag++) {double c=0;for(size_t i=lag;i<env.size();i++)c+=(env[i]-mean)*(env[i-lag]-mean);best=std::max(best,c/energy);}
+    return std::clamp(best,0.0,1.0);
+}
+struct RefBand {
+    double fc=0, entropy=1, beat=0, coherence=0, score=0, rms=0;
+    std::vector<double> env;
+};
+void analyze_reference_bands(const std::vector<double>& mid,const std::vector<double>& side,
+                             int sr,const std::string& prefix) {
+    constexpr int BANDS=48, ENV_HOP=512, TOP=12;
+    const double minHz=80.0,maxHz=std::min(10000.0,sr*0.45);
+    const double q=8.65; // approx 1/6-octave bandwidth
+    const double envRate=(double)sr/ENV_HOP;
+    std::vector<RefBand> bands(BANDS);
+    std::vector<std::vector<double>> filtered(BANDS);
+    for(int b=0;b<BANDS;b++) {
+        double t=(double)b/(BANDS-1); bands[b].fc=minHz*std::pow(maxHz/minHz,t);
+        filtered[b].resize(mid.size()); Biquad bm=make_bandpass(bands[b].fc,sr,q), bs=make_bandpass(bands[b].fc,sr,q);
+        std::vector<double> env; env.reserve((mid.size()+ENV_HOP-1)/ENV_HOP);
+        double e=0;for(size_t i=0;i<mid.size();i++) {
+            double y=0.5*(tick(bm,mid[i])+tick(bs,side[i])); filtered[b][i]=y;
+            e+=y*y;
+            if((i+1)%ENV_HOP==0) { env.push_back(std::sqrt(e/ENV_HOP)); e=0; }
+        }
+        if(mid.size()%ENV_HOP && !mid.empty())
+            env.push_back(std::sqrt(e/(mid.size()%ENV_HOP)));
+        bands[b].env=std::move(env); bands[b].rms=std::sqrt(std::inner_product(filtered[b].begin(),filtered[b].end(),filtered[b].begin(),0.0)/std::max<size_t>(1,mid.size()));
+        bands[b].entropy=transition_entropy(bands[b].env); bands[b].beat=beat_periodicity(bands[b].env,envRate);
+    }
+    // Coherence with the remaining filterbank: use best non-neighbor envelope
+    // correlation, to avoid simply rewarding adjacent overlapping filters.
+    for(int b=0;b<BANDS;b++) {
+        double best=0;for(int j=0;j<BANDS;j++)if(std::abs(j-b)>=2)best=std::max(best,std::abs(pearson(bands[b].env,bands[j].env)));
+        bands[b].coherence=best;
+        // Separate metrics; score is only a ranking heuristic, not a probability.
+        bands[b].score=(1.0-bands[b].entropy)*(0.50+0.25*bands[b].beat+0.25*bands[b].coherence);
+    }
+    std::vector<int> order(BANDS);std::iota(order.begin(),order.end(),0);
+    std::sort(order.begin(),order.end(),[&](int a,int b){return bands[a].score>bands[b].score;});
+    std::ofstream csv(prefix+"_reference_band_scores.csv");
+    csv<<"rank,band,center_hz,rms,transition_entropy,beat_periodicity,cross_band_coherence,heuristic_score\n";
+    for(int rank=0;rank<BANDS;rank++){int b=order[rank];auto& z=bands[b];csv<<rank+1<<","<<b<<","<<z.fc<<","<<z.rms<<","<<z.entropy<<","<<z.beat<<","<<z.coherence<<","<<z.score<<"\n";}
+    // Export top candidate bands as filtered audio and an audible envelope track.
+    // Envelope WAV is amplitude-modulated 220 Hz, useful for hearing its rhythm.
+    for(int rank=0;rank<std::min(TOP,BANDS);rank++) {
+        int b=order[rank];const std::string stem=prefix+"_ref_"+std::to_string(rank+1)+"_"+std::to_string((int)std::round(bands[b].fc))+"Hz";
+        write_mono(stem+".wav",filtered[b],sr);
+        std::vector<double> pulse(mid.size(),0.0);const auto& env=bands[b].env;
+        double env_peak=env.empty()?0.0:*std::max_element(env.begin(),env.end());
+        for(size_t i=0;i<pulse.size();i++){double pos=(double)i/ENV_HOP;size_t k=env.empty()?0:std::min((size_t)pos,env.size()-1);double v=(env_peak>1e-12&&!env.empty())?env[k]/env_peak:0.0;pulse[i]=0.25*std::sin(2.0*PI*220.0*i/sr)*v;}
+        write_mono(stem+"_envelope.wav",pulse,sr);
+    }
+    std::cout<<"Reference-band ranking: "<<prefix<<"_reference_band_scores.csv\n"
+             <<"Exported top "<<std::min(TOP,BANDS)<<" filtered candidate bands + envelope WAVs.\n"
+             <<"Scores are heuristic evidence, NOT proof of music-only content.\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -259,6 +362,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    analyze_reference_bands(mid, side, a.samplerate, prefix);
+
     // A first-pass repeat scan on Mid; Side is often more useful for detecting
     // panned musical elements. We scan both and combine their reports.
     const auto mid_spec = make_spectral_frames(mid);
@@ -284,3 +389,4 @@ int main(int argc, char** argv) {
               << "Note: repetition matches are coarse candidates, not source-separated stems.\n";
     return 0;
 }
+

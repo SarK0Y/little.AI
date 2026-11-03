@@ -516,25 +516,80 @@ For different lyrics or substantially different articulation, formant/spectral
 matching may fail. The next development step should be robust formant tracking
 and multi-landmark alignment, with a user-reviewable match threshold.
 
-# Voice Music Self-Template
+# Music-Dominant Reference-Band Experiment
 
-Experimental C++ tool for analyzing stereo music recordings and exploring music-based evidence for vocal extraction.
+Experimental C++17 DSP prototype for ranking narrow frequency bands that may
+serve as **musical-temporal references** in a mixed recording.
 
-The main idea is to use the music itself as a reference rather than relying on a fixed vocal template.
+The working hypothesis is that some bands have relatively low temporal
+conditional entropy and preserve useful beat/music timing even when the full
+mix contains vocals. These bands may later help predict musical structure in
+vocal-contaminated regions.
 
-## Current Features
+**This tool does not separate vocals and music.** It ranks candidate bands and
+exports audio for listening and further experiments.
 
-- Reads stereo WAV files using `libsndfile`.
-- Creates Mid and Side signals.
-- Exports stereo-difference listening samples.
-- Extracts frequency bands using FFTW-based STFT processing.
-- Searches for potentially repeated musical sections using coarse spectral similarity.
-- Writes a JSON report containing repetition candidates.
-- Produces intermediate WAV files for listening and analysis.
+## What it does
+
+The program:
+
+1. Reads an audio file with libsndfile.
+2. Creates a Mid/Side representation from the first two channels.
+3. Analyzes 48 logarithmically spaced narrow bands, approximately 1/6-octave
+   bandwidth, from 80 Hz up to `min(10,000 Hz, 0.45 × sample rate)`.
+4. Computes separate temporal measurements for each band:
+   - **Transition entropy:** normalized conditional entropy of transitions
+     between 8 quantized envelope levels. Lower values mean more predictable
+     envelope transitions.
+   - **Beat-like periodicity:** strongest normalized envelope autocorrelation
+     over lag values corresponding approximately to 60–240 BPM.
+   - **Cross-band coherence:** strongest absolute Pearson envelope correlation
+     with a non-neighboring band (at least two filterbank indices away).
+   - **RMS:** band signal level.
+5. Ranks bands with a heuristic score.
+6. Exports the top 12 bands and audible envelope tracks.
+7. Keeps the earlier coarse repeated-window scan on Mid and Side.
+
+## Ranking score
+
+The current heuristic is:
+
+```text
+score = (1 - transition_entropy)
+        * (0.50 + 0.25 * beat_periodicity
+                 + 0.25 * cross_band_coherence)
+```
+
+Each normalized metric is in `[0, 1]`.
+
+Entropy is the primary gate in this ranking: beat periodicity and cross-band
+coherence refine the score. The score is **not a probability** and is not
+evidence of a music-only band by itself.
+
+### Important interpretation
+
+Low entropy means the band’s envelope transitions are more predictable. It
+does **not** establish that the band contains music rather than voice or noise:
+a sustained vocal note, stationary noise, or other regular signal may also
+have low entropy.
+
+The beat metric is only an autocorrelation-based periodicity indicator, not a
+beat tracker. Cross-band coherence is correlation, not proof that two bands
+belong to the same source.
+
+The intended next validation is listening and testing whether reference-band
+timing predicts musical events in other bands. The presumed music-to-vocal
+energy ratio (for example, music dominance above 0.9) is not directly measured
+from a single mixed recording by this prototype.
 
 ## Requirements
 
-Linux, C++17, and the following development libraries:
+- C++17 compiler
+- `make`
+- libsndfile development package
+- FFTW3 development package
+
+On Debian/Ubuntu:
 
 ```bash
 sudo apt install build-essential libsndfile1-dev libfftw3-dev
@@ -542,98 +597,98 @@ sudo apt install build-essential libsndfile1-dev libfftw3-dev
 
 ## Build
 
-From the project directory:
+Compile the source:
 
 ```bash
-make voice_music_self_template
+c++ -O2 -std=c++17 -Wall -Wextra -Wpedantic \
+    voice_music_self_template_entropy.cpp \
+    -lsndfile -lfftw3 -lm \
+    -o voice_music_self_template_entropy
 ```
+
+Or add a target to the project Makefile with the same source and libraries.
 
 ## Usage
 
 ```bash
-./voice_music_self_template input_stereo.wav [output_prefix] [report.json]
+./voice_music_self_template_entropy input_stereo.wav [output_prefix] [report.json]
 ```
 
 Example:
 
 ```bash
-./voice_music_self_template song.wav listen listen_repeats.json
+mkdir -p out
+./voice_music_self_template_entropy song.wav out/song out/song_repeats.json
 ```
 
-Or use the Makefile:
+Arguments:
 
-```bash
-make run-music-self-template INPUT=song.wav PREFIX=listen
-```
+| Argument | Meaning | Default |
+|---|---|---|
+| `input_stereo.wav` | Input audio file; required | — |
+| `output_prefix` | Prefix for generated files | `stereo` |
+| `report.json` | Repeated-window report path | `<prefix>_repeats.json` |
 
-## Generated WAV Files
+The input must have at least two channels. For files with more than two
+channels, the program uses only the first two channels. The input sample rate
+is retained; the program does not resample.
 
-For the prefix `listen`, the program generates:
+## Outputs
 
-| File | Description |
+For prefix `out/song`:
+
+| Output | Description |
 |---|---|
-| `listen_mid.wav` | Mid component: L+R |
-| `listen_side.wav` | Side component: L−R |
-| `listen_unique_part_LminusR.wav` | Stereo difference |
-| `listen_unique_part_RminusL.wav` | Inverted stereo difference |
+| `out/song_mid.wav` | Mid signal: `(L + R) / 2` |
+| `out/song_side.wav` | Side signal: `(L - R) / 2` |
+| `out/song_reference_band_scores.csv` | All 48 bands ranked by heuristic score |
+| `out/song_ref_1_<frequency>Hz.wav` … | Filtered audio for top 12 candidate bands |
+| `out/song_ref_1_<frequency>Hz_envelope.wav` … | 220 Hz tone amplitude-modulated by each band’s envelope |
+| `out/song_repeats.json` | Coarse repeated spectral-window candidates |
 
-### Frequency-band outputs
-
-The program also generates Mid and Side WAVs for these bands:
-
-| Band | Frequency range |
-|---|---:|
-| Low | 80–250 Hz |
-| Low-mid | 250–700 Hz |
-| Mid | 700–2000 Hz |
-| Upper-mid | 2000–5000 Hz |
-| High | 5000–10000 Hz |
-
-Example:
+The CSV columns are:
 
 ```text
-listen_musical_band_mid_700_2000_mid.wav
-listen_musical_band_mid_700_2000_side.wav
+rank, band, center_hz, rms, transition_entropy,
+beat_periodicity, cross_band_coherence, heuristic_score
 ```
 
-These files are intended for listening and exploratory analysis.
+The envelope WAVs are **audible envelope monitors**, not reconstructed music.
+They make it easier to compare the rhythm and modulation of candidate bands.
 
-## Repeated-Section Analysis
+## Suggested listening / validation workflow
 
-The optional JSON report contains candidate repeated sections based on coarse spectral similarity.
+1. Run the program on a representative stereo mix.
+2. Open `*_reference_band_scores.csv` and inspect the top candidates.
+3. Listen to each top `*_ref_*Hz.wav` at a matched volume.
+4. Compare its corresponding `*_envelope.wav` with the original recording.
+5. Include contrasting material:
+   - instrumental music without vocals;
+   - isolated speech;
+   - speech over music;
+   - singing over music;
+   - sustained vocal notes and sustained/noisy instruments.
+6. Check whether low-entropy candidates actually preserve musical beat timing
+   and whether that timing predicts activity in other frequency regions.
+7. Do not label a band “music-only” based on its score or on listening to a
+   single short excerpt.
 
-Current parameters:
+## Current limitations
 
-- FFT size: 2048
-- Hop size: 512
-- Approximate analysis window: 2 seconds
-- Similarity threshold: 0.90
-- Minimum candidate separation: 4 seconds
+- This is an exploratory heuristic, not a validated separator.
+- Entropy is calculated from a quantized band-envelope transition sequence;
+  it is not the entropy of the original audio source.
+- The bandpass filterbank uses fixed-Q biquad filters and overlapping bands.
+- Beat periodicity searches a limited lag range; unusual tempos, syncopation,
+  or non-periodic music may score poorly.
+- Cross-band coherence can be high for vocals, shared noise, or unrelated
+  sources with correlated dynamics.
+- The score does not estimate the music/vocal energy ratio.
+- The filtered reference-band exports are diagnostic signals, not isolated
+  instrumental stems.
+- Repeated-window spectral similarity can match recurring vocals or similar
+  arrangements; it is not proof of accompaniment identity.
+- No neural network, database, or external source template is used.
 
-These are heuristic settings, not validated musical repetition detection.
-
-## Experimental Limitations
-
-**This is an exploratory analysis tool, not a vocal separator.**
-
-- Mid and Side do not automatically separate vocals from music.
-- Stereo difference is not a vocal-only signal.
-- Frequency bands may contain both vocals and instruments.
-- Similarity candidates may be false positives.
-- Repeated sections may differ in timing, instrumentation, or arrangement.
-- No music reconstruction or adaptive subtraction is currently implemented.
-
-## Research Direction
-
-The experiment explores three possible sources of evidence:
-
-1. Repeated musical sections can provide self-derived references.
-2. Frequency regions with reduced vocal contribution may provide useful musical evidence.
-3. Stereo channels and Mid/Side representations provide additional observations.
-
-The next stage is to listen to the intermediate WAVs, identify useful reference regions, and investigate whether music can be reconstructed and subtracted while preserving vocal content.
-
-## License
-
-Add the project’s license information here.
-
+Keep the original recording and evaluate all outputs by listening. A ranking
+score alone cannot establish separation quality.
