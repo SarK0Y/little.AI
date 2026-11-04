@@ -597,7 +597,16 @@ sudo apt install build-essential libsndfile1-dev libfftw3-dev
 
 ## Build
 
-Compile the source:
+Build just this experiment:
+
+```bash
+make voice_music_self_template_entropy
+```
+
+`make` also builds it as part of the default `all` target. It requires
+libsndfile and FFTW3 (see [Requirements](#requirements)).
+
+Compiling directly:
 
 ```bash
 c++ -O2 -std=c++17 -Wall -Wextra -Wpedantic \
@@ -605,8 +614,6 @@ c++ -O2 -std=c++17 -Wall -Wextra -Wpedantic \
     -lsndfile -lfftw3 -lm \
     -o voice_music_self_template_entropy
 ```
-
-Or add a target to the project Makefile with the same source and libraries.
 
 ## Usage
 
@@ -655,6 +662,65 @@ beat_periodicity, cross_band_coherence, heuristic_score
 
 The envelope WAVs are **audible envelope monitors**, not reconstructed music.
 They make it easier to compare the rhythm and modulation of candidate bands.
+
+
+## Experimental music-mask acceptance test
+
+The current experimental branch additionally uses the top-ranked reference
+band's envelope to create a **reference-driven gain mask** for each target
+band. It preserves the target band's carrier/phase and attenuates it according
+to the reference envelope; it does **not** subtract a phase-unrelated music
+waveform.
+
+Definitions used by this experiment:
+
+- `V[j]`: original filtered target-band signal.
+- `Y[j]`: target-band output after applying the reference-envelope gain mask.
+- `G[j]`: generated music-activity envelope, formed by multiplying the
+  normalized reference-band envelope by the original target-band envelope.
+- `H`: normalized transition entropy of the envelope (same 8-level conditional
+  entropy proxy described above).
+- `F`: average fade length in envelope frames. For each detected local peak
+  above 5% of the envelope's global peak, count frames until the envelope
+  falls below 10% of that local peak. The search is capped at about 100 frames
+  (roughly one second at the program's 512-sample envelope hop and common
+  audio sample rates). Peaks that never cross the threshold in the window
+  are omitted.
+
+A target is marked `accepted=1` only when **all three** user-defined conditions
+hold:
+
+```text
+H(Y[j]) >= H(V[j])
+F(Y[j]) >= F(V[j])
+abs(Corr(G[j], V[j])) > abs(Corr(G[j], Y[j]))
+```
+
+The CSV `*_music_mask_acceptance.csv` contains these metrics. The program also
+writes one `*_music_mask_ref_<ref>_target_<band>_Y.wav` output for each target
+band, whether or not the three tests accept it. The CSV is a diagnostic
+acceptance flag, not a quality guarantee.
+
+**Important:** this is a heuristic experiment, not a validated vocal remover.
+The gain mask may suppress vocal energy that coincides with the music envelope,
+and its entropy/fading/correlation checks do not prove that vocals were retained
+or that music was removed. Listen to the candidate WAVs and compare them with
+the original.
+
+### Build and run the new experiment
+
+```bash
+make voice_music_self_template_entropy
+make run-music-mask-experiment INPUT=song.wav PREFIX=out/song
+```
+
+`run-music-mask-experiment` passes `INPUT`, `PREFIX`, and `REPORT` to the
+program. Defaults are `INPUT=template.wav`, `PREFIX=stereo_analysis`, and
+`REPORT=$(PREFIX)_repeats.json`, so normally you will override at least
+`INPUT`. Create the output prefix's parent directory first.
+
+The Makefile also provides `music-mask-experiment` (build only) and
+`voice_music_self_template` / `run-music-self-template` for the older scanner.
 
 ## Suggested listening / validation workflow
 
