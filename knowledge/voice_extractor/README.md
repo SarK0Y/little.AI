@@ -516,6 +516,123 @@ For different lyrics or substantially different articulation, formant/spectral
 matching may fail. The next development step should be robust formant tracking
 and multi-landmark alignment, with a user-reviewable match threshold.
 
+# Voice Music Self-Template
+
+Experimental C++ tool for analyzing stereo music recordings and exploring music-based evidence for vocal extraction.
+
+The main idea is to use the music itself as a reference rather than relying on a fixed vocal template.
+
+## Current Features
+
+- Reads stereo WAV files using `libsndfile`.
+- Creates Mid and Side signals.
+- Exports stereo-difference listening samples.
+- Extracts frequency bands using FFTW-based STFT processing.
+- Searches for potentially repeated musical sections using coarse spectral similarity.
+- Writes a JSON report containing repetition candidates.
+- Produces intermediate WAV files for listening and analysis.
+
+## Requirements
+
+Linux, C++17, and the following development libraries:
+
+```bash
+sudo apt install build-essential libsndfile1-dev libfftw3-dev
+```
+
+## Build
+
+From the project directory:
+
+```bash
+make voice_music_self_template
+```
+
+## Usage
+
+```bash
+./voice_music_self_template input_stereo.wav [output_prefix] [report.json]
+```
+
+Example:
+
+```bash
+./voice_music_self_template song.wav listen listen_repeats.json
+```
+
+Or use the Makefile:
+
+```bash
+make run-music-self-template INPUT=song.wav PREFIX=listen
+```
+
+## Generated WAV Files
+
+For the prefix `listen`, the program generates:
+
+| File | Description |
+|---|---|
+| `listen_mid.wav` | Mid component: L+R |
+| `listen_side.wav` | Side component: L−R |
+| `listen_unique_part_LminusR.wav` | Stereo difference |
+| `listen_unique_part_RminusL.wav` | Inverted stereo difference |
+
+### Frequency-band outputs
+
+The program also generates Mid and Side WAVs for these bands:
+
+| Band | Frequency range |
+|---|---:|
+| Low | 80–250 Hz |
+| Low-mid | 250–700 Hz |
+| Mid | 700–2000 Hz |
+| Upper-mid | 2000–5000 Hz |
+| High | 5000–10000 Hz |
+
+Example:
+
+```text
+listen_musical_band_mid_700_2000_mid.wav
+listen_musical_band_mid_700_2000_side.wav
+```
+
+These files are intended for listening and exploratory analysis.
+
+## Repeated-Section Analysis
+
+The optional JSON report contains candidate repeated sections based on coarse spectral similarity.
+
+Current parameters:
+
+- FFT size: 2048
+- Hop size: 512
+- Approximate analysis window: 2 seconds
+- Similarity threshold: 0.90
+- Minimum candidate separation: 4 seconds
+
+These are heuristic settings, not validated musical repetition detection.
+
+## Experimental Limitations
+
+**This is an exploratory analysis tool, not a vocal separator.**
+
+- Mid and Side do not automatically separate vocals from music.
+- Stereo difference is not a vocal-only signal.
+- Frequency bands may contain both vocals and instruments.
+- Similarity candidates may be false positives.
+- Repeated sections may differ in timing, instrumentation, or arrangement.
+- No music reconstruction or adaptive subtraction is currently implemented.
+
+## Research Direction
+
+The experiment explores three possible sources of evidence:
+
+1. Repeated musical sections can provide self-derived references.
+2. Frequency regions with reduced vocal contribution may provide useful musical evidence.
+3. Stereo channels and Mid/Side representations provide additional observations.
+
+The next stage is to listen to the intermediate WAVs, identify useful reference regions, and investigate whether music can be reconstructed and subtracted while preserving vocal content.
+
 # Music-Dominant Reference-Band Experiment
 
 Experimental C++17 DSP prototype for ranking narrow frequency bands that may
