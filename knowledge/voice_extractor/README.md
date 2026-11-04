@@ -875,3 +875,36 @@ The Makefile also provides `music-mask-experiment` (build only) and
 
 Keep the original recording and evaluate all outputs by listening. A ranking
 score alone cannot establish separation quality.
+
+## Entropy-ranked music reconstruction and adaptive subtraction
+
+The entropy experiment now additionally ranks all analyzed bands by transition
+entropy (ascending; frequency-band index breaks ties), selects candidates,
+adds their filtered signals into a provisional music reconstruction, and
+subtracts a framewise least-squares estimate from the Mid signal. The adaptive
+coefficient is smoothed and clamped to avoid aggressive over-subtraction.
+This is still a heuristic: low entropy can also describe sustained vocals, and
+filterbank bands overlap. Listen to the reconstructed music and residual.
+
+New options (Hz unless stated otherwise):
+
+```bash
+./voice_music_self_template_entropy input.wav out/song out/repeats.json \
+    -band-bar 6000 -entropy 0.42 -silence-band 180-260
+```
+
+- `-band-bar HZ`: only consider candidate bands at or below this upper frequency.
+- `-entropy MAX`: only consider bands whose normalized transition entropy is at
+  or below `MAX` (0..1).
+- `-silence-band LOW-HIGH`: exclude candidate center frequencies inside this
+  interval. Use `LOW:HIGH` as an alternative separator.
+
+The candidate list is capped at 12 bands in this prototype. Outputs include:
+
+- `*_music_candidates.csv`: selected bands and their metrics.
+- `*_music_reconstructed.wav`: summed candidate music estimate.
+- `*_music_cut_residual.wav`: Mid-channel residual after adaptive subtraction.
+
+The current residual is mono Mid, not a full stereo vocal stem. The earlier
+reference-mask acceptance WAVs remain diagnostic only and are not the new
+subtraction path.

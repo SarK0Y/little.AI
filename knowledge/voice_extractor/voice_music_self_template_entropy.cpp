@@ -337,20 +337,35 @@ std::vector<double> suppress_with_reference_envelope(
     return out;
 }
 
+struct MusicOptions {
+    double max_band_hz = 10000.0; // -band-bar
+    double max_entropy = 0.45;    // -entropy
+    double silence_low_hz = -1.0; // -silence-band low-high; excluded range
+    double silence_high_hz = -1.0;
+    int max_candidates = 12;
+};
+
 void analyze_reference_bands(const std::vector<double>& mid,const std::vector<double>& side,
-                             int sr,const std::string& prefix) {
+                             int sr,const std::string& prefix,const MusicOptions& opts) {
     constexpr int BANDS=48, ENV_HOP=512, TOP=12;
     const double minHz=80.0,maxHz=std::min(10000.0,sr*0.45);
     const double q=8.65; // approx 1/6-octave bandwidth
     const double envRate=(double)sr/ENV_HOP;
     std::vector<RefBand> bands(BANDS);
     std::vector<std::vector<double>> filtered(BANDS);
+    std::vector<std::vector<double>> filtered_mid(BANDS);
     for(int b=0;b<BANDS;b++) {
         double t=(double)b/(BANDS-1); bands[b].fc=minHz*std::pow(maxHz/minHz,t);
-        filtered[b].resize(mid.size()); Biquad bm=make_bandpass(bands[b].fc,sr,q), bs=make_bandpass(bands[b].fc,sr,q);
+        filtered[b].resize(mid.size());
+        filtered_mid[b].resize(mid.size());
+        Biquad bm=make_bandpass(bands[b].fc,sr,q), bs=make_bandpass(bands[b].fc,sr,q);
+        Biquad bm_only=make_bandpass(bands[b].fc,sr,q);
         std::vector<double> env; env.reserve((mid.size()+ENV_HOP-1)/ENV_HOP);
         double e=0;for(size_t i=0;i<mid.size();i++) {
-            double y=0.5*(tick(bm,mid[i])+tick(bs,side[i])); filtered[b][i]=y;
+            const double mid_band = tick(bm_only, mid[i]);
+            double y=0.5*(tick(bm,mid[i])+tick(bs,side[i]));
+            filtered[b][i]=y;
+            filtered_mid[b][i]=mid_band;
             e+=y*y;
             if((i+1)%ENV_HOP==0) { env.push_back(std::sqrt(e/ENV_HOP)); e=0; }
         }
@@ -372,6 +387,65 @@ void analyze_reference_bands(const std::vector<double>& mid,const std::vector<do
     std::ofstream csv(prefix+"_reference_band_scores.csv");
     csv<<"rank,band,center_hz,rms,transition_entropy,beat_periodicity,cross_band_coherence,heuristic_score\n";
     for(int rank=0;rank<BANDS;rank++){int b=order[rank];auto& z=bands[b];csv<<rank+1<<","<<b<<","<<z.fc<<","<<z.rms<<","<<z.entropy<<","<<z.beat<<","<<z.coherence<<","<<z.score<<"\n";}
+    // Rank by entropy (primary), then by frequency-band index for stable ties.
+    std::vector<int> entropy_order(BANDS); std::iota(entropy_order.begin(), entropy_order.end(), 0);
+    std::sort(entropy_order.begin(), entropy_order.end(), [&](int a, int b) {
+        if (std::abs(bands[a].entropy - bands[b].entropy) > 1e-9)
+            return bands[a].entropy < bands[b].entropy;
+        return a < b;
+    });
+
+    std::vector<int> music_candidates;
+    for (int b : entropy_order) {
+        const double fc = bands[b].fc;
+        if (fc > opts.max_band_hz) continue;
+        if (opts.silence_low_hz >= 0.0 && fc >= opts.silence_low_hz && fc <= opts.silence_high_hz) continue;
+        if (bands[b].entropy > opts.max_entropy) continue;
+        if (bands[b].rms < 1e-7) continue; // avoid effectively silent filters
+        music_candidates.push_back(b);
+        if ((int)music_candidates.size() >= opts.max_candidates) break;
+    }
+
+    // Reconstruct a candidate music component by summing selected band signals.
+    // Normalize by sqrt(N) to avoid level inflation as more bands are selected.
+    std::vector<double> music(mid.size(), 0.0);
+    for (int b : music_candidates)
+        for (size_t i = 0; i < music.size(); ++i) music[i] += filtered_mid[b][i];
+    if (!music_candidates.empty()) {
+        const double norm = 1.0 / std::sqrt((double)music_candidates.size());
+        for (double& x : music) x *= norm;
+    }
+
+    // Adaptive framewise least-squares subtraction. The coefficient estimates
+    // how much of this reconstructed component is supported by the source.
+    // Smooth alpha between frames and clamp it to avoid over-subtraction.
+    constexpr size_t ADAPT_HOP = 2048;
+    constexpr double ALPHA_MAX = 1.25;
+    std::vector<double> residual(mid.size()), alpha_track;
+    double alpha_prev = 0.0;
+    for (size_t start = 0; start < mid.size(); start += ADAPT_HOP) {
+        const size_t end = std::min(mid.size(), start + ADAPT_HOP);
+        double dot = 0.0, energy = 0.0;
+        for (size_t i = start; i < end; ++i) { dot += mid[i] * music[i]; energy += music[i] * music[i]; }
+        double alpha = energy > 1e-12 ? std::clamp(dot / energy, 0.0, ALPHA_MAX) : 0.0;
+        alpha = 0.65 * alpha_prev + 0.35 * alpha; // temporal smoothing
+        alpha_prev = alpha; alpha_track.push_back(alpha);
+        for (size_t i = start; i < end; ++i) residual[i] = mid[i] - alpha * music[i];
+    }
+    write_mono(prefix + "_music_reconstructed.wav", music, sr);
+    write_mono(prefix + "_music_cut_residual.wav", residual, sr);
+    std::ofstream selected(prefix + "_music_candidates.csv");
+    selected << "rank,band,center_hz,entropy,rms,adaptive_alpha\n";
+    for (size_t k = 0; k < music_candidates.size(); ++k) {
+        const int b = music_candidates[k];
+        const double alpha = alpha_track.empty() ? 0.0 :
+            std::accumulate(alpha_track.begin(), alpha_track.end(), 0.0) / alpha_track.size();
+        selected << k+1 << "," << b << "," << bands[b].fc << "," << bands[b].entropy
+                << "," << bands[b].rms << "," << alpha << "\n";
+    }
+    std::cout << "Music candidates selected: " << music_candidates.size() << "\n"
+              << "Music reconstruction: " << prefix << "_music_reconstructed.wav\n"
+              << "Adaptive residual: " << prefix << "_music_cut_residual.wav\n";
     // Export top candidate bands as filtered audio and an audible envelope track.
     // Envelope WAV is amplitude-modulated 220 Hz, useful for hearing its rhythm.
     for(int rank=0;rank<std::min(TOP,BANDS);rank++) {
@@ -425,13 +499,34 @@ void analyze_reference_bands(const std::vector<double>& mid,const std::vector<do
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 4) {
-        std::cerr << "Usage: " << argv[0] << " input_stereo.wav [output_prefix] [report.json]\n";
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " input_stereo.wav [output_prefix] [report.json]"
+                  << " [-band-bar HZ] [-entropy MAX] [-silence-band LOW-HIGH]\n";
         return 2;
     }
     const std::string input = argv[1];
-    const std::string prefix = argc >= 3 ? argv[2] : "stereo";
-    const std::string report = argc >= 4 ? argv[3] : prefix + "_repeats.json";
+    std::string prefix = "stereo", report;
+    int argi = 2;
+    if (argi < argc && argv[argi][0] != '-') prefix = argv[argi++];
+    report = prefix + "_repeats.json";
+    if (argi < argc && argv[argi][0] != '-') report = argv[argi++];
+    MusicOptions opts;
+    for (; argi < argc; ++argi) {
+        const std::string flag = argv[argi];
+        if (flag == "-band-bar" && argi + 1 < argc) opts.max_band_hz = std::stod(argv[++argi]);
+        else if (flag == "-entropy" && argi + 1 < argc) opts.max_entropy = std::stod(argv[++argi]);
+        else if (flag == "-silence-band" && argi + 1 < argc) {
+            std::string range = argv[++argi];
+            auto sep = range.find('-'); if (sep == std::string::npos) sep = range.find(':');
+            if (sep == std::string::npos) { std::cerr << "-silence-band expects LOW-HIGH (Hz)\n"; return 2; }
+            opts.silence_low_hz = std::stod(range.substr(0, sep));
+            opts.silence_high_hz = std::stod(range.substr(sep + 1));
+            if (opts.silence_low_hz > opts.silence_high_hz) std::swap(opts.silence_low_hz, opts.silence_high_hz);
+        } else { std::cerr << "Unknown/incomplete option: " << flag << "\n"; return 2; }
+    }
+    if (opts.max_band_hz <= 0 || opts.max_entropy < 0 || opts.max_entropy > 1) {
+        std::cerr << "-band-bar must be >0 and -entropy must be in [0,1].\n"; return 2;
+    }
 
     Audio a;
     if (!read_audio(input, a)) return 1;
@@ -457,7 +552,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    analyze_reference_bands(mid, side, a.samplerate, prefix);
+    analyze_reference_bands(mid, side, a.samplerate, prefix, opts);
 
     // A first-pass repeat scan on Mid; Side is often more useful for detecting
     // panned musical elements. We scan both and combine their reports.
