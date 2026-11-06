@@ -343,7 +343,47 @@ struct MusicOptions {
     double silence_low_hz = -1.0; // -silence-band low-high; excluded range
     double silence_high_hz = -1.0;
     int max_candidates = 12;
+    double too_quiet_db = -24.0; // relative to whole-source RMS
+    bool no_bursts_enabled = false;
+    double no_bursts_ms = 80.0; // peak-centered output window duration
+    double no_bursts_db = -45.0; // minimum peak frame level relative to source RMS
 };
+
+// Stage 2: apply -no-bursts directly to Mid before any reference-band,
+// entropy, gRef, or music-removal analysis. A burst is a contiguous run of
+// frames above the DB-relative Mid RMS threshold; keep an MS-length window
+// centered on that run's maximum frame.
+std::vector<double> apply_no_bursts_to_mid(const std::vector<double>& mid,
+                                           int sr, double ms, double db) {
+    std::vector<double> out(mid.size(), 0.0);
+    if (mid.empty()) return out;
+    constexpr size_t HOP = 512;
+    const size_t frames = (mid.size() + HOP - 1) / HOP;
+    std::vector<double> frame_rms(frames, 0.0);
+    for (size_t f = 0; f < frames; ++f) {
+        const size_t a = f * HOP, b = std::min(mid.size(), a + HOP);
+        double e = 0.0;
+        for (size_t i = a; i < b; ++i) e += mid[i] * mid[i];
+        frame_rms[f] = b > a ? std::sqrt(e / static_cast<double>(b-a)) : 0.0;
+    }
+    const double threshold = rms(mid) * std::pow(10.0, -std::abs(db) / 20.0);
+    const size_t half = static_cast<size_t>(std::llround(std::max(0.0, ms) * sr / 2000.0));
+    size_t f = 0;
+    while (f < frames) {
+        if (frame_rms[f] < threshold) { ++f; continue; }
+        const size_t run_begin = f;
+        while (f < frames && frame_rms[f] >= threshold) ++f;
+        const size_t run_end = f;
+        size_t peak = run_begin;
+        for (size_t j = run_begin + 1; j < run_end; ++j)
+            if (frame_rms[j] > frame_rms[peak]) peak = j;
+        const size_t peak_sample = std::min(mid.size()-1, peak * HOP + HOP/2);
+        const size_t a = peak_sample > half ? peak_sample - half : 0;
+        const size_t b = std::min(mid.size(), peak_sample + half + 1);
+        for (size_t i = a; i < b; ++i) out[i] = mid[i];
+    }
+    return out;
+}
 
 void analyze_reference_bands(const std::vector<double>& mid,const std::vector<double>& side,
                              int sr,const std::string& prefix,const MusicOptions& opts) {
@@ -366,12 +406,14 @@ void analyze_reference_bands(const std::vector<double>& mid,const std::vector<do
             double y=0.5*(tick(bm,mid[i])+tick(bs,side[i]));
             filtered[b][i]=y;
             filtered_mid[b][i]=mid_band;
-            e+=y*y;
+            e+=mid_band*mid_band; // reference envelope is from the Mid reference band
             if((i+1)%ENV_HOP==0) { env.push_back(std::sqrt(e/ENV_HOP)); e=0; }
         }
         if(mid.size()%ENV_HOP && !mid.empty())
             env.push_back(std::sqrt(e/(mid.size()%ENV_HOP)));
-        bands[b].env=std::move(env); bands[b].rms=std::sqrt(std::inner_product(filtered[b].begin(),filtered[b].end(),filtered[b].begin(),0.0)/std::max<size_t>(1,mid.size()));
+        bands[b].env=std::move(env);
+        bands[b].rms=std::sqrt(std::inner_product(filtered_mid[b].begin(),filtered_mid[b].end(),
+                                                   filtered_mid[b].begin(),0.0)/std::max<size_t>(1,mid.size()));
         bands[b].entropy=transition_entropy(bands[b].env); bands[b].beat=beat_periodicity(bands[b].env,envRate);
     }
     // Coherence with the remaining filterbank: use best non-neighbor envelope
@@ -387,16 +429,10 @@ void analyze_reference_bands(const std::vector<double>& mid,const std::vector<do
     std::ofstream csv(prefix+"_reference_band_scores.csv");
     csv<<"rank,band,center_hz,rms,transition_entropy,beat_periodicity,cross_band_coherence,heuristic_score\n";
     for(int rank=0;rank<BANDS;rank++){int b=order[rank];auto& z=bands[b];csv<<rank+1<<","<<b<<","<<z.fc<<","<<z.rms<<","<<z.entropy<<","<<z.beat<<","<<z.coherence<<","<<z.score<<"\n";}
-    // Rank by entropy (primary), then by frequency-band index for stable ties.
-    std::vector<int> entropy_order(BANDS); std::iota(entropy_order.begin(), entropy_order.end(), 0);
-    std::sort(entropy_order.begin(), entropy_order.end(), [&](int a, int b) {
-        if (std::abs(bands[a].entropy - bands[b].entropy) > 1e-9)
-            return bands[a].entropy < bands[b].entropy;
-        return a < b;
-    });
-
+    // Select music candidates with the same heuristic score used by
+    // voice_music_self_template, instead of entropy alone.
     std::vector<int> music_candidates;
-    for (int b : entropy_order) {
+    for (int b : order) {
         const double fc = bands[b].fc;
         if (fc > opts.max_band_hz) continue;
         if (opts.silence_low_hz >= 0.0 && fc >= opts.silence_low_hz && fc <= opts.silence_high_hz) continue;
@@ -406,19 +442,60 @@ void analyze_reference_bands(const std::vector<double>& mid,const std::vector<do
         if ((int)music_candidates.size() >= opts.max_candidates) break;
     }
 
-    // Reconstruct a candidate music component by summing selected band signals.
-    // Normalize by sqrt(N) to avoid level inflation as more bands are selected.
+    // Reconstruct the music component from the enveloped reference bands: each
+    // selected band is modulated by its own RMS-normalized envelope, so the
+    // average level is unchanged but the rhythm the envelope files expose is
+    // what gets subtracted. Normalize by sqrt(N) to avoid level inflation.
     std::vector<double> music(mid.size(), 0.0);
-    for (int b : music_candidates)
-        for (size_t i = 0; i < music.size(); ++i) music[i] += filtered_mid[b][i];
+    for (int b : music_candidates) {
+        const auto& env = bands[b].env;
+        if (env.empty()) continue;
+        double env_sq = 0.0;
+        for (double e : env) env_sq += e * e;
+        const double env_rms = std::sqrt(env_sq / std::max<size_t>(1, env.size()));
+        for (size_t i = 0; i < music.size(); ++i) {
+            const size_t k = std::min(i / ENV_HOP, env.size() - 1);
+            const double gain = env_rms > 1e-12 ? env[k] / env_rms : 0.0;
+            music[i] += filtered_mid[b][i] * gain;
+        }
+    }
     if (!music_candidates.empty()) {
         const double norm = 1.0 / std::sqrt((double)music_candidates.size());
         for (double& x : music) x *= norm;
     }
 
-    // Adaptive framewise least-squares subtraction. The coefficient estimates
-    // how much of this reconstructed component is supported by the source.
-    // Smooth alpha between frames and clamp it to avoid over-subtraction.
+    // gRef is the summed envelope of the selected reference bands. It is the
+    // single time-aligned activity mask used for both filler and voice zones.
+    const size_t zone_frames = (mid.size() + ENV_HOP - 1) / ENV_HOP;
+    std::vector<double> gRef(zone_frames, 0.0);
+    if (!music_candidates.empty()) {
+        for (int b : music_candidates) {
+            const auto& env = bands[b].env; // envelope of this Mid reference band
+            for (size_t k = 0; k < std::min(zone_frames, env.size()); ++k)
+                gRef[k] += env[k];
+        }
+        const double scale = 1.0 / std::sqrt(static_cast<double>(music_candidates.size()));
+        for (double& v : gRef) v *= scale;
+    }
+
+    // -too-quiet is the ONLY quiet/non-silent decision. It is relative to
+    // source RMS; all region boundaries are exactly the gRef envelope frames.
+    double source_energy = 0.0;
+    for (double x : mid) source_energy += x * x;
+    const double source_rms = std::sqrt(source_energy / std::max<size_t>(1, mid.size()));
+    const double quiet_threshold = source_rms * std::pow(10.0, opts.too_quiet_db / 20.0);
+
+    std::vector<int> zone_class(zone_frames, 0); // 0=voice candidate, 1=music filler
+    std::vector<double> voice_gate(zone_frames, 1.0);
+    for (size_t k = 0; k < zone_frames; ++k) {
+        const bool silent_ref = gRef[k] <= quiet_threshold;
+        zone_class[k] = silent_ref ? 0 : 1;
+        voice_gate[k] = silent_ref ? 1.0 : 0.0;
+    }
+
+    // Remove the enveloped-reference music estimate only in non-silent gRef
+    // regions (music fillers). In silent gRef regions, leave the Mid signal
+    // untouched so candidate width follows the silent reference timecodes.
     constexpr size_t ADAPT_HOP = 2048;
     constexpr double ALPHA_MAX = 1.25;
     std::vector<double> residual(mid.size()), alpha_track;
@@ -426,26 +503,70 @@ void analyze_reference_bands(const std::vector<double>& mid,const std::vector<do
     for (size_t start = 0; start < mid.size(); start += ADAPT_HOP) {
         const size_t end = std::min(mid.size(), start + ADAPT_HOP);
         double dot = 0.0, energy = 0.0;
-        for (size_t i = start; i < end; ++i) { dot += mid[i] * music[i]; energy += music[i] * music[i]; }
+        for (size_t i = start; i < end; ++i) {
+            const size_t frame = std::min(i / ENV_HOP, zone_frames - 1);
+            if (zone_class[frame] != 1) continue; // fit music only in filler
+            dot += mid[i] * music[i];
+            energy += music[i] * music[i];
+        }
         double alpha = energy > 1e-12 ? std::clamp(dot / energy, 0.0, ALPHA_MAX) : 0.0;
         alpha = 0.65 * alpha_prev + 0.35 * alpha; // temporal smoothing
         alpha_prev = alpha; alpha_track.push_back(alpha);
-        for (size_t i = start; i < end; ++i) residual[i] = mid[i] - alpha * music[i];
+        for (size_t i = start; i < end; ++i) {
+            const size_t frame = std::min(i / ENV_HOP, zone_frames - 1);
+            residual[i] = zone_class[frame] == 1 ? mid[i] - alpha * music[i] : mid[i];
+        }
     }
+
+    // Build a compact voice-only output: retain only samples belonging to
+    // gRef-quiet voice-candidate frames AND above the -too-quiet amplitude
+    // threshold. Concatenate active runs; do not synthesize silence or preserve
+    // original timeline gaps. This stage receives the already burst-gated Mid.
+    std::vector<double> voice_zone_samples;
+    voice_zone_samples.reserve(mid.size());
+    const double sample_gate = quiet_threshold;
+    for (size_t i = 0; i < mid.size(); ++i) {
+        const size_t frame = std::min(i / ENV_HOP, zone_frames - 1);
+        if (zone_class[frame] == 0 && std::abs(residual[i]) > sample_gate)
+            voice_zone_samples.push_back(residual[i]);
+    }
+
     write_mono(prefix + "_music_reconstructed.wav", music, sr);
     write_mono(prefix + "_music_cut_residual.wav", residual, sr);
+    write_mono(prefix + "_voice_detected_zones.wav", voice_zone_samples, sr);
+    std::ofstream zones(prefix + "_zones.csv");
+    zones << "frame,start_ms,end_ms,gRef,zone,voice_gate\n";
+    for (size_t k = 0; k < zone_frames; ++k) {
+        const double start_ms = 1000.0 * k * ENV_HOP / sr;
+        const double end_ms = 1000.0 * std::min(mid.size(), (k + 1) * ENV_HOP) / sr;
+        const char* label = zone_class[k] == 0 ? "voice_candidate" : "music_filler";
+        zones << k << "," << start_ms << "," << end_ms << "," << gRef[k]
+              << "," << label << "," << voice_gate[k] << "\n";
+    }
+    // Export gRef as a normalized sample-aligned envelope WAV for inspection.
+    std::vector<double> gRef_audio(mid.size(), 0.0);
+    const double gRef_peak = gRef.empty() ? 0.0 : *std::max_element(gRef.begin(), gRef.end());
+    for (size_t i = 0; i < gRef_audio.size(); ++i) {
+        const size_t frame = std::min(i / ENV_HOP, gRef.size() - 1);
+        gRef_audio[i] = gRef_peak > 1e-12 ? gRef[frame] / gRef_peak : 0.0;
+    }
+    write_mono(prefix + "_gRef_envelope.wav", gRef_audio, sr);
+
     std::ofstream selected(prefix + "_music_candidates.csv");
-    selected << "rank,band,center_hz,entropy,rms,adaptive_alpha\n";
+    selected << "rank,band,center_hz,entropy,beat_periodicity,cross_band_coherence,heuristic_score,rms,adaptive_alpha\n";
     for (size_t k = 0; k < music_candidates.size(); ++k) {
         const int b = music_candidates[k];
         const double alpha = alpha_track.empty() ? 0.0 :
             std::accumulate(alpha_track.begin(), alpha_track.end(), 0.0) / alpha_track.size();
         selected << k+1 << "," << b << "," << bands[b].fc << "," << bands[b].entropy
+                << "," << bands[b].beat << "," << bands[b].coherence << "," << bands[b].score
                 << "," << bands[b].rms << "," << alpha << "\n";
     }
     std::cout << "Music candidates selected: " << music_candidates.size() << "\n"
               << "Music reconstruction: " << prefix << "_music_reconstructed.wav\n"
-              << "Adaptive residual: " << prefix << "_music_cut_residual.wav\n";
+              << "Adaptive residual: " << prefix << "_music_cut_residual.wav\n"
+              << "Compact voice-only zones: " << prefix << "_voice_detected_zones.wav\n"
+              << "Zone report: " << prefix << "_zones.csv\n";
     // Export top candidate bands as filtered audio and an audible envelope track.
     // Envelope WAV is amplitude-modulated 220 Hz, useful for hearing its rhythm.
     for(int rank=0;rank<std::min(TOP,BANDS);rank++) {
@@ -501,7 +622,8 @@ void analyze_reference_bands(const std::vector<double>& mid,const std::vector<do
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " input_stereo.wav [output_prefix] [report.json]"
-                  << " [-band-bar HZ] [-entropy MAX] [-silence-band LOW-HIGH]\n";
+                  << " [-band-bar HZ] [-entropy MAX] [-silence-band LOW-HIGH]"
+                  << " [-too-quiet DB] [-no-bursts MS DB]\n";
         return 2;
     }
     const std::string input = argv[1];
@@ -515,6 +637,12 @@ int main(int argc, char** argv) {
         const std::string flag = argv[argi];
         if (flag == "-band-bar" && argi + 1 < argc) opts.max_band_hz = std::stod(argv[++argi]);
         else if (flag == "-entropy" && argi + 1 < argc) opts.max_entropy = std::stod(argv[++argi]);
+        else if (flag == "-too-quiet" && argi + 1 < argc) opts.too_quiet_db = std::stod(argv[++argi]);
+        else if (flag == "-no-bursts" && argi + 2 < argc) {
+            opts.no_bursts_enabled = true;
+            opts.no_bursts_ms = std::stod(argv[++argi]);
+            opts.no_bursts_db = std::stod(argv[++argi]);
+        }
         else if (flag == "-silence-band" && argi + 1 < argc) {
             std::string range = argv[++argi];
             auto sep = range.find('-'); if (sep == std::string::npos) sep = range.find(':');
@@ -524,8 +652,12 @@ int main(int argc, char** argv) {
             if (opts.silence_low_hz > opts.silence_high_hz) std::swap(opts.silence_low_hz, opts.silence_high_hz);
         } else { std::cerr << "Unknown/incomplete option: " << flag << "\n"; return 2; }
     }
-    if (opts.max_band_hz <= 0 || opts.max_entropy < 0 || opts.max_entropy > 1) {
-        std::cerr << "-band-bar must be >0 and -entropy must be in [0,1].\n"; return 2;
+    if (opts.max_band_hz <= 0 || opts.max_entropy < 0 || opts.max_entropy > 1 ||
+        opts.too_quiet_db > 0 || !std::isfinite(opts.no_bursts_ms) ||
+        opts.no_bursts_ms < 0 || !std::isfinite(opts.no_bursts_db)) {
+        std::cerr << "-band-bar must be >0, -entropy in [0,1], -too-quiet must be <=0 dB, "
+                     "and -no-bursts requires finite MS >=0 and finite DB (any sign).\n";
+        return 2;
     }
 
     Audio a;
@@ -552,12 +684,28 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    analyze_reference_bands(mid, side, a.samplerate, prefix, opts);
+    // Stage 1 creates Mid/Side. Stage 2 is optional: when -no-bursts is
+    // present, gate Mid and apply the same retained sample mask to Side.
+    // Without the option, pass the original Mid and Side through unchanged.
+    const std::vector<double> mid_stage2 = opts.no_bursts_enabled
+        ? apply_no_bursts_to_mid(mid, a.samplerate, opts.no_bursts_ms, opts.no_bursts_db)
+        : mid;
+    std::vector<double> side_stage2 = side;
+    if (opts.no_bursts_enabled) {
+        for (size_t i = 0; i < side.size(); ++i)
+            if (mid_stage2[i] == 0.0) side_stage2[i] = 0.0;
+        if (!write_mono(prefix + "_mid_no_bursts.wav", mid_stage2, a.samplerate) ||
+            !write_mono(prefix + "_side_no_bursts.wav", side_stage2, a.samplerate)) {
+            std::cerr << "Failed writing stage-2 Mid/Side (-no-bursts).\n";
+            return 1;
+        }
+    }
+    analyze_reference_bands(mid_stage2, side_stage2, a.samplerate, prefix, opts);
 
-    // A first-pass repeat scan on Mid; Side is often more useful for detecting
+    // A first-pass repeat scan on stage-2 Mid; Side is often more useful for detecting
     // panned musical elements. We scan both and combine their reports.
-    const auto mid_spec = make_spectral_frames(mid);
-    const auto side_spec = make_spectral_frames(side);
+    const auto mid_spec = make_spectral_frames(mid_stage2);
+    const auto side_spec = make_spectral_frames(side_stage2);
     const auto mid_matches = find_repeated_windows(mid_spec, a.samplerate, 2.0, 4.0);
     const auto side_matches = find_repeated_windows(side_spec, a.samplerate, 2.0, 4.0);
 
@@ -573,9 +721,13 @@ int main(int argc, char** argv) {
               << "Sample rate: " << a.samplerate << " Hz\n"
               << "Duration: " << static_cast<double>(n) / a.samplerate << " s\n"
               << "L RMS: " << rms(l) << " | R RMS: " << rms(r) << "\n"
-              << "Mid RMS: " << rms(mid) << " | Side RMS: " << rms(side) << "\n"
-              << "Wrote: " << prefix << "_mid.wav, " << prefix << "_side.wav\n"
-              << "Repeated-window report: " << report << "\n"
+              << "Mid RMS: " << rms(mid)
+              << (opts.no_bursts_enabled ? " | Stage-2 Mid RMS: " : " | Stage-2 bypassed; using original Mid")
+              << (opts.no_bursts_enabled ? std::to_string(rms(mid_stage2)) : std::string())
+              << " | Side RMS: " << rms(side) << "\n"
+              << "Wrote: " << prefix << "_mid.wav, " << prefix << "_side.wav"
+              << (opts.no_bursts_enabled ? ", " + prefix + "_mid_no_bursts.wav, " + prefix + "_side_no_bursts.wav" : std::string())
+              << "\nRepeated-window report: " << report << "\n"
               << "Note: repetition matches are coarse candidates, not source-separated stems.\n";
     return 0;
 }

@@ -4,7 +4,8 @@ LDFLAGS  ?=
 
 TARGETS := voice_extractor voice_reconstruct \
            voice_template_benchmark voice_template_recovery \
-           voice_template_reconstruct voice_music_self_template
+           voice_template_reconstruct voice_music_self_template \
+           voice_music_self_template_entropy
 
 SOURCE   := voice_extractor.cpp
 OBJECTS  := $(SOURCE:.cpp=.o)
@@ -13,13 +14,15 @@ BENCHMARK_OBJECT := voice_template_benchmark.o
 RECOVERY_OBJECT  := voice_template_recovery.o
 RECONSTRUCT_OBJECT := voice_template_reconstruct.o
 MUSIC_SELF_TEMPLATE_OBJECT := voice_music_self_template.o
+MUSIC_SELF_TEMPLATE_ENTROPY_OBJECT := voice_music_self_template_entropy.o
 
 INPUT  ?= template.wav
 OUTDIR ?= benchmark
 
 .PHONY: all clean benchmark run-benchmark recovery run-recovery \
         run-all-recoveries reconstruct run-reconstruct run-all-reconstructs \
-        music-self-template run-music-self-template
+        music-self-template run-music-self-template \
+        music-mask-experiment run-music-mask-experiment
 
 all: $(TARGETS)
 
@@ -96,5 +99,17 @@ run-music-self-template: voice_music_self_template
 clean:
 	$(RM) $(TARGETS) $(OBJECTS) \
 		template_reconstruct.o \
-		$(BENCHMARK_OBJECT) $(RECOVERY_OBJECT) $(RECONSTRUCT_OBJECT)
+		$(BENCHMARK_OBJECT) $(RECOVERY_OBJECT) $(RECONSTRUCT_OBJECT) \
+		$(MUSIC_SELF_TEMPLATE_OBJECT) $(MUSIC_SELF_TEMPLATE_ENTROPY_OBJECT)
 
+
+
+# Entropy/fading/correlation acceptance experiment (separate from the older
+# self-template scanner so existing targets remain unchanged).
+voice_music_self_template_entropy: $(MUSIC_SELF_TEMPLATE_ENTROPY_OBJECT)
+	$(CXX) $(LDFLAGS) -o $@ $^ -lsndfile -lfftw3 -lm
+
+music-mask-experiment: voice_music_self_template_entropy
+
+run-music-mask-experiment: voice_music_self_template_entropy
+	./voice_music_self_template_entropy $(INPUT) $(PREFIX) $(REPORT)

@@ -876,14 +876,23 @@ The Makefile also provides `music-mask-experiment` (build only) and
 Keep the original recording and evaluate all outputs by listening. A ranking
 score alone cannot establish separation quality.
 
-## Entropy-ranked music reconstruction and adaptive subtraction
+## Score-ranked music reconstruction and adaptive subtraction
 
-The entropy experiment now additionally ranks all analyzed bands by transition
-entropy (ascending; frequency-band index breaks ties), selects candidates,
-adds their filtered signals into a provisional music reconstruction, and
+The entropy experiment now ranks all analyzed bands with the same heuristic as
+`voice_music_self_template`:
+
+```text
+score = (1 - transition_entropy)
+        * (0.50 + 0.25 * beat_periodicity
+                 + 0.25 * cross_band_coherence)
+```
+
+It selects candidates in descending score order, modulates each band by its own
+RMS-normalized envelope (the same envelope exposed by the `_ref_*_envelope.wav`
+monitor files), sums them into a provisional music reconstruction, and
 subtracts a framewise least-squares estimate from the Mid signal. The adaptive
-coefficient is smoothed and clamped to avoid aggressive over-subtraction.
-This is still a heuristic: low entropy can also describe sustained vocals, and
+coefficient is smoothed and clamped to avoid aggressive over-subtraction. This
+is still a heuristic: low entropy can also describe sustained vocals, and
 filterbank bands overlap. Listen to the reconstructed music and residual.
 
 New options (Hz unless stated otherwise):
@@ -908,3 +917,48 @@ The candidate list is capped at 12 bands in this prototype. Outputs include:
 The current residual is mono Mid, not a full stereo vocal stem. The earlier
 reference-mask acceptance WAVs remain diagnostic only and are not the new
 subtraction path.
+
+## Voice/music zone detection.
+
+The current experimental branch now divides the recording into envelope-frame
+zones using the summed activity of the accepted low-entropy reference bands:
+
+- **voice candidate**: reference-band sum is below `-too-quiet` dB relative
+  to the whole source RMS;
+- **music filler**: reference-band activity is loud enough and its local
+  transition entropy is at or below `-entropy`;
+- **mix**: reference activity is present, but local entropy is too high to
+  classify the zone as a filler.
+
+The summed accepted-band envelope is an approximate filler-width/activity
+indicator, not a guaranteed musical source estimate.
+
+`-no-bursts MS DB` takes **two arguments**:
+
+- `MS`: total peak-centered output window in milliseconds. The algorithm finds
+  each voice-candidate burst's maximum frame RMS in the reconstructed voice
+  variant (the adaptive music-cut residual), then copies that variant from
+  `MS/2` milliseconds before the peak through `MS/2` milliseconds after it.
+- `DB`: minimum peak level as a margin below the reconstructed variant's RMS.
+  A burst is accepted only if its maximum frame RMS reaches this level. The
+  sign is ignored, so `2` and `-2` both mean 2 dB below the variant RMS.
+
+For example, `-no-bursts 120 5` uses a 60 ms left / 60 ms right window and
+rejects bursts whose peak is more than 5 dB below the reconstructed variant RMS.
+
+Example:
+
+```bash
+./voice_music_self_template_entropy song.wav out/song out/song_repeats.json \
+    -band-bar 6000 -entropy 0.42 -silence-band 180-260 \
+    -too-quiet -24 -no-bursts 120 5
+```
+
+Outputs include `*_zones.csv` (framewise zone labels; `voice_gate` is 1 only
+where `-no-bursts` accepted the run), `*_voice_detected_zones.wav` (pieces of
+the adaptive music residual copied from accepted voice-candidate runs),
+`*_music_reconstructed.wav`, and `*_music_cut_residual.wav`.
+
+Zone labels are heuristic. A voice used as an instrument is intentionally
+classified by its musical role when it shares strong, predictable musical
+activity; the algorithm cannot infer artistic intent from timbre alone.
