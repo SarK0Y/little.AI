@@ -1,0 +1,15 @@
+[package]
+name = "context-3sat"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nova / little.AI"]
+description = "Incremental 3-SAT local-search engine for context handling"
+license = "MIT"
+
+[[bin]]
+name = "3sat"
+path = "src/main.rs"
+
+[lib]
+name = "context_3sat"
+path = "src/lib.rs"
