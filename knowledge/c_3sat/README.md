@@ -4,8 +4,11 @@ C port of `knowledge/3sat` (the Rust `context-3sat` experiment): an incremental
 stochastic local-search 3-SAT engine for `little.AI` context handling.
 
 Dependency-free C11 (GNU extensions: GCC/Clang). It returns **SAT** (verified
-against the input) or **UNKNOWN** when the budget runs out. It never claims
-UNSAT: local search cannot prove it.
+against the input) or **UNKNOWN** when the budget runs out. Local search cannot
+prove UNSAT, so the only UNSAT it reports is structural: a unit clause `(x)` and
+its negation `(-x)` are detected up front and returned as **UNSAT** with the list
+of contradictory clause pairs. A pair of longer negated clauses is *not*
+contradictory (`(1 2 3)` and `(-1 -2 -3)` are both true at `x1=1, x2=0, x3=0`).
 
 ## Build / test
 
@@ -25,7 +28,23 @@ knowledge/c_3sat/build/3sat input.cnf --strategy greedy --progress 100000 --out 
 
 Default output: `./knowledge/c_3sat/results/latest.json` (relative to cwd), same
 JSON shape as the Rust version. Exit codes: `0` SAT, `1` input/output/internal
-error, `2` usage error, `3` budget exhausted (UNKNOWN).
+error, `2` usage error, `3` budget exhausted (UNKNOWN), `4` structural UNSAT.
+
+UNSAT output lists the conflicting clause indices (0-based):
+
+```json
+{
+  "status": "UNSAT",
+  "message": "UNSAT",
+  "variables": 3,
+  "clauses": 5,
+  "contradictions": [{"i": 1, "j": 3}]
+}
+```
+
+Here clause `j` is the negation of clause `i`; both must be unit clauses.
+Non-unit relatives -- e.g. `(1 2)` and `(-1 -2)` -- are consistent even when the
+formula has more clauses than variables, so they are not reported.
 
 ## Design
 
@@ -64,6 +83,11 @@ Adding a heuristic = write a `PickFn`, add one row to `STRATEGIES`.
 
 ## Differences from the Rust version
 
+- Structural UNSAT: a unit clause and its negation are detected before search and
+  returned as UNSAT with the conflicting clause pairs. The Rust version reports
+  UNKNOWN.
+- The DIMACS `%` end-of-file marker (used by SATLIB files) is accepted; the Rust
+  parser rejects it.
 - If the very last allowed flip satisfies the formula, C reports SAT. The Rust
   loop only checks at the top of a step, so it could report UNKNOWN with 0
   unsatisfied clauses.

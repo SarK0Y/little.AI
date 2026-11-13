@@ -143,6 +143,14 @@ static ResultUnit write_json(const char *path, const Cnf *cnf, const SolveResult
                 cnf->n_vars, cnf->n_clauses, r->steps, r->restart);
         for (size_t i = 0; i < r->n_vars; i++) fprintf(f, "%s%s", i ? ", " : "", r->assignment[i] ? "true" : "false");
         fprintf(f, "]\n}\n");
+    } else if (r->status == SOLVE_UNSAT) {
+        fprintf(f, "{\n  \"status\": \"UNSAT\",\n  \"message\": \"UNSAT\",\n"
+                   "  \"variables\": %zu,\n  \"clauses\": %zu,\n  \"contradictions\": [",
+                cnf->n_vars, cnf->n_clauses);
+        for (size_t i = 0; i < r->n_contradictions; i++)
+            fprintf(f, "%s{\"i\": %zu, \"j\": %zu}", i ? ", " : "",
+                    r->contradictions[i].a, r->contradictions[i].b);
+        fprintf(f, "]\n}\n");
     } else {
         fprintf(f, "{\n  \"status\": \"UNKNOWN\",\n  \"variables\": %zu,\n  \"clauses\": %zu,\n"
                    "  \"steps\": %zu,\n  \"best_unsatisfied\": %zu\n}\n",
@@ -173,6 +181,12 @@ static ResultInt solve_and_report(const Cnf *cnf, const Cli *cli) {
     if (res.status == SOLVE_SAT) {
         printf("SAT (%zu steps, restart %zu) \xe2\x80\x94 %s\n", res.steps, res.restart, cli->output);
         code = 0;
+    } else if (res.status == SOLVE_UNSAT) {
+        printf("UNSAT (%zu contradiction%s) \xe2\x80\x94 %s\n",
+               res.n_contradictions, res.n_contradictions == 1 ? "" : "s", cli->output);
+        for (size_t i = 0; i < res.n_contradictions; i++)
+            printf("  clause %zu == not clause %zu\n", res.contradictions[i].b, res.contradictions[i].a);
+        code = 4;
     } else {
         printf("UNKNOWN (%zu steps, best %zu unsatisfied) \xe2\x80\x94 %s\n", res.steps, res.best_unsatisfied, cli->output);
         code = 3;

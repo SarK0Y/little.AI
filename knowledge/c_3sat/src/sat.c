@@ -105,6 +105,7 @@ ResultCnf cnf_from_dimacs_str(const char *input) {
         while (llen && is_ws(*line)) { line++; llen--; }
         while (llen && is_ws(line[llen - 1])) llen--;
         if (llen == 0 || line[0] == 'c') continue;
+        if (line[0] == '%') break;   /* DIMACS end-of-file marker; trailing tokens are ignored */
 
         if (line[0] == 'p') {
             struct { const char *s; size_t n; } f[5];
@@ -464,14 +465,57 @@ static ResultSolve make_sat(const Solver *s, size_t steps, size_t restart) {
     bool *a = malloc(nv ? nv : 1);
     if (!a) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
     if (nv) memcpy(a, s->assignment, nv);
-    return OK(ResultSolve, ((SolveResult){ SOLVE_SAT, a, nv, steps, restart, 0 }));
+    return OK(ResultSolve, ((SolveResult){ SOLVE_SAT, a, nv, steps, restart, 0, NULL, 0 }));
+}
+
+/* Sound UNSAT pre-check: only a unit clause and its negation are contradictory.
+ * For length >= 2, a clause and its pointwise negation are satisfiable, e.g.
+ * (1 2 3) and (-1 -2 -3) are both true at x1=1, x2=0, x3=0. */
+static bool find_contradictions(const Cnf *cnf, Contradiction **out, size_t *out_n) {
+    size_t nv = cnf->n_vars;
+    size_t *pos = malloc((nv ? nv : 1) * sizeof *pos);
+    size_t *neg = malloc((nv ? nv : 1) * sizeof *neg);
+    *out = NULL;
+    *out_n = 0;
+    if (!pos || !neg) { free(pos); free(neg); return false; }
+    for (size_t v = 0; v < nv; v++) pos[v] = neg[v] = SIZE_MAX;
+    size_t n = 0, cap = 0;
+    Contradiction *list = NULL;
+    for (size_t ci = 0; ci < cnf->n_clauses; ci++) {
+        if (cnf_clause_len(cnf, ci) != 1) continue;
+        Lit l = cnf_clause(cnf, ci)[0];
+        size_t *same = l.positive ? &pos[l.var] : &neg[l.var];
+        size_t *opp = l.positive ? &neg[l.var] : &pos[l.var];
+        if (*opp != SIZE_MAX) {
+            if (n == cap) {
+                size_t ncap = cap ? cap * 2 : 8;
+                Contradiction *p = realloc(list, ncap * sizeof *p);
+                if (!p) { free(pos); free(neg); free(list); return false; }
+                list = p; cap = ncap;
+            }
+            list[n++] = l.positive ? (Contradiction){ ci, *opp }
+                                   : (Contradiction){ *opp, ci };
+        }
+        *same = ci;
+    }
+    free(pos); free(neg);
+    *out = list;
+    *out_n = n;
+    return true;
 }
 
 ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
     const Cnf *cnf = s->cnf;
+    Contradiction *contradictions = NULL;
+    size_t n_contradictions = 0;
+    if (!find_contradictions(cnf, &contradictions, &n_contradictions))
+        return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+    if (n_contradictions)
+        return OK(ResultSolve, ((SolveResult){ SOLVE_UNSAT, NULL, cnf->n_vars, 0, 0, 0,
+                                               contradictions, n_contradictions }));
     for (size_t i = 0; i < cnf->n_clauses; i++)
         if (cnf_clause_len(cnf, i) == 0)
-            return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, cnf->n_clauses }));
+            return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, cnf->n_clauses, NULL, 0 }));
     if (cnf->n_clauses == 0) {
         memset(s->assignment, 0, cnf->n_vars);
         return make_sat(s, 0, 0);
@@ -494,12 +538,14 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
         if (s->n_rogue == 0) return make_sat(s, total, restart);  /* last flip solved it */
     }
     if (s->n_rogue < best) best = s->n_rogue;
-    return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, total, 0, best }));
+    return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, total, 0, best, NULL, 0 }));
 }
 
 void solve_result_free(SolveResult *r) {
     free(r->assignment);
+    free(r->contradictions);
     r->assignment = NULL;
+    r->contradictions = NULL;
 }
 
 /* ---- introspection ---------------------------------------------------- */

@@ -1,7 +1,8 @@
 /* context-3sat (C port): incremental 3-SAT stochastic local search.
  *
  * Returns SAT when it finds a verified satisfying assignment and UNKNOWN when
- * the budget ends. It never claims UNSAT (local search cannot prove it).
+ * the budget ends. Local search cannot prove UNSAT, but a contradictory unit
+ * pair -- `(x)` and `(-x)` -- is checked up front and reported as UNSAT.
  */
 #ifndef C3SAT_SAT_H
 #define C3SAT_SAT_H
@@ -111,7 +112,10 @@ SolverConfig solver_config_default(void);
 typedef struct Solver Solver;   /* borrows the Cnf: keep it alive */
 typedef RESULT(Solver *) ResultSolver;
 
-typedef enum { SOLVE_SAT, SOLVE_UNKNOWN } SolveStatus;
+/* Two unit clauses with opposite signs: clause b == not clause a. */
+typedef struct { size_t a, b; } Contradiction;
+
+typedef enum { SOLVE_SAT, SOLVE_UNKNOWN, SOLVE_UNSAT } SolveStatus;
 typedef struct {
     SolveStatus status;
     bool *assignment;        /* owned; SAT only (else NULL) */
@@ -119,6 +123,8 @@ typedef struct {
     size_t steps;
     size_t restart;          /* SAT only */
     size_t best_unsatisfied; /* UNKNOWN only */
+    Contradiction *contradictions; /* owned; UNSAT only (else NULL) */
+    size_t n_contradictions;
 } SolveResult;
 typedef RESULT(SolveResult) ResultSolve;
 

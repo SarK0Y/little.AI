@@ -25,6 +25,12 @@ static void test_dimacs_multiline_and_comments(void) {
     cnf_free(&c);
 }
 
+static void test_dimacs_percent_eof(void) {
+    Cnf c = must_parse("p cnf 2 1\n1 2 0\n%\n0\n");
+    CHECK(c.n_clauses == 1 && cnf_clause_len(&c, 0) == 2);
+    cnf_free(&c);
+}
+
 static void test_normalization(void) {
     Cnf c = must_parse("p cnf 3 3\n1 1 2 0\n1 -1 2 0\n-3 0\n");
     CHECK(c.n_clauses == 2);                 /* tautology dropped */
@@ -156,6 +162,57 @@ static void test_incremental_matches_rebuild(void) {
     solver_free(a); solver_free(b); cnf_free(&c);
 }
 
+static void test_contradictory_units_are_unsat(void) {
+    Cnf c = must_parse("p cnf 3 5\n1 2 0\n1 0\n3 0\n-1 0\n-3 0\n");
+    Solver *s = must_solver(&c, 1);
+    SolverConfig cfg = solver_config_default();
+    ResultSolve r = solver_solve(s, &cfg);
+    CHECK(r.ok && r.val.status == SOLVE_UNSAT);
+    CHECK(r.ok && r.val.assignment == NULL && r.val.n_contradictions == 2);
+    if (r.ok && r.val.n_contradictions == 2) {
+        CHECK(r.val.contradictions[0].a == 1 && r.val.contradictions[0].b == 3);
+        CHECK(r.val.contradictions[1].a == 2 && r.val.contradictions[1].b == 4);
+    }
+    if (r.ok) solve_result_free(&r.val);
+    solver_free(s); cnf_free(&c);
+
+    /* negative unit first: the pair is still reported as (positive, negative) */
+    Cnf d = must_parse("p cnf 1 2\n-1 0\n1 0\n");
+    s = must_solver(&d, 1);
+    r = solver_solve(s, &cfg);
+    CHECK(r.ok && r.val.status == SOLVE_UNSAT && r.val.n_contradictions == 1);
+    if (r.ok && r.val.n_contradictions == 1)
+        CHECK(r.val.contradictions[0].a == 1 && r.val.contradictions[0].b == 0);
+    if (r.ok) solve_result_free(&r.val);
+    solver_free(s); cnf_free(&d);
+}
+
+/* core relatives (1 2)/(-1 -2) are consistent; only the extra units (1)/(-1) conflict. */
+static void test_contradiction_lives_in_extras(void) {
+    Cnf c = must_parse("p cnf 2 4\n1 2 0\n-1 -2 0\n1 0\n-1 0\n");
+    Solver *s = must_solver(&c, 1);
+    SolverConfig cfg = solver_config_default();
+    ResultSolve r = solver_solve(s, &cfg);
+    CHECK(r.ok && r.val.status == SOLVE_UNSAT && r.val.n_contradictions == 1);
+    if (r.ok && r.val.n_contradictions == 1)
+        CHECK(r.val.contradictions[0].a == 2 && r.val.contradictions[0].b == 3);
+    if (r.ok) solve_result_free(&r.val);
+    solver_free(s); cnf_free(&c);
+}
+
+/* (1 2 3) and (-1 -2 -3) are not contradictory: x1=1, x2=0, x3=0 satisfies both. */
+static void test_negated_3clauses_are_not_unsat(void) {
+    Cnf c = must_parse("p cnf 3 2\n1 2 3 0\n-1 -2 -3 0\n");
+    Solver *s = must_solver(&c, 1);
+    SolverConfig cfg = solver_config_default();
+    cfg.max_steps = 1000; cfg.restarts = 5;
+    ResultSolve r = solver_solve(s, &cfg);
+    CHECK(r.ok && r.val.status == SOLVE_SAT);
+    if (r.ok && r.val.status == SOLVE_SAT) CHECK(verify(&c, r.val.assignment, r.val.n_vars));
+    if (r.ok) solve_result_free(&r.val);
+    solver_free(s); cnf_free(&c);
+}
+
 static size_t progress_calls = 0;
 static void count_progress(void *ctx, size_t steps, size_t unsat) {
     (void)steps; (void)unsat; (*(size_t *)ctx)++;
@@ -214,12 +271,16 @@ static void test_try_macros(void) {
 
 int main(void) {
     test_dimacs_multiline_and_comments();
+    test_dimacs_percent_eof();
     test_normalization();
     test_parse_errors();
     test_verify();
     test_solves_simple();
     test_empty_clause_and_empty_formula();
     test_unsat_is_unknown_never_unsat();
+    test_contradictory_units_are_unsat();
+    test_contradiction_lives_in_extras();
+    test_negated_3clauses_are_not_unsat();
     test_rogue_is_a_clause_state();
     test_neutral_can_occur_in_rogue_clause();
     test_prime_precedence();
