@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 
+#include "groups.h"
 #include "sat.h"
 
 #define DEFAULT_OUT "./knowledge/c_3sat/results/latest.json"
@@ -11,6 +12,8 @@ typedef struct {
     const char *input;
     const char *output;
     SolverConfig cfg;
+    bool groups_mode;      /* --mode groups: sequential rogue groups + neutral merge */
+    GroupConfig gcfg;
 } Cli;
 
 typedef RESULT(int) ResultInt;
@@ -71,6 +74,40 @@ static ResultUnit opt_strategy(Cli *cli, const char *flag, const char *value) {
     return OK_UNIT(ResultUnit);
 }
 
+static ResultUnit opt_mode(Cli *cli, const char *flag, const char *value) {
+    if (strcmp(value, "plain") == 0) cli->groups_mode = false;
+    else if (strcmp(value, "groups") == 0) cli->groups_mode = true;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected plain|groups)", flag, value);
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_max_groups(Cli *cli, const char *flag, const char *value) {
+    size_t v;
+    TRY0(ResultUnit, parse_size(flag, value, &v));
+    if (v < 1 || v > GROUPS_MAX) return ERRF(ResultUnit, ERR_USAGE, "%s must be between 1 and %d", flag, GROUPS_MAX);
+    cli->gcfg.max_groups = v;
+    return OK_UNIT(ResultUnit);
+}
+
+static ResultUnit opt_merge(Cli *cli, const char *flag, const char *value) {
+    if (strcmp(value, "free") == 0) cli->gcfg.directed_only = false;
+    else if (strcmp(value, "directed") == 0) cli->gcfg.directed_only = true;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected free|directed)", flag, value);
+    return OK_UNIT(ResultUnit);
+}
+
+static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
+    if (strcmp(value, "majority") == 0) cli->cfg.init = INIT_MAJORITY;
+    else if (strcmp(value, "rarest") == 0) cli->cfg.init = INIT_RAREST;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest)", flag, value);
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_group_len(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->gcfg.group_len);
+}
+static ResultUnit opt_diversify(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->gcfg.diversify);
+}
+
 static void print_progress(void *ctx, size_t steps, size_t unsat) {
     (void)ctx;
     fprintf(stderr, "[%zu steps] %zu unsatisfied\n", steps, unsat);
@@ -87,12 +124,19 @@ static const OptSpec OPTS[] = {
     { "--noise", opt_noise },     { "--seed", opt_seed },
     { "--out", opt_out },         { "--strategy", opt_strategy },
     { "--progress", opt_progress },
+    { "--mode", opt_mode },       { "--max-groups", opt_max_groups },
+    { "--merge", opt_merge },     { "--diversify", opt_diversify },
+    { "--group-len", opt_group_len }, { "-group-len", opt_group_len },
+    { "--init", opt_init },
 };
 
 static void usage(void) {
     fprintf(stderr,
         "Usage: 3sat INPUT.cnf [--steps N] [--restarts N] [--noise 0..1] [--seed N]\n"
-        "                      [--strategy ranked|greedy|random] [--progress N] [--out FILE]\n");
+        "                      [--strategy ranked|greedy|random] [--progress N] [--out FILE]\n"
+        "                      [--mode plain|groups] [--max-groups 1..1024] [--merge free|directed]\n"
+        "                      [--diversify N] [--group-len N]\n"
+        "                      [--init majority|rarest]\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
@@ -160,11 +204,84 @@ static ResultUnit write_json(const char *path, const Cnf *cnf, const SolveResult
     return OK_UNIT(ResultUnit);
 }
 
+static void json_id_list(FILE *f, const size_t *ids, size_t n) {   /* 1-based, DIMACS style */
+    fputc('[', f);
+    for (size_t i = 0; i < n; i++) fprintf(f, "%s%zu", i ? ", " : "", ids[i] + 1);
+    fputc(']', f);
+}
+
+static ResultUnit write_group_json(const char *path, const Cnf *cnf, const GroupResult *r) {
+    TRY0(ResultUnit, ensure_parent_dir(path));
+    FILE *f = fopen(path, "wb");
+    if (!f) return ERRF(ResultUnit, ERR_IO, "Cannot write result %s: %s", path, strerror(errno));
+    if (r->status == SOLVE_UNSAT) {
+        fprintf(f, "{\n  \"status\": \"UNSAT\",\n  \"mode\": \"groups\",\n  \"variables\": %zu,\n"
+                   "  \"clauses\": %zu,\n  \"contradictions\": [", cnf->n_vars, cnf->n_clauses);
+        for (size_t i = 0; i < r->n_contradictions; i++)
+            fprintf(f, "%s{\"i\": %zu, \"j\": %zu}", i ? ", " : "", r->contradictions[i].a, r->contradictions[i].b);
+        fprintf(f, "]\n}\n");
+    } else {
+        fprintf(f, "{\n  \"status\": \"%s\",\n  \"mode\": \"groups\",\n  \"variables\": %zu,\n"
+                   "  \"clauses\": %zu,\n  \"steps\": %zu,\n  \"groups\": %zu,\n  \"group_sizes\": [",
+                r->status == SOLVE_SAT ? "SAT" : "UNKNOWN", cnf->n_vars, cnf->n_clauses, r->steps, r->n_groups);
+        for (size_t i = 0; i < r->n_groups; i++) fprintf(f, "%s%zu", i ? ", " : "", r->group_sizes[i]);
+        fprintf(f, "],\n  \"merged\": %s,\n  \"merge_flips\": %zu,\n  \"merge_flips_free\": %zu,\n",
+                r->merged ? "true" : "false", r->merge_flips, r->merge_flips_free);
+        if (r->merged) fprintf(f, "  \"anchor_group\": %zu,\n", r->anchor + 1);
+        if (r->status == SOLVE_UNKNOWN) {
+            /* merged part of the system: what is still broken and what can/cannot move */
+            /* each leftover clause together with the group(s) it was rogue in (ids 1-based; [] = none) */
+            fprintf(f, "  \"unmerged_clauses\": [");
+            for (size_t i = 0; i < r->n_rogue; i++) {
+                fprintf(f, "%s\n    {\"clause\": %zu, \"groups\": ", i ? "," : "", r->rogue[i] + 1);
+                json_id_list(f, r->rogue_group + r->rogue_group_off[i], r->rogue_group_off[i + 1] - r->rogue_group_off[i]);
+                fputc('}', f);
+            }
+            fprintf(f, "%s]", r->n_rogue ? "\n  " : "");
+            fprintf(f, ",\n  \"neutral_vars\": ");   json_id_list(f, r->neutral, r->n_neutral);
+            fprintf(f, ",\n  \"prime_vars\": ");     json_id_list(f, r->prime, r->n_prime);
+            fprintf(f, ",\n  \"merged_assignment\": [");
+        } else {
+            fprintf(f, "  \"assignment\": [");
+        }
+        for (size_t i = 0; i < r->n_vars; i++) fprintf(f, "%s%s", i ? ", " : "", r->assignment[i] ? "true" : "false");
+        fprintf(f, "]\n}\n");
+    }
+    if (fclose(f) != 0) return ERRF(ResultUnit, ERR_IO, "Cannot write result %s: %s", path, strerror(errno));
+    return OK_UNIT(ResultUnit);
+}
+
+static ResultInt solve_groups_and_report(const Cnf *cnf, const Cli *cli) {
+    GroupResult res = TRY(ResultInt, group_solve(cnf, &cli->cfg, &cli->gcfg));
+    ResultUnit w = write_group_json(cli->output, cnf, &res);
+    if (!w.ok) { group_result_free(&res); return ERR(ResultInt, w.err); }
+    int code;
+    if (res.status == SOLVE_SAT) {
+        printf("SAT (%zu group%s, %zu steps, %zu merge flip%s) \xe2\x80\x94 %s\n", res.n_groups,
+               res.n_groups == 1 ? "" : "s", res.steps, res.merge_flips, res.merge_flips == 1 ? "" : "s", cli->output);
+        code = 0;
+    } else if (res.status == SOLVE_UNSAT) {
+        printf("UNSAT (%zu contradiction%s) \xe2\x80\x94 %s\n", res.n_contradictions,
+               res.n_contradictions == 1 ? "" : "s", cli->output);
+        for (size_t i = 0; i < res.n_contradictions; i++)
+            printf("  clause %zu == not clause %zu\n", res.contradictions[i].b, res.contradictions[i].a);
+        code = 4;
+    } else {
+        printf("UNKNOWN (%zu group%s, %zu merge flip%s) \xe2\x80\x94 %zu unmerged clause%s, %zu neutral, %zu prime \xe2\x80\x94 %s\n",
+               res.n_groups, res.n_groups == 1 ? "" : "s", res.merge_flips, res.merge_flips == 1 ? "" : "s",
+               res.n_rogue, res.n_rogue == 1 ? "" : "s", res.n_neutral, res.n_prime, cli->output);
+        code = 3;
+    }
+    group_result_free(&res);
+    return OK(ResultInt, code);
+}
+
 /* ---- run --------------------------------------------------------------- */
 
 static ResultInt solve_and_report(const Cnf *cnf, const Cli *cli) {
     if (!cnf_is_3sat(cnf))
         fprintf(stderr, "Warning: input contains clauses longer than 3 literals; solving general CNF instead of strict 3-SAT.\n");
+    if (cli->groups_mode) return solve_groups_and_report(cnf, cli);
     Solver *solver = TRY(ResultInt, solver_new(cnf, cli->cfg.seed));
     ResultSolve rs = solver_solve(solver, &cli->cfg);
     solver_free(solver);
@@ -196,7 +313,8 @@ static ResultInt solve_and_report(const Cnf *cnf, const Cli *cli) {
 }
 
 static ResultInt run(int argc, char **argv) {
-    Cli cli = { .input = NULL, .output = DEFAULT_OUT, .cfg = solver_config_default() };
+    Cli cli = { .input = NULL, .output = DEFAULT_OUT, .cfg = solver_config_default(),
+                .groups_mode = false, .gcfg = group_config_default() };
     TRY0(ResultInt, parse_args(argc, argv, &cli));
     Cnf cnf = TRY_CTX(ResultInt, cnf_from_dimacs_file(cli.input), "Failed to load CNF");
     ResultInt r = solve_and_report(&cnf, &cli);

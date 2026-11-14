@@ -94,12 +94,20 @@ extern const Strategy STRATEGIES[];
 extern const size_t N_STRATEGIES;
 PickFn pick_fn_by_name(const char *name); /* NULL if unknown */
 
+/* Where restart 0 starts from (later restarts are random). */
+typedef enum {
+    INIT_MAJORITY,  /* every variable takes its majority polarity (default) */
+    INIT_RAREST     /* constructive: rarest variables first, see solver_init_rarest() */
+} InitMode;
+
 typedef struct {
     size_t max_steps;
     size_t restarts;
     double noise;     /* probability of a random pick among top candidates */
     uint64_t seed;
     PickFn pick;      /* NULL => pick_ranked */
+    const bool *initial;  /* optional start for restart 0 (n_vars entries); NULL => use `init` */
+    InitMode init;
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -131,6 +139,8 @@ typedef RESULT(SolveResult) ResultSolve;
 ResultSolver solver_new(const Cnf *cnf, uint64_t seed);
 void solver_free(Solver *s);
 ResultSolve solver_solve(Solver *s, const SolverConfig *cfg);
+/* Contradictory unit pairs (x)/(-x); false only on allocation failure. Caller frees *out. */
+bool cnf_find_contradictions(const Cnf *cnf, Contradiction **out, size_t *out_n);
 void solve_result_free(SolveResult *r);
 
 /* Introspection (also used by the tests). */
@@ -141,5 +151,19 @@ size_t solver_clause_support(const Solver *s, size_t clause);
 const VarStats *solver_var_stats(Solver *s);  /* refreshes lazily if stale */
 void solver_set_assignment(Solver *s, const bool *assignment);
 void solver_flip(Solver *s, size_t var);
+/* Deterministic constructive start (no RNG). Repeatedly takes the rarest unset
+ * variable: fewest clauses holding x or !x (the larger of the two polarity counts,
+ * satisfied clauses excluded, ties by id), recomputed after each assignment so a
+ * satisfied clause drops its overlap from every remaining variable. A variable takes the value that
+ *   1. satisfies more *forced* clauses (open clauses where it is the last unset variable),
+ *   2. else satisfies more open (not yet satisfied) clauses,
+ *   3. else has the larger total polarity, else false.
+ * false only on allocation failure. */
+bool solver_init_rarest(Solver *s);
+void solver_init_majority(Solver *s);                  /* majority-polarity start (ties use the solver RNG) */
+const size_t *solver_rogue_list(const Solver *s);      /* solver_unsatisfied_count() clause ids */
+VarStats solver_refresh_var(Solver *s, size_t var);    /* fresh stats of one variable, O(occurrences) */
+size_t solver_occ_count(const Solver *s, size_t var);  /* clauses containing var */
+size_t solver_occ_clause(const Solver *s, size_t var, size_t i);
 
 #endif

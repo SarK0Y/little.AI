@@ -375,7 +375,12 @@ ResultSolver solver_new(const Cnf *cnf, uint64_t seed) {
 }
 
 /* Re-derive one variable's state, break and make counts from the current
- * assignment in a single pass over its occurrences. */
+ * assignment in a single pass over its occurrences.
+ *
+ * Ranking invariant (relied on by the group merge):
+ *   VAR_PRIME   <=> break_count >= 1   (sole support of at least one solved clause)
+ *   VAR_NEUTRAL <=> break_count == 0   (flipping can never un-solve a clause)
+ * Neutrality is a property of the *current* assignment, not of the variable. */
 static void refresh_var(Solver *s, size_t v) {
     size_t satisfied = 0, rogue_occ = 0, breaks = 0, min_support = SIZE_MAX;
     bool prime = false;
@@ -460,6 +465,112 @@ static void random_assignment(Solver *s, bool majority) {
     rebuild_counts(s);
 }
 
+typedef struct { size_t key, var; } Rare;
+
+static bool rare_before(Rare a, Rare b) {
+    if (a.key != b.key) return a.key < b.key;
+    return a.var < b.var;
+}
+
+static void rare_push(Rare *h, size_t *n, Rare x) {
+    size_t i = (*n)++;
+    while (i > 0) {
+        size_t p = (i - 1) / 2;
+        if (!rare_before(x, h[p])) break;
+        h[i] = h[p];
+        i = p;
+    }
+    h[i] = x;
+}
+
+static void rare_sift_down(Rare *h, size_t n, size_t i, Rare x) {
+    for (;;) {
+        size_t l = 2 * i + 1;
+        if (l >= n) break;
+        size_t c = l;
+        if (l + 1 < n && rare_before(h[l + 1], h[l])) c = l + 1;
+        if (!rare_before(h[c], x)) break;
+        h[i] = h[c];
+        i = c;
+    }
+    h[i] = x;
+}
+
+static Rare rare_pop(Rare *h, size_t *n) {
+    Rare top = h[0], last = h[--(*n)];
+    if (*n) rare_sift_down(h, *n, 0, last);
+    return top;
+}
+
+/* Rarest = fewest clauses holding x or !x, whichever is larger. Only clauses
+ * that are still unsatisfied count, so satisfying a clause removes the
+ * overlapping occurrences of every variable it contains. */
+static size_t rare_key(const uint32_t *pos, const uint32_t *neg, size_t v) {
+    return pos[v] > neg[v] ? pos[v] : neg[v];
+}
+
+bool solver_init_rarest(Solver *s) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
+    uint32_t *unset = malloc((nc ? nc : 1) * sizeof *unset);   /* unassigned variables left in each clause */
+    unsigned char *done = calloc(nc ? nc : 1, 1);              /* clause already has a true literal */
+    uint32_t *pos = calloc(nv ? nv : 1, sizeof *pos);          /* effective: satisfied clauses dropped */
+    uint32_t *neg = calloc(nv ? nv : 1, sizeof *neg);
+    unsigned char *assigned = calloc(nv ? nv : 1, 1);
+    Rare *heap = malloc((nv + s->occ_off[nv] + 1) * sizeof *heap);
+    if (!unset || !done || !pos || !neg || !assigned || !heap) {
+        free(unset); free(done); free(pos); free(neg); free(assigned); free(heap);
+        return false;
+    }
+    for (size_t c = 0; c < nc; c++) unset[c] = (uint32_t)cnf_clause_len(cnf, c);
+    size_t hn = 0;
+    for (size_t v = 0; v < nv; v++) {
+        for (size_t k = s->occ_off[v]; k < s->occ_off[v + 1]; k++)
+            if (s->occ[k].positive) pos[v]++; else neg[v]++;
+        rare_push(heap, &hn, (Rare){ rare_key(pos, neg, v), v });
+    }
+
+    for (size_t step = 0; step < nv; step++) {
+        Rare top;
+        do {
+            top = rare_pop(heap, &hn);
+        } while (assigned[top.var] || top.key != rare_key(pos, neg, top.var));
+        size_t v = top.var;
+        size_t fp = 0, fn = 0, op = 0, on = 0, tp = 0, tn = 0;
+        for (size_t k = s->occ_off[v]; k < s->occ_off[v + 1]; k++) {
+            Occ o = s->occ[k];
+            if (o.positive) tp++; else tn++;
+            if (done[o.clause]) continue;
+            if (unset[o.clause] == 1) { if (o.positive) fp++; else fn++; }
+            else                      { if (o.positive) op++; else on++; }
+        }
+        bool val;
+        if (fp != fn) val = fp > fn;
+        else if (op != on) val = op > on;
+        else if (tp != tn) val = tp > tn;
+        else val = false;
+        s->assignment[v] = val;
+        assigned[v] = 1;
+        for (size_t k = s->occ_off[v]; k < s->occ_off[v + 1]; k++) {
+            Occ o = s->occ[k];
+            unset[o.clause]--;
+            if (done[o.clause] || o.positive != val) continue;
+            done[o.clause] = 1;
+            const Lit *cl = cnf_clause(cnf, o.clause);
+            size_t len = cnf_clause_len(cnf, o.clause);
+            for (size_t j = 0; j < len; j++) {
+                size_t u = cl[j].var;
+                if (assigned[u]) continue;
+                if (cl[j].positive) pos[u]--; else neg[u]--;
+                rare_push(heap, &hn, (Rare){ rare_key(pos, neg, u), u });
+            }
+        }
+    }
+    free(unset); free(done); free(pos); free(neg); free(assigned); free(heap);
+    rebuild_counts(s);
+    return true;
+}
+
 static ResultSolve make_sat(const Solver *s, size_t steps, size_t restart) {
     size_t nv = s->cnf->n_vars;
     bool *a = malloc(nv ? nv : 1);
@@ -471,7 +582,7 @@ static ResultSolve make_sat(const Solver *s, size_t steps, size_t restart) {
 /* Sound UNSAT pre-check: only a unit clause and its negation are contradictory.
  * For length >= 2, a clause and its pointwise negation are satisfiable, e.g.
  * (1 2 3) and (-1 -2 -3) are both true at x1=1, x2=0, x3=0. */
-static bool find_contradictions(const Cnf *cnf, Contradiction **out, size_t *out_n) {
+bool cnf_find_contradictions(const Cnf *cnf, Contradiction **out, size_t *out_n) {
     size_t nv = cnf->n_vars;
     size_t *pos = malloc((nv ? nv : 1) * sizeof *pos);
     size_t *neg = malloc((nv ? nv : 1) * sizeof *neg);
@@ -508,7 +619,7 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
     const Cnf *cnf = s->cnf;
     Contradiction *contradictions = NULL;
     size_t n_contradictions = 0;
-    if (!find_contradictions(cnf, &contradictions, &n_contradictions))
+    if (!cnf_find_contradictions(cnf, &contradictions, &n_contradictions))
         return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
     if (n_contradictions)
         return OK(ResultSolve, ((SolveResult){ SOLVE_UNSAT, NULL, cnf->n_vars, 0, 0, 0,
@@ -523,7 +634,14 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
     PickFn pick = cfg->pick ? cfg->pick : pick_ranked;
     size_t total = 0, best = SIZE_MAX;
     for (size_t restart = 0; restart <= cfg->restarts; restart++) {
-        random_assignment(s, restart == 0);
+        if (restart == 0 && cfg->initial) {
+            if (cnf->n_vars) memcpy(s->assignment, cfg->initial, cnf->n_vars);
+            rebuild_counts(s);
+        } else if (restart == 0 && cfg->init == INIT_RAREST) {
+            if (!solver_init_rarest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else {
+            random_assignment(s, restart == 0);
+        }
         for (size_t step = 0; step < cfg->max_steps; step++) {
             if (s->n_rogue == 0) return make_sat(s, total, restart);
             if (s->n_rogue < best) best = s->n_rogue;
@@ -559,6 +677,12 @@ const VarStats *solver_var_stats(Solver *s) {
     if (s->stats_dirty) refresh_all(s);
     return s->stats;
 }
+
+void solver_init_majority(Solver *s) { random_assignment(s, true); }
+const size_t *solver_rogue_list(const Solver *s) { return s->rogue; }
+VarStats solver_refresh_var(Solver *s, size_t v) { refresh_var(s, v); return s->stats[v]; }
+size_t solver_occ_count(const Solver *s, size_t v) { return occ_count(s, v); }
+size_t solver_occ_clause(const Solver *s, size_t v, size_t i) { return s->occ[s->occ_off[v] + i].clause; }
 
 void solver_set_assignment(Solver *s, const bool *a) {
     if (s->cnf->n_vars) memcpy(s->assignment, a, s->cnf->n_vars);
