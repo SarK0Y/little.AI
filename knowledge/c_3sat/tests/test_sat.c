@@ -256,7 +256,7 @@ static void test_ranking_invariant_neutral_means_zero_breaks(void) {
                     if (cl[k].var == v && lit_value(cl[k], solver_assignment(s)[v]) && solver_clause_support(s, ci) == 1) breaks++;
             }
             CHECK(st[v].break_count == breaks);
-            CHECK((st[v].state == VAR_PRIME) == (breaks >= 1));
+            CHECK((st[v].state == VAR_PRIME || st[v].state == VAR_TWIN) == (breaks >= 1));
             if (st[v].state == VAR_NEUTRAL) CHECK(st[v].break_count == 0);
             CHECK(solver_refresh_var(s, v).state == st[v].state);   /* single-var refresh agrees */
         }
@@ -293,7 +293,7 @@ static void check_group_result(const Cnf *c, const GroupResult *r) {
     for (size_t i = 0; i < r->n_prime; i++) pri[r->prime[i]] = 1;
     for (size_t v = 0; v < nv; v++) {
         CHECK(neu[v] == (st[v].state == VAR_NEUTRAL));
-        CHECK(pri[v] == (st[v].state == VAR_PRIME));
+        CHECK(pri[v] == (st[v].state == VAR_PRIME || st[v].state == VAR_TWIN));
         CHECK(!(neu[v] && pri[v]));
     }
     solver_free(ref);
@@ -547,6 +547,74 @@ static void test_init_rarest_properties(void) {
     }
 }
 
+/* ---- Likho: majority + neutral/twin repair ----------------------------- */
+
+static void test_likho_neutral_repair(void) {
+    /* Majority leaves (1 2 3) rogue with every variable neutral: each true
+     * literal sits in a clause that has two other true literals. One neutral
+     * flip satisfies the rogue clause and breaks nothing. */
+    Cnf c = must_parse("p cnf 4 7\n"
+                       "1 2 3 0\n"
+                       "-1 -2 4 0\n-1 -3 4 0\n-2 -1 4 0\n"
+                       "-2 -3 4 0\n-3 -1 4 0\n-3 -2 4 0\n");
+    Solver *s = must_solver(&c, 1);
+    solver_init_majority(s);
+    CHECK(solver_unsatisfied_count(s) == 1);
+    for (size_t k = 0; k < 3; k++)
+        CHECK(solver_refresh_var(s, k).state == VAR_NEUTRAL);
+    CHECK(solver_likho(s));
+    CHECK(solver_unsatisfied_count(s) == 0);
+    CHECK(verify(&c, solver_assignment(s), c.n_vars));
+    solver_free(s); cnf_free(&c);
+}
+
+static void test_likho_twin_repair(void) {
+    /* Majority leaves (-1 2 3) rogue. x1 is the sole support of (1 2 3) and x2
+     * of (-1 -2 3), so neither can flip alone; flipping both satisfies the
+     * rogue clause and each other's broken clause, and breaks nothing. */
+    Cnf c = must_parse("p cnf 4 10\n"
+                       "1 2 3 0\n"
+                       "-1 -2 3 0\n"
+                       "-1 2 3 0\n"
+                       "-3 -1 2 0\n"
+                       "-2 4 1 0\n-2 4 1 0\n-2 4 1 0\n"
+                       "-3 4 1 0\n-3 4 1 0\n-3 4 1 0\n");
+    Solver *s = must_solver(&c, 1);
+    solver_init_majority(s);
+    CHECK(solver_unsatisfied_count(s) == 1);
+    for (size_t k = 0; k < 3; k++)
+        CHECK(solver_refresh_var(s, k).state == VAR_PRIME);
+    CHECK(solver_likho(s));
+    CHECK(solver_unsatisfied_count(s) == 0);
+    CHECK(verify(&c, solver_assignment(s), c.n_vars));
+    solver_free(s); cnf_free(&c);
+}
+
+static void test_likho_properties(void) {
+    for (int i = 0; i < 25; i++) {
+        Cnf c = random_cnf(60 + 20 * (i % 4), (int)((60 + 20 * (i % 4)) * (2.0 + 0.4 * (i % 5))), 700 + (uint64_t)i);
+        Solver *base = must_solver(&c, 7), *a = must_solver(&c, 7), *b = must_solver(&c, 7);
+        solver_init_majority(base);
+        size_t before = solver_unsatisfied_count(base);
+        CHECK(solver_likho(a) && solver_likho(b));
+        CHECK(memcmp(solver_assignment(a), solver_assignment(b), c.n_vars) == 0);   /* same seed => same repair */
+        CHECK(solver_unsatisfied_count(a) <= before);                               /* never worse than majority */
+        CHECK(solver_unsatisfied_count(a) == brute_unsat(&c, solver_assignment(a)));/* counters consistent */
+        solver_free(base); solver_free(a); solver_free(b);
+
+        SolverConfig cfg = solver_config_default();
+        cfg.init = INIT_LIKHO;
+        cfg.max_steps = 20000; cfg.restarts = 2;
+        Solver *s = must_solver(&c, 5);
+        ResultSolve r = solver_solve(s, &cfg);
+        CHECK(r.ok);
+        if (r.ok && r.val.status == SOLVE_SAT) CHECK(verify(&c, r.val.assignment, r.val.n_vars));
+        if (r.ok) solve_result_free(&r.val);
+        solver_free(s);
+        cnf_free(&c);
+    }
+}
+
 static size_t progress_calls = 0;
 static void count_progress(void *ctx, size_t steps, size_t unsat) {
     (void)steps; (void)unsat; (*(size_t *)ctx)++;
@@ -629,6 +697,9 @@ int main(void) {
     test_more_than_64_groups();
     test_init_rarest_hand_checked();
     test_init_rarest_properties();
+    test_likho_neutral_repair();
+    test_likho_twin_repair();
+    test_likho_properties();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

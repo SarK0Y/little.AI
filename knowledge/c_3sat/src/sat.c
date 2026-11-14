@@ -378,8 +378,8 @@ ResultSolver solver_new(const Cnf *cnf, uint64_t seed) {
  * assignment in a single pass over its occurrences.
  *
  * Ranking invariant (relied on by the group merge):
- *   VAR_PRIME   <=> break_count >= 1   (sole support of at least one solved clause)
- *   VAR_NEUTRAL <=> break_count == 0   (flipping can never un-solve a clause)
+ *   VAR_PRIME or VAR_TWIN <=> break_count >= 1  (sole support of a solved clause)
+ *   VAR_NEUTRAL           <=> break_count == 0  (flipping can never un-solve a clause)
  * Neutrality is a property of the *current* assignment, not of the variable. */
 static void refresh_var(Solver *s, size_t v) {
     size_t satisfied = 0, rogue_occ = 0, breaks = 0, min_support = SIZE_MAX;
@@ -444,7 +444,8 @@ static size_t rank_candidates(Solver *s, size_t clause) {
         Candidate cd = { v, 0, 0, st->break_count, st->make_count };
         switch (st->state) {
             case VAR_NEUTRAL: cd.cls = 0; cd.support = st->min_support; break;
-            case VAR_PRIME:   cd.cls = 1; cd.support = 1; break;
+            case VAR_PRIME:
+            case VAR_TWIN:    cd.cls = 1; cd.support = 1; break;   /* a twin is still a prime on its own */
             case VAR_UNUSED:  cd.cls = 2; cd.support = SIZE_MAX; break;
         }
         size_t j = k;  /* insertion sort: clauses are tiny */
@@ -571,6 +572,102 @@ bool solver_init_rarest(Solver *s) {
     return true;
 }
 
+/* ---- Likho: majority start + one-flip-per-variable repair pass ---------- */
+
+/* a is a prime in a rogue clause. Flipping it breaks every clause where it is
+ * the sole true literal; take the first such clause and try its other (false)
+ * literals as partners. b is a twin iff b is an unflipped prime and flipping
+ * both leaves every clause containing a or b satisfied. A flip toggles its
+ * literal in each such clause, so a clause that is rogue after the pair flip
+ * was satisfied before it -- exactly the breakage that rules the pair out.
+ * shortcut: only the first sole-support clause is searched; a prime with
+ * several sole supports rarely has one partner that fixes them all. */
+static bool likho_twin(Solver *s, size_t a, const unsigned char *flipped, size_t *partner) {
+    if (flipped[a] || solver_refresh_var(s, a).state != VAR_PRIME) return false;
+    bool aval = s->assignment[a];
+    size_t sole = SIZE_MAX;
+    for (size_t i = s->occ_off[a]; i < s->occ_off[a + 1]; i++) {
+        Occ o = s->occ[i];
+        if (o.positive == aval && s->sat[o.clause] == 1) { sole = o.clause; break; }
+    }
+    if (sole == SIZE_MAX) return false;
+    const Lit *cl = cnf_clause(s->cnf, sole);
+    size_t n = cnf_clause_len(s->cnf, sole);
+    for (size_t k = 0; k < n; k++) {
+        size_t b = cl[k].var;
+        if (b == a || flipped[b]) continue;
+        if (solver_refresh_var(s, b).state != VAR_PRIME) continue;
+        solver_flip(s, a);
+        solver_flip(s, b);
+        bool clean = true;
+        for (size_t i = s->occ_off[a]; i < s->occ_off[a + 1] && clean; i++)
+            if (s->sat[s->occ[i].clause] == 0) clean = false;
+        for (size_t i = s->occ_off[b]; i < s->occ_off[b + 1] && clean; i++)
+            if (s->sat[s->occ[i].clause] == 0) clean = false;
+        if (clean) {
+            s->stats[a].state = VAR_TWIN;   /* phase-2 label; the next refresh re-derives it */
+            s->stats[b].state = VAR_TWIN;
+            *partner = b;
+            return true;
+        }
+        solver_flip(s, b);
+        solver_flip(s, a);
+    }
+    return false;
+}
+
+bool solver_likho(Solver *s) {
+    solver_init_majority(s);
+    size_t nv = s->cnf->n_vars, nc = s->cnf->n_clauses;
+    unsigned char *flipped = calloc(nv ? nv : 1, 1);
+    size_t *snap = malloc((nc ? nc : 1) * sizeof *snap);
+    if (!flipped || !snap) { free(flipped); free(snap); return false; }
+    while (s->n_rogue > 0) {
+        size_t nr = s->n_rogue;
+        memcpy(snap, s->rogue, nr * sizeof *snap);
+        bool moved = false;
+        /* Neutrals first: a neutral flip breaks nothing, so it only removes
+         * clauses from the rogue set. Re-scanning next round also catches the
+         * primes this pass liberated (they are neutral now). */
+        for (size_t i = 0; i < nr; i++) {
+            size_t c = snap[i];
+            if (!solver_clause_is_rogue(s, c)) continue;
+            const Lit *cl = cnf_clause(s->cnf, c);
+            size_t len = cnf_clause_len(s->cnf, c);
+            for (size_t k = 0; k < len; k++) {
+                size_t v = cl[k].var;
+                if (flipped[v]) continue;
+                if (solver_refresh_var(s, v).state != VAR_NEUTRAL) continue;
+                solver_flip(s, v);
+                flipped[v] = 1;
+                moved = true;
+                break;
+            }
+        }
+        if (moved) continue;   /* prefer neutrals, including freshly liberated primes */
+        /* Twins: only reached when no rogue clause has a neutral left. A clean
+         * pair flip also adds no new rogue clause, so this pass can keep going. */
+        for (size_t i = 0; i < nr; i++) {
+            size_t c = snap[i];
+            if (!solver_clause_is_rogue(s, c)) continue;
+            const Lit *cl = cnf_clause(s->cnf, c);
+            size_t len = cnf_clause_len(s->cnf, c);
+            for (size_t k = 0; k < len; k++) {
+                size_t v = cl[k].var, partner;
+                if (flipped[v]) continue;
+                if (!likho_twin(s, v, flipped, &partner)) continue;
+                flipped[v] = 1;
+                flipped[partner] = 1;
+                moved = true;
+                break;
+            }
+        }
+        if (!moved) break;   /* stuck: no neutral and no twin anywhere */
+    }
+    free(flipped); free(snap);
+    return true;
+}
+
 static ResultSolve make_sat(const Solver *s, size_t steps, size_t restart) {
     size_t nv = s->cnf->n_vars;
     bool *a = malloc(nv ? nv : 1);
@@ -639,6 +736,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             rebuild_counts(s);
         } else if (restart == 0 && cfg->init == INIT_RAREST) {
             if (!solver_init_rarest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_LIKHO) {
+            if (!solver_likho(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else {
             random_assignment(s, restart == 0);
         }

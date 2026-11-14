@@ -83,9 +83,15 @@ Adding a heuristic = write a `PickFn`, add one row to `STRATEGIES`.
 
 ## Initial assignment (`--init`)
 
-Restart 0 starts from `--init majority` (default: every variable takes its majority
-polarity) or `--init rarest`, a deterministic constructive start (no RNG, works in both
-`plain` and `groups` mode; later restarts stay random):
+Restart 0 starts from one of three starts (later restarts are always random):
+
+- `--init majority` (default): every variable takes its majority polarity.
+- `--init rarest`: deterministic constructive start (no RNG).
+- `--init likho`: majority, then a neutral/twin repair pass.
+
+All three work in both `plain` and `groups` mode.
+
+### Rarest
 
 1. Repeatedly set the currently **rarest** unassigned variable: the fewest clauses
    holding `x` or `!x`, whichever count is larger, and only clauses that are not yet
@@ -95,19 +101,49 @@ polarity) or `--init rarest`, a deterministic constructive start (no RNG, works 
    clauses (open clauses where it is the last unset variable); else more **open**
    (not yet satisfied) clauses; else the larger total polarity; else `false`.
 
+### Likho
+
+`--init likho` starts from `majority`, then repairs rogue clauses. It only accepts
+moves that break no satisfied clause, and each variable is flipped at most once:
+
+- A **neutral** variable inside a rogue clause is flipped immediately; it breaks
+  nothing and satisfies at least that clause.
+- A **prime** is the sole support of some satisfied clause, so flipping it alone
+  breaks that clause. Two primes are **twins** when flipping both together breaks
+  nothing. The partner is taken from the clause the first prime's flip would break,
+  and the pair is accepted only if every clause containing either variable is still
+  satisfied afterwards.
+- A neutral flip can liberate a prime (the clause it was propping up gets another
+  true literal); the next pass sees it as neutral and can flip it. Twin pairs are
+  tried only when no neutral is left anywhere.
+
+For a fixed seed the repair is deterministic (the majority phase breaks polarity
+ties with the solver RNG).
+
+### Measurements
+
 Measured on random 3-SAT, 10 seeds per row (3 seeds for the 5000-var row), 20
-restarts. "old" is the previous total-occurrence order, kept for comparison:
+restarts, default solver seed. "old" is the previous total-occurrence rarest order,
+kept for comparison; all four starts share the same search code:
 
-| instance | broken after init (majority / old / new) | solved (majority / old / new) | mean flips (majority / old / new) |
+| instance | broken after init (maj / old / new / likho) | solved | mean flips over solved (maj / old / new / likho) |
 |---|---|---|---|
-| 1000 vars, ratio 2.0 | 76 / 15 / 27 | 10/10, 10/10, 10/10 | 85 / 32 / 42 |
-| 1000 vars, ratio 3.5 | 187 / 77 / 98 | 10/10, 10/10, 10/10 | 11.1k / 16.1k / 12.0k |
-| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 | 9/10, 9/10, 9/10 | 123k / 169k / 162k |
-| 5000 vars, ratio 3.9 | 1098 / 482 / 631 | 2/3, 2/3, 2/3 | 3.06M / 0.76M / 1.84M |
-| AIM yes-set, 48 instances | 44 / 18 / 21 | 27 / 31 / 31 | — |
+| 1000 vars, ratio 2.0 | 78 / 15 / 28 / 5 | 10/10 each | 88 / 47 / 67 / 25 |
+| 1000 vars, ratio 3.5 | 187 / 77 / 98 / 52 | 10/10 each | 11.1k / 16.1k / 12.0k / 10.2k |
+| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 / 1036 | 9/10, 9/10, 9/10, 10/10 | 123k / 169k / 162k / 118k |
+| 5000 vars, ratio 3.9 | 1098 / 482 / 631 / 360 | 2/3 each | 3.06M / 0.76M / 1.84M / 3.24M |
+| AIM yes-set, 48 instances | 46 / 18 / 21 / 26 | 27 / 31 / 31 / 27 | — |
 
-The max-of-polarities order leaves 2-3x fewer broken clauses than majority, but
-~30% more than the total-occurrence order. It is faster on 1000-var/3.5 and
+Likho leaves the fewest broken clauses in every row. On random 3-SAT it is fastest
+at 1000/2.0, 1000/3.5 and 20000/3.5, and the only start that solves all ten
+20000-var instances at this budget; it is slower than both rarest orders at
+5000/3.9. On the AIM yes-set it ties majority at 27/48 and fails the same 21
+instances, while rarest reaches 31/48. So the repair improves the starting
+assignment much more reliably than it changes which hard instances the search can
+reach.
+
+The max-of-polarities rarest order leaves 2-3x fewer broken clauses than majority,
+but ~30% more than the total-occurrence order. It is faster on 1000-var/3.5 and
 20000-var/3.5, slower on 5000-var/3.9; on the AIM yes-set both rarest orders solve
 the same 31/48 (identical failure sets) versus 27/48 for majority. It changes which
 near-solutions are reachable more than it changes total coverage.
@@ -119,13 +155,14 @@ every satisfied clause hangs on a single variable. On the 20000-var / ratio 3.5 
 (38%), and 63% of the broken clauses contain no neutral variable at all, i.e. no free flip
 (26% after majority) -- measured with the old ordering. Fewer problems, but most of the
 remaining ones cannot be fixed
-without breaking something. Group mode's merge, which only fires neutrals, is hit the same
-way: its leftover barely changed (e.g. 105.7 -> 95.0 unmerged at ratio 4.2).
-`majority` stays the default.
+without breaking something. Likho attacks exactly that: when no neutral is left it
+uses twin primes instead of giving up. Group mode's merge, which only fires neutrals,
+is hit the same way: its leftover barely changed (e.g. 105.7 -> 95.0 unmerged at ratio
+4.2). `majority` stays the default.
 
 Reproduce with `make bench-rarest ARGS="1000 3.5 10 200000 9"` (or
 `ARGS="file.cnf 100000 20"`); `steps = 0` measures init quality only. The harness
-also reimplements the old total-occurrence order as a baseline, so all three starts
+also reimplements the old total-occurrence order as a baseline, so all four starts
 run the same search code.
 
 ## Group mode (`--mode groups`)
@@ -142,7 +179,7 @@ build/3sat input.cnf --mode groups --max-groups 64 --merge directed --diversify 
 build/3sat input.cnf --mode groups --group-len 10 --max-groups 400   # at most 10 clauses per group
 ```
 
-**Formation.** Start from the majority-polarity assignment `B`.
+**Formation.** Start from the `--init` assignment `B` (majority by default).
 1. `G1` = *all* clauses rogue under `B`. Solve `G1` on its own (a sub-formula that
    sees only its clauses, started from `B`) -> snapshot `X1`. The same variable may
    hold different polarities in different snapshots.

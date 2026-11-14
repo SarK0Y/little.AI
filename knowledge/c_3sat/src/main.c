@@ -98,7 +98,8 @@ static ResultUnit opt_merge(Cli *cli, const char *flag, const char *value) {
 static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
     if (strcmp(value, "majority") == 0) cli->cfg.init = INIT_MAJORITY;
     else if (strcmp(value, "rarest") == 0) cli->cfg.init = INIT_RAREST;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest)", flag, value);
+    else if (strcmp(value, "likho") == 0) cli->cfg.init = INIT_LIKHO;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|likho)", flag, value);
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_group_len(Cli *cli, const char *flag, const char *value) {
@@ -136,7 +137,7 @@ static void usage(void) {
         "                      [--strategy ranked|greedy|random] [--progress N] [--out FILE]\n"
         "                      [--mode plain|groups] [--max-groups 1..1024] [--merge free|directed]\n"
         "                      [--diversify N] [--group-len N]\n"
-        "                      [--init majority|rarest]\n");
+        "                      [--init majority|rarest|likho]\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {

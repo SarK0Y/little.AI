@@ -1,9 +1,9 @@
-/* Benchmark of the constructive `--init rarest` start against the default
- * majority start, on random 3-SAT or a DIMACS file.
+/* Benchmark of the four starts -- majority, old/new rarest, Likho -- on random
+ * 3-SAT or a DIMACS file.
  *
  * The previous total-occurrence rarest order is reimplemented here as a
  * baseline (O(nv * clauses), benchmark-sized inputs only) and injected through
- * SolverConfig.initial, so all three starts run the same search code.
+ * SolverConfig.initial, so all four starts run the same search code.
  *
  * usage:
  *   bench_rarest <n> <ratio> <seeds> <steps> <restarts>
@@ -137,8 +137,13 @@ int main(int argc, char **argv) {
         nc = (size_t)(nv * ratio + 0.5);
     }
 
-    Row rows[3] = {
-        { .name = "majority" }, { .name = "rarest-old" }, { .name = "rarest-new" },
+    SolverConfig cfg = solver_config_default();
+    cfg.max_steps = steps;
+    cfg.restarts = restarts;
+
+    Row rows[4] = {
+        { .name = "majority" }, { .name = "rarest-old" },
+        { .name = "rarest-new" }, { .name = "likho" },
     };
     for (size_t sd = 1; sd <= seeds; sd++) {
         Gen g = { 0 };
@@ -156,8 +161,8 @@ int main(int argc, char **argv) {
         Cnf cnf = rc.val;
         nv = cnf.n_vars; nc = cnf.n_clauses;
 
-        for (int i = 0; i < 3; i++) {
-            ResultSolver rs = solver_new(&cnf, 5);
+        for (int i = 0; i < 4; i++) {
+            ResultSolver rs = solver_new(&cnf, cfg.seed);
             if (!rs.ok) { fprintf(stderr, "solver: %s\n", rs.err.msg); return 1; }
             Solver *s = rs.val;
             if (i == 0) {
@@ -167,7 +172,12 @@ int main(int argc, char **argv) {
                 old_rarest(&cnf, a);
                 solver_set_assignment(s, a);
                 free(a);
-            } else if (!solver_init_rarest(s)) {
+            } else if (i == 2) {
+                if (!solver_init_rarest(s)) {
+                    fprintf(stderr, "init: out of memory\n");
+                    return 1;
+                }
+            } else if (!solver_likho(s)) {
                 fprintf(stderr, "init: out of memory\n");
                 return 1;
             }
@@ -176,9 +186,7 @@ int main(int argc, char **argv) {
             if (steps) {
                 bool *start = malloc(nv * sizeof *start);
                 memcpy(start, solver_assignment(s), nv * sizeof *start);
-                SolverConfig c = solver_config_default();
-                c.max_steps = steps;
-                c.restarts = restarts;
+                SolverConfig c = cfg;
                 c.initial = start;
                 clock_t t0 = clock();
                 ResultSolve r = solver_solve(s, &c);
@@ -207,7 +215,7 @@ int main(int argc, char **argv) {
     else printf("n=%zu ratio=%.1f clauses=%zu seeds=%zu\n", nv, ratio, nc, seeds);
     printf("budget=%zu steps x %zu attempts\n", steps, restarts + 1);
     printf("%-12s %12s %8s %12s %8s\n", "init", "init_unsat", "solved", "mean_steps", "sec");
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         double init = (double)rows[i].init_unsat / (double)seeds;
         double mean = rows[i].solved ? (double)rows[i].sum_steps / (double)rows[i].solved : 0.0;
         printf("%-12s %12.1f %5zu/%-2zu %12.0f %8.1f\n",
