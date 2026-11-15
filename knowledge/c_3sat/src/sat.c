@@ -576,8 +576,11 @@ bool solver_init_rarest(Solver *s) {
 
 /* a is a prime in a rogue clause. Flipping it breaks every clause where it is
  * the sole true literal; take the first such clause and try its other (false)
- * literals as partners. b is a twin iff b is an unflipped prime and flipping
- * both leaves every clause containing a or b satisfied. A flip toggles its
+ * literals as partners. b is a twin iff b is an unflipped prime or neutral and
+ * flipping both leaves every clause containing a or b satisfied. (A neutral b
+ * is flipped for free and gives the sole-support clause a second support, which
+ * liberates a: the move a neutral-only scan never reaches, since b need not sit
+ * in a rogue clause.) A flip toggles its
  * literal in each such clause, so a clause that is rogue after the pair flip
  * was satisfied before it -- exactly the breakage that rules the pair out.
  * shortcut: only the first sole-support clause is searched; a prime with
@@ -596,7 +599,8 @@ static bool likho_twin(Solver *s, size_t a, const unsigned char *flipped, size_t
     for (size_t k = 0; k < n; k++) {
         size_t b = cl[k].var;
         if (b == a || flipped[b]) continue;
-        if (solver_refresh_var(s, b).state != VAR_PRIME) continue;
+        VarState bs = solver_refresh_var(s, b).state;
+        if (bs != VAR_PRIME && bs != VAR_NEUTRAL) continue;
         solver_flip(s, a);
         solver_flip(s, b);
         bool clean = true;

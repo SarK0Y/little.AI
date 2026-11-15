@@ -615,6 +615,198 @@ static void test_likho_properties(void) {
     }
 }
 
+/* ---- general-CNF generator + rarest reference (spec cross-check) ---------- */
+
+/* Clauses of 1..maxlen literals over n variables (some variables may never occur). */
+static Cnf random_general_cnf(int n, int m, int maxlen, uint64_t seed) {
+    size_t cap = (size_t)m * (size_t)(maxlen * 12 + 4) + 64;
+    char *text = malloc(cap);
+    Rng g = rng_new(seed);
+    size_t len = (size_t)snprintf(text, cap, "p cnf %d %d\n", n, m);
+    for (int i = 0; i < m; i++) {
+        int k = 1 + (int)rng_index(&g, (size_t)maxlen);
+        for (int j = 0; j < k; j++) {
+            int x = 1 + (int)rng_index(&g, (size_t)n);
+            len += (size_t)snprintf(text + len, cap - len, "%d ", rng_bool(&g) ? x : -x);
+        }
+        len += (size_t)snprintf(text + len, cap - len, "0\n");
+    }
+    Cnf c = must_parse(text);
+    free(text);
+    return c;
+}
+
+/* Naive spec of --init rarest: every step recomputes, for each unset variable, max(#x, #!x) over the
+ * clauses not yet satisfied, takes the smallest (ties: lowest id), then applies forced > open > total
+ * polarity > false. No heap, no incremental counters. */
+static void rarest_reference(const Cnf *c, bool *out) {
+    size_t nv = c->n_vars, nc = c->n_clauses;
+    bool *set = calloc(nv ? nv : 1, 1), *done = calloc(nc ? nc : 1, 1);
+    for (size_t step = 0; step < nv; step++) {
+        size_t best = SIZE_MAX, best_key = 0;
+        for (size_t v = 0; v < nv; v++) {
+            if (set[v]) continue;
+            size_t p = 0, n = 0;
+            for (size_t ci = 0; ci < nc; ci++) {
+                if (done[ci]) continue;
+                for (size_t k = 0; k < cnf_clause_len(c, ci); k++) {
+                    Lit l = cnf_clause(c, ci)[k];
+                    if (l.var == v) { if (l.positive) p++; else n++; }
+                }
+            }
+            size_t key = p > n ? p : n;
+            if (best == SIZE_MAX || key < best_key) { best = v; best_key = key; }
+        }
+        size_t v = best, fp = 0, fn = 0, op = 0, on = 0, tp = 0, tn = 0;
+        for (size_t ci = 0; ci < nc; ci++) {
+            size_t unset_here = 0;
+            bool has = false, pos = false;
+            for (size_t k = 0; k < cnf_clause_len(c, ci); k++) {
+                Lit l = cnf_clause(c, ci)[k];
+                if (!set[l.var]) unset_here++;
+                if (l.var == v) { has = true; pos = l.positive; }
+            }
+            if (!has) continue;
+            if (pos) tp++; else tn++;
+            if (done[ci]) continue;
+            if (unset_here == 1) { if (pos) fp++; else fn++; }
+            else                 { if (pos) op++; else on++; }
+        }
+        bool val = (fp != fn) ? fp > fn : (op != on) ? op > on : (tp != tn) ? tp > tn : false;
+        out[v] = val; set[v] = true;
+        for (size_t ci = 0; ci < nc; ci++)
+            for (size_t k = 0; k < cnf_clause_len(c, ci); k++) {
+                Lit l = cnf_clause(c, ci)[k];
+                if (l.var == v && l.positive == val) done[ci] = true;
+            }
+    }
+    free(set); free(done);
+}
+
+static void check_rarest_matches_reference(const Cnf *c) {
+    Solver *s = must_solver(c, 1);
+    bool *ref = malloc(c->n_vars ? c->n_vars : 1);
+    CHECK(solver_init_rarest(s));
+    rarest_reference(c, ref);
+    CHECK(c->n_vars == 0 || memcmp(solver_assignment(s), ref, c->n_vars) == 0);
+    CHECK(solver_unsatisfied_count(s) == brute_unsat(c, ref));
+    free(ref);
+    solver_free(s);
+}
+
+static void test_init_rarest_matches_reference(void) {
+    for (int i = 0; i < 150; i++) {                           /* random 3-SAT, easy to hard */
+        int n = 8 + (i % 7) * 9;
+        Cnf c = random_cnf(n, (int)(n * (1.0 + 0.5 * (i % 9))), 9000 + (uint64_t)i);
+        check_rarest_matches_reference(&c);
+        cnf_free(&c);
+    }
+    for (int i = 0; i < 150; i++) {                           /* general CNF: units, long clauses, unused vars */
+        int n = 5 + (i % 6) * 7;
+        Cnf c = random_general_cnf(n * 2, n + (i % 5) * 6, 1 + (i % 6), 4000 + (uint64_t)i);
+        check_rarest_matches_reference(&c);
+        cnf_free(&c);
+    }
+    Cnf e = must_parse("p cnf 0 0\n");
+    check_rarest_matches_reference(&e);
+    cnf_free(&e);
+    Cnf one = must_parse("p cnf 1 1\n-1 0\n");
+    check_rarest_matches_reference(&one);
+    cnf_free(&one);
+}
+
+/* ---- Likho: properties the repair pass promises ---------------------------- */
+
+/* VAR_TWIN is a label of the pass only: it must never be visible afterwards. */
+static void test_likho_twin_label_does_not_leak(void) {
+    Cnf t = must_parse("p cnf 4 10\n1 2 3 0\n-1 -2 3 0\n-1 2 3 0\n-3 -1 2 0\n"
+                       "-2 4 1 0\n-2 4 1 0\n-2 4 1 0\n-3 4 1 0\n-3 4 1 0\n-3 4 1 0\n");   /* the twin case */
+    Solver *s = must_solver(&t, 1);
+    CHECK(solver_likho(s) && solver_unsatisfied_count(s) == 0);
+    const VarStats *st = solver_var_stats(s);
+    for (size_t v = 0; v < t.n_vars; v++) CHECK(st[v].state != VAR_TWIN);
+    solver_free(s); cnf_free(&t);
+    for (int i = 0; i < 40; i++) {
+        Cnf c = random_cnf(100, 330 + 6 * i, 5100 + (uint64_t)i);
+        Solver *l = must_solver(&c, 3);
+        CHECK(solver_likho(l));
+        const VarStats *ls = solver_var_stats(l);
+        for (size_t v = 0; v < c.n_vars; v++) {
+            CHECK(ls[v].state != VAR_TWIN);
+            CHECK((ls[v].state == VAR_PRIME) == (ls[v].break_count >= 1));   /* invariant holds after the pass */
+        }
+        solver_free(l); cnf_free(&c);
+    }
+}
+
+/* If a rogue clause contains a neutral variable after majority, one free flip exists, so Likho
+ * must strictly reduce the rogue count; otherwise it must never increase it. */
+static void test_likho_strictly_improves_when_a_free_move_exists(void) {
+    size_t with_free = 0;
+    for (int i = 0; i < 80; i++) {
+        int n = 60 + 20 * (i % 4);
+        Cnf c = random_cnf(n, (int)(n * (2.0 + 0.4 * (i % 6))), 6100 + (uint64_t)i);
+        Solver *m = must_solver(&c, 9), *l = must_solver(&c, 9);   /* same seed => same majority start */
+        solver_init_majority(m);
+        size_t before = solver_unsatisfied_count(m);
+        bool free_move = false;
+        const size_t *rl = solver_rogue_list(m);
+        for (size_t r = 0; r < before; r++)
+            for (size_t k = 0; k < cnf_clause_len(&c, rl[r]); k++)
+                if (solver_refresh_var(m, cnf_clause(&c, rl[r])[k].var).state == VAR_NEUTRAL) free_move = true;
+        CHECK(solver_likho(l));
+        size_t after = solver_unsatisfied_count(l);
+        if (free_move) { CHECK(after < before); with_free++; }
+        else CHECK(after <= before);
+        solver_free(m); solver_free(l); cnf_free(&c);
+    }
+    CHECK(with_free > 20);   /* the interesting branch really happens */
+}
+
+static void test_likho_general_cnf_and_edge_cases(void) {
+    for (int i = 0; i < 120; i++) {                         /* units, long clauses, unused variables */
+        int n = 6 + (i % 6) * 7;
+        Cnf c = random_general_cnf(n * 2, n + (i % 5) * 6, 1 + (i % 6), 8100 + (uint64_t)i);
+        Solver *base = must_solver(&c, 2), *a = must_solver(&c, 2), *b = must_solver(&c, 2);
+        solver_init_majority(base);
+        CHECK(solver_likho(a) && solver_likho(b));
+        CHECK(c.n_vars == 0 || memcmp(solver_assignment(a), solver_assignment(b), c.n_vars) == 0);
+        CHECK(solver_unsatisfied_count(a) <= solver_unsatisfied_count(base));
+        CHECK(solver_unsatisfied_count(a) == brute_unsat(&c, solver_assignment(a)));
+        solver_free(base); solver_free(a); solver_free(b);
+        cnf_free(&c);
+    }
+    const char *edge[] = { "p cnf 0 0\n", "p cnf 5 0\n", "p cnf 1 1\n1 0\n", "p cnf 3 1\n1 2 0\n" };
+    for (size_t i = 0; i < sizeof edge / sizeof edge[0]; i++) {
+        Cnf c = must_parse(edge[i]);
+        Solver *s = must_solver(&c, 1);
+        CHECK(solver_likho(s));
+        CHECK(solver_unsatisfied_count(s) == brute_unsat(&c, solver_assignment(s)));
+        solver_free(s); cnf_free(&c);
+    }
+}
+
+static void test_likho_in_group_mode(void) {
+    SolverConfig cfg = solver_config_default();
+    cfg.init = INIT_LIKHO;
+    cfg.max_steps = 5000; cfg.restarts = 2;
+    for (int i = 0; i < 40; i++) {
+        int n = 40 + (i % 4) * 25;
+        Cnf c = random_cnf(n, (int)(n * (2.2 + 0.3 * (i % 5))), 7100 + (uint64_t)i);
+        GroupConfig gc = group_config_default();
+        gc.max_groups = 64;
+        ResultGroup a = group_solve(&c, &cfg, &gc), b = group_solve(&c, &cfg, &gc);
+        CHECK(a.ok && b.ok);
+        if (a.ok && b.ok) {
+            check_group_result(&c, &a.val);              /* includes: twins are reported as primes, lists consistent */
+            CHECK(same_group_result(&a.val, &b.val));
+        }
+        if (a.ok) group_result_free(&a.val);
+        if (b.ok) group_result_free(&b.val);
+        cnf_free(&c);
+    }
+}
+
 static size_t progress_calls = 0;
 static void count_progress(void *ctx, size_t steps, size_t unsat) {
     (void)steps; (void)unsat; (*(size_t *)ctx)++;
@@ -700,6 +892,11 @@ int main(void) {
     test_likho_neutral_repair();
     test_likho_twin_repair();
     test_likho_properties();
+    test_init_rarest_matches_reference();
+    test_likho_twin_label_does_not_leak();
+    test_likho_strictly_improves_when_a_free_move_exists();
+    test_likho_general_cnf_and_edge_cases();
+    test_likho_in_group_mode();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
