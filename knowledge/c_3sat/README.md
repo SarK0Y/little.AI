@@ -87,7 +87,7 @@ Restart 0 starts from one of three starts (later restarts are always random):
 
 - `--init majority` (default): every variable takes its majority polarity.
 - `--init rarest`: deterministic constructive start (no RNG).
-- `--init likho`: majority, then a neutral/twin repair pass.
+- `--init likho`: majority, then a neutral/switch-domain repair pass.
 
 All three work in both `plain` and `groups` mode.
 
@@ -109,16 +109,23 @@ moves that break no satisfied clause, and each variable is flipped at most once:
 - A **neutral** variable inside a rogue clause is flipped immediately; it breaks
   nothing and satisfies at least that clause.
 - A **prime** is the sole support of some satisfied clause, so flipping it alone
-  breaks that clause. Two primes are **twins** when flipping both together breaks
-  nothing. The partner is taken from the clause the first prime's flip would break,
-  and the pair is accepted only if every clause containing either variable is still
-  satisfied afterwards.
+  breaks that clause. Its **switch domain** is the set of other unflipped variables
+  that must flip with it so every clause it breaks gains a new true literal. A
+  repair may itself be a prime, so a domain chains: prime -> prime -> ... -> neutral.
+  The domain is accepted only if the joint flip leaves every touched clause
+  satisfied. A twin pair is the special case of a domain with one partner.
+- Domains are recomputed after every firing, and the gold rule (every variable
+  fires once) means two primes whose domains share a variable share that single
+  flip, while a prime whose domain conflicts with an already fired one is simply
+  not fired.
 - A neutral flip can liberate a prime (the clause it was propping up gets another
-  true literal); the next pass sees it as neutral and can flip it. Twin pairs are
+  true literal); the next pass sees it as neutral and can flip it. Domains are
   tried only when no neutral is left anywhere.
 
-For a fixed seed the repair is deterministic (the majority phase breaks polarity
-ties with the solver RNG).
+A domain is capped at 8 variables and its closure search at 64 backtracking nodes,
+so a prime with an unusually large or conflicting domain is skipped rather than
+solved. For a fixed seed the repair is deterministic (the majority phase breaks
+polarity ties with the solver RNG).
 
 ### Measurements
 
@@ -128,19 +135,22 @@ kept for comparison; all four starts share the same search code:
 
 | instance | broken after init (maj / old / new / likho) | solved | mean flips over solved (maj / old / new / likho) |
 |---|---|---|---|
-| 1000 vars, ratio 2.0 | 78 / 15 / 28 / 5 | 10/10 each | 88 / 47 / 67 / 25 |
-| 1000 vars, ratio 3.5 | 187 / 77 / 98 / 52 | 10/10 each | 11.1k / 16.1k / 12.0k / 10.2k |
-| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 / 1036 | 9/10, 9/10, 9/10, 10/10 | 123k / 169k / 162k / 118k |
-| 5000 vars, ratio 3.9 | 1098 / 482 / 631 / 360 | 2/3 each | 3.06M / 0.76M / 1.84M / 3.24M |
-| AIM yes-set, 48 instances | 46 / 18 / 21 / 26 | 27 / 31 / 31 / 27 | — |
+| 1000 vars, ratio 2.0 | 78 / 15 / 28 / 0 | 10/10 each | 88 / 47 / 67 / 0 |
+| 1000 vars, ratio 3.5 | 187 / 77 / 98 / 10 | 10/10 each | 11.1k / 16.1k / 12.0k / 9.8k |
+| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 / 209 | 9/10 each | 123k / 169k / 162k / 129k |
+| 5000 vars, ratio 3.9 | 1098 / 482 / 631 / 126 | 2/3 each | 3.06M / 0.76M / 1.84M / 5.68M |
+| AIM yes-set, 48 instances | 46 / 18 / 21 / 22 | 27 / 31 / 31 / 27 | — |
 
-Likho leaves the fewest broken clauses in every row. On random 3-SAT it is fastest
-at 1000/2.0, 1000/3.5 and 20000/3.5, and the only start that solves all ten
-20000-var instances at this budget; it is slower than both rarest orders at
-5000/3.9. On the AIM yes-set it ties majority at 27/48 and fails the same 21
-instances, while rarest reaches 31/48. So the repair improves the starting
-assignment much more reliably than it changes which hard instances the search can
-reach.
+Switch-domains leave 9-19x fewer broken clauses than majority on the ratio-3.5/3.9
+rows and solve 1000/2.0 outright at init (zero flips). Search speed
+is mixed: fastest at 1000/2.0 and 1000/3.5, about even at 20000/3.5, slower than
+majority at 5000/3.9. Solved counts match majority everywhere (9/10 at 20000/3.5,
+2/3 at 5000/3.9); the four starts miss one instance each, and not always the same
+one. On the
+AIM yes-set it ties majority at 27/48 and fails the same 21 instances, while rarest
+reaches 31/48. So the repair improves the starting assignment far more reliably
+than it changes which hard instances the search can reach, and a deeper start can
+also mean a deeper local minimum.
 
 The max-of-polarities rarest order leaves 2-3x fewer broken clauses than majority,
 but ~30% more than the total-occurrence order. It is faster on 1000-var/3.5 and
@@ -155,8 +165,9 @@ every satisfied clause hangs on a single variable. On the 20000-var / ratio 3.5 
 (38%), and 63% of the broken clauses contain no neutral variable at all, i.e. no free flip
 (26% after majority) -- measured with the old ordering. Fewer problems, but most of the
 remaining ones cannot be fixed
-without breaking something. Likho attacks exactly that: when no neutral is left it
-uses twin primes instead of giving up. Group mode's merge, which only fires neutrals,
+without breaking something. Likho attacks exactly that: a prime's switch domain
+chains through other primes until it reaches a neutral, instead of giving up at the
+first broken clause. Group mode's merge, which only fires neutrals,
 is hit the same way: its leftover barely changed (e.g. 105.7 -> 95.0 unmerged at ratio
 4.2). `majority` stays the default.
 

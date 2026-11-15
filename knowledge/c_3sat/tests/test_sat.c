@@ -256,7 +256,7 @@ static void test_ranking_invariant_neutral_means_zero_breaks(void) {
                     if (cl[k].var == v && lit_value(cl[k], solver_assignment(s)[v]) && solver_clause_support(s, ci) == 1) breaks++;
             }
             CHECK(st[v].break_count == breaks);
-            CHECK((st[v].state == VAR_PRIME || st[v].state == VAR_TWIN) == (breaks >= 1));
+            CHECK((st[v].state == VAR_PRIME) == (breaks >= 1));
             if (st[v].state == VAR_NEUTRAL) CHECK(st[v].break_count == 0);
             CHECK(solver_refresh_var(s, v).state == st[v].state);   /* single-var refresh agrees */
         }
@@ -293,7 +293,7 @@ static void check_group_result(const Cnf *c, const GroupResult *r) {
     for (size_t i = 0; i < r->n_prime; i++) pri[r->prime[i]] = 1;
     for (size_t v = 0; v < nv; v++) {
         CHECK(neu[v] == (st[v].state == VAR_NEUTRAL));
-        CHECK(pri[v] == (st[v].state == VAR_PRIME || st[v].state == VAR_TWIN));
+        CHECK(pri[v] == (st[v].state == VAR_PRIME));
         CHECK(!(neu[v] && pri[v]));
     }
     solver_free(ref);
@@ -547,7 +547,7 @@ static void test_init_rarest_properties(void) {
     }
 }
 
-/* ---- Likho: majority + neutral/twin repair ----------------------------- */
+/* ---- Likho: majority + neutral/switch-domain repair --------------------- */
 
 static void test_likho_neutral_repair(void) {
     /* Majority leaves (1 2 3) rogue with every variable neutral: each true
@@ -587,6 +587,34 @@ static void test_likho_twin_repair(void) {
     CHECK(solver_likho(s));
     CHECK(solver_unsatisfied_count(s) == 0);
     CHECK(verify(&c, solver_assignment(s), c.n_vars));
+    solver_free(s); cnf_free(&c);
+}
+
+static void test_likho_switch_domain_chain(void) {
+    /* Majority leaves the unit clause (-1) rogue. x1 solely supports
+     * (1 -2 -3), and both x2 and x3 are primes, so no pair flip is clean: the
+     * only repair is the chain x1 -> x2 -> x4, where x4 is neutral. */
+    Cnf c = must_parse("p cnf 8 13\n"
+                       "-1 0\n"
+                       "1 -2 -3 0\n"
+                       "2 -4 -5 0\n"
+                       "3 -4 -5 0\n"
+                       "1 6 7 0\n2 6 7 0\n3 6 7 0\n"
+                       "4 6 7 0\n4 7 8 0\n4 6 8 0\n"
+                       "5 6 7 0\n5 7 8 0\n5 6 8 0\n");
+    Solver *s = must_solver(&c, 1);
+    solver_init_majority(s);
+    CHECK(solver_unsatisfied_count(s) == 1);
+    CHECK(solver_refresh_var(s, 0).state == VAR_PRIME);    /* x1 breaks (1 -2 -3) */
+    CHECK(solver_refresh_var(s, 1).state == VAR_PRIME);    /* x2 breaks (2 -4 -5) */
+    CHECK(solver_refresh_var(s, 3).state == VAR_NEUTRAL);  /* x4 is a free repair */
+    CHECK(solver_likho(s));
+    CHECK(solver_unsatisfied_count(s) == 0);
+    CHECK(verify(&c, solver_assignment(s), c.n_vars));
+    /* the accepted domain was {x1, x2, x4}: each fired exactly once */
+    const bool *a = solver_assignment(s);
+    for (size_t v = 0; v < c.n_vars; v++)
+        CHECK(a[v] == (v != 0 && v != 1 && v != 3));
     solver_free(s); cnf_free(&c);
 }
 
@@ -717,24 +745,24 @@ static void test_init_rarest_matches_reference(void) {
 
 /* ---- Likho: properties the repair pass promises ---------------------------- */
 
-/* VAR_TWIN is a label of the pass only: it must never be visible afterwards. */
-static void test_likho_twin_label_does_not_leak(void) {
+/* After the pass, states are re-derived from the final assignment: the ranking
+ * invariant must hold and no stale label may survive. */
+static void test_likho_refreshed_states(void) {
     Cnf t = must_parse("p cnf 4 10\n1 2 3 0\n-1 -2 3 0\n-1 2 3 0\n-3 -1 2 0\n"
-                       "-2 4 1 0\n-2 4 1 0\n-2 4 1 0\n-3 4 1 0\n-3 4 1 0\n-3 4 1 0\n");   /* the twin case */
+                       "-2 4 1 0\n-2 4 1 0\n-2 4 1 0\n-3 4 1 0\n-3 4 1 0\n-3 4 1 0\n");
     Solver *s = must_solver(&t, 1);
     CHECK(solver_likho(s) && solver_unsatisfied_count(s) == 0);
     const VarStats *st = solver_var_stats(s);
-    for (size_t v = 0; v < t.n_vars; v++) CHECK(st[v].state != VAR_TWIN);
+    for (size_t v = 0; v < t.n_vars; v++)
+        CHECK((st[v].state == VAR_PRIME) == (st[v].break_count >= 1));
     solver_free(s); cnf_free(&t);
     for (int i = 0; i < 40; i++) {
         Cnf c = random_cnf(100, 330 + 6 * i, 5100 + (uint64_t)i);
         Solver *l = must_solver(&c, 3);
         CHECK(solver_likho(l));
         const VarStats *ls = solver_var_stats(l);
-        for (size_t v = 0; v < c.n_vars; v++) {
-            CHECK(ls[v].state != VAR_TWIN);
+        for (size_t v = 0; v < c.n_vars; v++)
             CHECK((ls[v].state == VAR_PRIME) == (ls[v].break_count >= 1));   /* invariant holds after the pass */
-        }
         solver_free(l); cnf_free(&c);
     }
 }
@@ -798,7 +826,7 @@ static void test_likho_in_group_mode(void) {
         ResultGroup a = group_solve(&c, &cfg, &gc), b = group_solve(&c, &cfg, &gc);
         CHECK(a.ok && b.ok);
         if (a.ok && b.ok) {
-            check_group_result(&c, &a.val);              /* includes: twins are reported as primes, lists consistent */
+            check_group_result(&c, &a.val);              /* prime/neutral lists and counters are consistent */
             CHECK(same_group_result(&a.val, &b.val));
         }
         if (a.ok) group_result_free(&a.val);
@@ -891,9 +919,10 @@ int main(void) {
     test_init_rarest_properties();
     test_likho_neutral_repair();
     test_likho_twin_repair();
+    test_likho_switch_domain_chain();
     test_likho_properties();
     test_init_rarest_matches_reference();
-    test_likho_twin_label_does_not_leak();
+    test_likho_refreshed_states();
     test_likho_strictly_improves_when_a_free_move_exists();
     test_likho_general_cnf_and_edge_cases();
     test_likho_in_group_mode();

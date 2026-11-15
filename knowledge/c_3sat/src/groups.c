@@ -361,13 +361,13 @@ ResultGroup group_solve(const Cnf *cnf, const SolverConfig *cfg, const GroupConf
     {
         const VarStats *st = solver_var_stats(full);
         size_t nn = 0, np = 0;
-        for (size_t v = 0; v < nv; v++) { nn += st[v].state == VAR_NEUTRAL; np += st[v].state == VAR_PRIME || st[v].state == VAR_TWIN; }
+        for (size_t v = 0; v < nv; v++) { nn += st[v].state == VAR_NEUTRAL; np += st[v].state == VAR_PRIME; }
         out.neutral = malloc((nn ? nn : 1) * sizeof *out.neutral);
         out.prime = malloc((np ? np : 1) * sizeof *out.prime);
         if (!out.neutral || !out.prime) NOMEM();
         for (size_t v = 0; v < nv; v++) {
             if (st[v].state == VAR_NEUTRAL) out.neutral[out.n_neutral++] = v;
-            else if (st[v].state == VAR_PRIME || st[v].state == VAR_TWIN) out.prime[out.n_prime++] = v;
+            else if (st[v].state == VAR_PRIME) out.prime[out.n_prime++] = v;
         }
     }
     if (out.n_rogue == 0) {

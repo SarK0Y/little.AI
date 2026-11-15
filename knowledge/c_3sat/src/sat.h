@@ -56,11 +56,8 @@ static inline size_t rng_index(Rng *r, size_t upper) { return (size_t)rng_next_u
 
 /* ---- states ----------------------------------------------------------- */
 
-/* Rogue is deliberately NOT a variable state: only clauses can be rogue.
- * VAR_TWIN is a prime that the Likho pass paired with another prime: flipping
- * both together breaks no satisfied clause. It is assigned only during that
- * pass and re-derived as PRIME/NEUTRAL on the next refresh. */
-typedef enum { VAR_UNUSED, VAR_PRIME, VAR_NEUTRAL, VAR_TWIN } VarState;
+/* Rogue is deliberately NOT a variable state: only clauses can be rogue. */
+typedef enum { VAR_UNUSED, VAR_PRIME, VAR_NEUTRAL } VarState;
 
 typedef struct {
     VarState state;
@@ -166,9 +163,9 @@ void solver_flip(Solver *s, size_t var);
 bool solver_init_rarest(Solver *s);
 void solver_init_majority(Solver *s);                  /* majority-polarity start (ties use the solver RNG) */
 /* Likho: majority start, then a repair pass that flips an unflipped neutral
- * variable in a rogue clause (always safe), or a twin pair of primes whose
- * joint flip breaks no satisfied clause. Each variable is flipped at most once.
- * false only on allocation failure. */
+ * variable in a rogue clause (always safe), or a switch domain: a prime plus
+ * the neutrals/primes that must flip with it so no satisfied clause breaks.
+ * Each variable is flipped at most once. false only on allocation failure. */
 bool solver_likho(Solver *s);
 const size_t *solver_rogue_list(const Solver *s);      /* solver_unsatisfied_count() clause ids */
 VarStats solver_refresh_var(Solver *s, size_t var);    /* fresh stats of one variable, O(occurrences) */

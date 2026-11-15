@@ -378,8 +378,8 @@ ResultSolver solver_new(const Cnf *cnf, uint64_t seed) {
  * assignment in a single pass over its occurrences.
  *
  * Ranking invariant (relied on by the group merge):
- *   VAR_PRIME or VAR_TWIN <=> break_count >= 1  (sole support of a solved clause)
- *   VAR_NEUTRAL           <=> break_count == 0  (flipping can never un-solve a clause)
+ *   VAR_PRIME   <=> break_count >= 1   (sole support of at least one solved clause)
+ *   VAR_NEUTRAL <=> break_count == 0   (flipping can never un-solve a clause)
  * Neutrality is a property of the *current* assignment, not of the variable. */
 static void refresh_var(Solver *s, size_t v) {
     size_t satisfied = 0, rogue_occ = 0, breaks = 0, min_support = SIZE_MAX;
@@ -444,8 +444,7 @@ static size_t rank_candidates(Solver *s, size_t clause) {
         Candidate cd = { v, 0, 0, st->break_count, st->make_count };
         switch (st->state) {
             case VAR_NEUTRAL: cd.cls = 0; cd.support = st->min_support; break;
-            case VAR_PRIME:
-            case VAR_TWIN:    cd.cls = 1; cd.support = 1; break;   /* a twin is still a prime on its own */
+            case VAR_PRIME:   cd.cls = 1; cd.support = 1; break;
             case VAR_UNUSED:  cd.cls = 2; cd.support = SIZE_MAX; break;
         }
         size_t j = k;  /* insertion sort: clauses are tiny */
@@ -572,60 +571,103 @@ bool solver_init_rarest(Solver *s) {
     return true;
 }
 
-/* ---- Likho: majority start + one-flip-per-variable repair pass ---------- */
+/* ---- Likho: majority start + switch-domain repair pass ------------------ */
 
-/* a is a prime in a rogue clause. Flipping it breaks every clause where it is
- * the sole true literal; take the first such clause and try its other (false)
- * literals as partners. b is a twin iff b is an unflipped prime or neutral and
- * flipping both leaves every clause containing a or b satisfied. (A neutral b
- * is flipped for free and gives the sole-support clause a second support, which
- * liberates a: the move a neutral-only scan never reaches, since b need not sit
- * in a rogue clause.) A flip toggles its
- * literal in each such clause, so a clause that is rogue after the pair flip
- * was satisfied before it -- exactly the breakage that rules the pair out.
- * shortcut: only the first sole-support clause is searched; a prime with
- * several sole supports rarely has one partner that fixes them all. */
-static bool likho_twin(Solver *s, size_t a, const unsigned char *flipped, size_t *partner) {
-    if (flipped[a] || solver_refresh_var(s, a).state != VAR_PRIME) return false;
-    bool aval = s->assignment[a];
-    size_t sole = SIZE_MAX;
-    for (size_t i = s->occ_off[a]; i < s->occ_off[a + 1]; i++) {
+/* A switch domain of a prime is the set of unflipped variables that must flip
+ * with it so that no currently satisfied clause becomes rogue. A neutral is
+ * its own domain; a prime needs a repair for every clause it solely supports,
+ * and a repair may itself be a prime, so domains can chain. Domains are
+ * recomputed after each firing and `flipped` enforces the gold rule (every
+ * variable fires once): two primes whose domains share a variable share that
+ * single flip, and a prime whose domain conflicts with an already fired one is
+ * simply not fired. */
+#define LIKHO_DOMAIN_MAX 8      /* variables in one domain, prime included */
+#define LIKHO_SEARCH_NODES 64   /* backtracking budget per prime */
+/* shortcut: a prime whose domain needs more than either bound is skipped, not
+ * solved; raise the bounds when larger chains start to matter. */
+
+typedef struct {
+    Solver *s;
+    const unsigned char *flipped;
+    unsigned char *in;   /* membership of the domain under construction */
+    size_t *dom;         /* dom[0] is the prime the domain is for */
+    size_t n, nodes;
+} LikhoSearch;
+
+/* Support of `clause` after flipping every variable of the domain once.
+ * Clauses with no domain variable keep their count and are never examined. */
+static uint32_t likho_sat_after(const LikhoSearch *d, size_t clause) {
+    const Lit *c = cnf_clause(d->s->cnf, clause);
+    size_t n = cnf_clause_len(d->s->cnf, clause);
+    uint32_t cnt = 0;
+    for (size_t k = 0; k < n; k++)
+        cnt += lit_value(c[k], d->s->assignment[c[k].var]) != d->in[c[k].var];
+    return cnt;
+}
+
+/* true when flipping v alone cannot un-satisfy a clause; those "free" repairs
+ * are tried first because they add no new breakage to the domain. */
+static bool likho_breaks_nothing(const Solver *s, size_t v) {
+    bool val = s->assignment[v];
+    for (size_t i = s->occ_off[v]; i < s->occ_off[v + 1]; i++) {
         Occ o = s->occ[i];
-        if (o.positive == aval && s->sat[o.clause] == 1) { sole = o.clause; break; }
+        if (o.positive == val && s->sat[o.clause] == 1) return false;
     }
-    if (sole == SIZE_MAX) return false;
-    const Lit *cl = cnf_clause(s->cnf, sole);
-    size_t n = cnf_clause_len(s->cnf, sole);
-    for (size_t k = 0; k < n; k++) {
-        size_t b = cl[k].var;
-        if (b == a || flipped[b]) continue;
-        VarState bs = solver_refresh_var(s, b).state;
-        if (bs != VAR_PRIME && bs != VAR_NEUTRAL) continue;
-        solver_flip(s, a);
-        solver_flip(s, b);
-        bool clean = true;
-        for (size_t i = s->occ_off[a]; i < s->occ_off[a + 1] && clean; i++)
-            if (s->sat[s->occ[i].clause] == 0) clean = false;
-        for (size_t i = s->occ_off[b]; i < s->occ_off[b + 1] && clean; i++)
-            if (s->sat[s->occ[i].clause] == 0) clean = false;
-        if (clean) {
-            s->stats[a].state = VAR_TWIN;   /* phase-2 label; the next refresh re-derives it */
-            s->stats[b].state = VAR_TWIN;
-            *partner = b;
-            return true;
+    return true;
+}
+
+/* Close the domain: every clause it broke needs a repair from one of its own
+ * false literals, recursively. A clause with no free false literal backtracks. */
+static bool likho_close(LikhoSearch *d) {
+    if (++d->nodes > LIKHO_SEARCH_NODES) return false;
+    Solver *s = d->s;
+    for (size_t i = 0; i < d->n; i++) {
+        size_t v = d->dom[i];
+        for (size_t j = s->occ_off[v]; j < s->occ_off[v + 1]; j++) {
+            size_t c = s->occ[j].clause;
+            if (likho_sat_after(d, c) != 0) continue;
+            if (d->n >= LIKHO_DOMAIN_MAX) return false;
+            const Lit *cl = cnf_clause(s->cnf, c);
+            size_t len = cnf_clause_len(s->cnf, c);
+            for (int pass = 0; pass < 2; pass++)
+                for (size_t k = 0; k < len; k++) {
+                    size_t u = cl[k].var;
+                    if (d->in[u] || d->flipped[u]) continue;
+                    if (lit_value(cl[k], s->assignment[u])) continue;   /* must be false to help */
+                    if ((pass == 0) != likho_breaks_nothing(s, u)) continue;
+                    d->in[u] = 1; d->dom[d->n++] = u;
+                    if (likho_close(d)) return true;
+                    d->n--; d->in[u] = 0;
+                }
+            return false;   /* this clause cannot be repaired: backtrack */
         }
-        solver_flip(s, b);
-        solver_flip(s, a);
     }
-    return false;
+    return true;   /* nothing broke */
+}
+
+/* Switch domain of v, or 0 when none fits the size/node bounds. On success the
+ * membership flags are cleared again; the caller applies dom[0..n). */
+static size_t likho_domain(Solver *s, size_t v, const unsigned char *flipped,
+                           unsigned char *in, size_t *dom) {
+    LikhoSearch d = { s, flipped, in, dom, 1, 0 };
+    dom[0] = v;
+    in[v] = 1;
+    bool ok = likho_close(&d);
+    for (size_t i = 0; i < d.n; i++) in[dom[i]] = 0;  /* failed search leaves n == 1 */
+    return ok ? d.n : 0;
 }
 
 bool solver_likho(Solver *s) {
     solver_init_majority(s);
     size_t nv = s->cnf->n_vars, nc = s->cnf->n_clauses;
     unsigned char *flipped = calloc(nv ? nv : 1, 1);
+    unsigned char *in = calloc(nv ? nv : 1, 1);
     size_t *snap = malloc((nc ? nc : 1) * sizeof *snap);
-    if (!flipped || !snap) { free(flipped); free(snap); return false; }
+    size_t *dom = malloc(LIKHO_DOMAIN_MAX * sizeof *dom);
+    if (!flipped || !in || !snap || !dom) {
+        free(flipped); free(in); free(snap); free(dom);
+        return false;
+    }
     while (s->n_rogue > 0) {
         size_t nr = s->n_rogue;
         memcpy(snap, s->rogue, nr * sizeof *snap);
@@ -649,26 +691,27 @@ bool solver_likho(Solver *s) {
             }
         }
         if (moved) continue;   /* prefer neutrals, including freshly liberated primes */
-        /* Twins: only reached when no rogue clause has a neutral left. A clean
-         * pair flip also adds no new rogue clause, so this pass can keep going. */
+        /* Switch domains: only reached when no rogue clause has a neutral
+         * left. A closed domain adds no rogue clause, so this pass can keep
+         * going and the next round re-derives the states it changed. */
         for (size_t i = 0; i < nr; i++) {
             size_t c = snap[i];
             if (!solver_clause_is_rogue(s, c)) continue;
             const Lit *cl = cnf_clause(s->cnf, c);
             size_t len = cnf_clause_len(s->cnf, c);
             for (size_t k = 0; k < len; k++) {
-                size_t v = cl[k].var, partner;
+                size_t v = cl[k].var;
                 if (flipped[v]) continue;
-                if (!likho_twin(s, v, flipped, &partner)) continue;
-                flipped[v] = 1;
-                flipped[partner] = 1;
+                size_t n = likho_domain(s, v, flipped, in, dom);
+                if (n == 0) continue;
+                for (size_t j = 0; j < n; j++) { solver_flip(s, dom[j]); flipped[dom[j]] = 1; }
                 moved = true;
                 break;
             }
         }
-        if (!moved) break;   /* stuck: no neutral and no twin anywhere */
+        if (!moved) break;   /* stuck: no neutral and no switch domain anywhere */
     }
-    free(flipped); free(snap);
+    free(flipped); free(in); free(snap); free(dom);
     return true;
 }
 
