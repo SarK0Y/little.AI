@@ -24,6 +24,8 @@ make -C knowledge/c_3sat bench N=20000 RATIO=3.5 SEED=1
 knowledge/c_3sat/build/3sat input.cnf
 knowledge/c_3sat/build/3sat input.cnf --steps 250000 --restarts 40 --noise 0.20 --seed 42
 knowledge/c_3sat/build/3sat input.cnf --strategy greedy --progress 100000 --out out.json
+knowledge/c_3sat/build/3sat input.cnf -deep-dive 32 128
+knowledge/c_3sat/build/3sat input.cnf -pre-cook majority
 ```
 
 Default output: `./knowledge/c_3sat/results/latest.json` (relative to cwd), same
@@ -87,9 +89,15 @@ Restart 0 starts from one of three starts (later restarts are always random):
 
 - `--init majority` (default): every variable takes its majority polarity.
 - `--init rarest`: deterministic constructive start (no RNG).
-- `--init likho`: majority, then a neutral/switch-domain repair pass.
+- `--init likho`: all false, then a neutral/switch-domain repair pass.
+- `-deep-dive VARS NODES`: implies `--init likho`, caps switch domains at VARS
+  variables, gives each prime at most NODES search nodes, and fires domains
+  before neutral repairs.
+- `-pre-cook zero|majority|rarest`: implies `--init likho`; phase 1 is that
+  assignment instead of the default all-false one (a partially solved input).
 
-All three work in both `plain` and `groups` mode.
+The three starts work in both `plain` and `groups` mode; `-deep-dive` is a variant
+of `likho`.
 
 ### Rarest
 
@@ -103,8 +111,9 @@ All three work in both `plain` and `groups` mode.
 
 ### Likho
 
-`--init likho` starts from `majority`, then repairs rogue clauses. It only accepts
-moves that break no satisfied clause, and each variable is flipped at most once:
+`--init likho` starts from `-pre-cook` (`zero`, the default: every variable
+`false`), then repairs rogue clauses. It only accepts moves that break no
+satisfied clause, and each variable is flipped at most once:
 
 - A **neutral** variable inside a rogue clause is flipped immediately; it breaks
   nothing and satisfies at least that clause.
@@ -119,38 +128,44 @@ moves that break no satisfied clause, and each variable is flipped at most once:
   flip, while a prime whose domain conflicts with an already fired one is simply
   not fired.
 - A neutral flip can liberate a prime (the clause it was propping up gets another
-  true literal); the next pass sees it as neutral and can flip it. Domains are
-  tried only when no neutral is left anywhere.
+  true literal); the next pass sees it as neutral and can flip it. By default
+  domains are tried only when no neutral is left anywhere; `-deep-dive` reverses
+  that order and tries a closed domain first.
 
 A domain is capped at 8 variables and its closure search at 64 backtracking nodes,
 so a prime with an unusually large or conflicting domain is skipped rather than
-solved. For a fixed seed the repair is deterministic (the majority phase breaks
-polarity ties with the solver RNG).
+solved. `-deep-dive VARS NODES` raises or lowers both bounds. With the default
+zero start the repair is deterministic for a given formula; `-pre-cook majority`
+inherits the majority phase's RNG tie-breaking.
 
 ### Measurements
 
 Measured on random 3-SAT, 10 seeds per row (3 seeds for the 5000-var row), 20
 restarts, default solver seed. "old" is the previous total-occurrence rarest order,
-kept for comparison; all four starts share the same search code:
+kept for comparison; "likho-dd" is `-deep-dive 32 128`, "likho-pc" is
+`-pre-cook majority`. All six starts share the same search code:
 
-| instance | broken after init (maj / old / new / likho) | solved | mean flips over solved (maj / old / new / likho) |
+| instance | broken after init (maj / old / new / likho / dd / pc) | solved | mean flips over solved (maj / old / new / likho / dd / pc) |
 |---|---|---|---|
-| 1000 vars, ratio 2.0 | 78 / 15 / 28 / 0 | 10/10 each | 88 / 47 / 67 / 0 |
-| 1000 vars, ratio 3.5 | 187 / 77 / 98 / 10 | 10/10 each | 11.1k / 16.1k / 12.0k / 9.8k |
-| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 / 209 | 9/10 each | 123k / 169k / 162k / 129k |
-| 5000 vars, ratio 3.9 | 1098 / 482 / 631 / 126 | 2/3 each | 3.06M / 0.76M / 1.84M / 5.68M |
-| AIM yes-set, 48 instances | 46 / 18 / 21 / 22 | 27 / 31 / 31 / 27 | — |
+| 1000 vars, ratio 2.0 | 78 / 15 / 28 / 0 / 0.2 / 0 | 10/10 each | 88 / 47 / 67 / 0 / 1 / 0 |
+| 1000 vars, ratio 3.5 | 187 / 77 / 98 / 34 / 32 / 10 | 10/10 each | 11.1k / 16.1k / 12.0k / 18.1k / 17.6k / 9.8k |
+| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 / 742 / 637 / 209 | 9/10, 9/10, 9/10, 0/10, 0/10, 9/10 | 123k / 169k / 162k / — / — / 129k |
+| 5000 vars, ratio 3.9 | 1098 / 482 / 631 / 385 / 337 / 126 | 2/3 each | 3.06M / 0.76M / 1.84M / 4.40M / 4.40M / 5.68M |
+| AIM yes-set, 48 instances | 46 / 18 / 21 / 23 / 22 / 22 | 27 / 31 / 31 / 31 / 31 / 27 | — |
 
-Switch-domains leave 9-19x fewer broken clauses than majority on the ratio-3.5/3.9
-rows and solve 1000/2.0 outright at init (zero flips). Search speed
-is mixed: fastest at 1000/2.0 and 1000/3.5, about even at 20000/3.5, slower than
-majority at 5000/3.9. Solved counts match majority everywhere (9/10 at 20000/3.5,
-2/3 at 5000/3.9); the four starts miss one instance each, and not always the same
-one. On the
-AIM yes-set it ties majority at 27/48 and fails the same 21 instances, while rarest
-reaches 31/48. So the repair improves the starting assignment far more reliably
-than it changes which hard instances the search can reach, and a deeper start can
-also mean a deeper local minimum.
+The zero start still leaves 3-5x fewer broken clauses than majority, and it solves
+1000/2.0 outright at init (zero flips), but it is a much deeper local minimum. At
+20000/3.5 it solves **0/10** at this budget, where majority and both rarest orders
+solve 9/10; fewer broken clauses does not mean an easier search. `-pre-cook
+majority` restores the previous majority-start repair exactly (209 broken, 9/10,
+129k flips), so pre-cooking is the escape from the zero-start basin. On the AIM
+yes-set the zero start matches both rarest orders at 31/48 (majority and the
+majority pre-cook stay at 27/48), so the constructive start pays off there.
+`-deep-dive 32 128` trims the zero-start init count (637 at 20000, 337 at 5000) but
+changes no solved count. From a majority pre-cook, domains-first makes 20000/3.5
+much worse (1/10 at 32 128, 0/3 at the default bounds), so deep-dive is not the
+escape route; pre-cook without it is. `majority` stays the default start for the
+plain search.
 
 The max-of-polarities rarest order leaves 2-3x fewer broken clauses than majority,
 but ~30% more than the total-occurrence order. It is faster on 1000-var/3.5 and
@@ -169,12 +184,29 @@ without breaking something. Likho attacks exactly that: a prime's switch domain
 chains through other primes until it reaches a neutral, instead of giving up at the
 first broken clause. Group mode's merge, which only fires neutrals,
 is hit the same way: its leftover barely changed (e.g. 105.7 -> 95.0 unmerged at ratio
-4.2). `majority` stays the default.
+4.2).
+
+### Coverage: instances no start can solve
+
+The per-start counts above hide whether a failure is shared. Taking the union over
+all six starts:
+
+- **Random 3-SAT: 0 unsolved by all.** Every generated instance in the table was
+  solved by at least one start, even where individual starts missed it (e.g. the
+  zero-start Likho at 20000/3.5).
+- **AIM yes-set: 17 of 48 unsolved by all** (31 covered). Every one is satisfiable,
+  so these are budget failures at 100000 steps x 20 restarts, not UNSAT. By size:
+  50-var `50-1_6-yes1-{1,2}` (2), 100-var `100-1_6-yes1-{1..4}` and
+  `100-2_0-yes1-{1,2,4}` (7), 200-var `200-1_6-yes1-{1..4}` and
+  `200-2_0-yes1-{1..4}` (8).
+- The AIM union is exactly rarest's 31: zero-start Likho reaches the same count but
+  not the same set, so the extra starts add no new instance beyond rarest.
 
 Reproduce with `make bench-rarest ARGS="1000 3.5 10 200000 9"` (or
 `ARGS="file.cnf 100000 20"`); `steps = 0` measures init quality only. The harness
-also reimplements the old total-occurrence order as a baseline, so all four starts
-run the same search code.
+also reimplements the old total-occurrence order as a baseline, so all six starts
+run the same search code; its deep-dive row uses `-deep-dive 32 128` and its
+pre-cook row uses `-pre-cook majority`.
 
 ## Group mode (`--mode groups`)
 

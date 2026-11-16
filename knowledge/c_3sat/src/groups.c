@@ -201,7 +201,7 @@ ResultGroup group_solve(const Cnf *cnf, const SolverConfig *cfg, const GroupConf
 
     /* ---- formation: each new group = ALL clauses rogue after applying the previous ones ---- */
     if (cfg->init == INIT_RAREST) { if (!solver_init_rarest(full)) NOMEM(); }
-    else if (cfg->init == INIT_LIKHO) { if (!solver_likho(full)) NOMEM(); }
+    else if (cfg->init == INIT_LIKHO) { if (!solver_likho(full, cfg)) NOMEM(); }
     else solver_init_majority(full);
     bool converged = false;
     size_t repeats = 0;

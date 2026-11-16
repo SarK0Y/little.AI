@@ -3,6 +3,10 @@
 #include <errno.h>
 #include <stdlib.h>
 
+/* Likho switch-domain defaults; the CLI -deep-dive flag overrides both. */
+#define LIKHO_DOMAIN_MAX 8      /* variables in one domain, prime included */
+#define LIKHO_SEARCH_NODES 64   /* backtracking budget per prime */
+
 /* ======================================================================== */
 /* small helpers                                                            */
 /* ======================================================================== */
@@ -268,6 +272,8 @@ SolverConfig solver_config_default(void) {
     return (SolverConfig){
         .max_steps = 100000, .restarts = 20, .noise = 0.22,
         .seed = 0x9e3779b97f4a7c15ULL, .pick = pick_ranked,
+        .likho_domain_max = LIKHO_DOMAIN_MAX, .likho_search_nodes = LIKHO_SEARCH_NODES,
+        .likho_domains_first = false, .likho_pre_cook = INIT_ZERO,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -571,7 +577,7 @@ bool solver_init_rarest(Solver *s) {
     return true;
 }
 
-/* ---- Likho: majority start + switch-domain repair pass ------------------ */
+/* ---- Likho: zero start + switch-domain repair pass --------------------- */
 
 /* A switch domain of a prime is the set of unflipped variables that must flip
  * with it so that no currently satisfied clause becomes rogue. A neutral is
@@ -581,17 +587,15 @@ bool solver_init_rarest(Solver *s) {
  * variable fires once): two primes whose domains share a variable share that
  * single flip, and a prime whose domain conflicts with an already fired one is
  * simply not fired. */
-#define LIKHO_DOMAIN_MAX 8      /* variables in one domain, prime included */
-#define LIKHO_SEARCH_NODES 64   /* backtracking budget per prime */
 /* shortcut: a prime whose domain needs more than either bound is skipped, not
- * solved; raise the bounds when larger chains start to matter. */
+ * solved; -deep-dive raises the bounds. */
 
 typedef struct {
     Solver *s;
     const unsigned char *flipped;
     unsigned char *in;   /* membership of the domain under construction */
     size_t *dom;         /* dom[0] is the prime the domain is for */
-    size_t n, nodes;
+    size_t n, nodes, max_vars, max_nodes;
 } LikhoSearch;
 
 /* Support of `clause` after flipping every variable of the domain once.
@@ -619,14 +623,14 @@ static bool likho_breaks_nothing(const Solver *s, size_t v) {
 /* Close the domain: every clause it broke needs a repair from one of its own
  * false literals, recursively. A clause with no free false literal backtracks. */
 static bool likho_close(LikhoSearch *d) {
-    if (++d->nodes > LIKHO_SEARCH_NODES) return false;
+    if (++d->nodes > d->max_nodes) return false;
     Solver *s = d->s;
     for (size_t i = 0; i < d->n; i++) {
         size_t v = d->dom[i];
         for (size_t j = s->occ_off[v]; j < s->occ_off[v + 1]; j++) {
             size_t c = s->occ[j].clause;
             if (likho_sat_after(d, c) != 0) continue;
-            if (d->n >= LIKHO_DOMAIN_MAX) return false;
+            if (d->n >= d->max_vars) return false;
             const Lit *cl = cnf_clause(s->cnf, c);
             size_t len = cnf_clause_len(s->cnf, c);
             for (int pass = 0; pass < 2; pass++)
@@ -648,8 +652,9 @@ static bool likho_close(LikhoSearch *d) {
 /* Switch domain of v, or 0 when none fits the size/node bounds. On success the
  * membership flags are cleared again; the caller applies dom[0..n). */
 static size_t likho_domain(Solver *s, size_t v, const unsigned char *flipped,
-                           unsigned char *in, size_t *dom) {
-    LikhoSearch d = { s, flipped, in, dom, 1, 0 };
+                           unsigned char *in, size_t *dom,
+                           size_t max_vars, size_t max_nodes) {
+    LikhoSearch d = { s, flipped, in, dom, 1, 0, max_vars, max_nodes };
     dom[0] = v;
     in[v] = 1;
     bool ok = likho_close(&d);
@@ -657,13 +662,72 @@ static size_t likho_domain(Solver *s, size_t v, const unsigned char *flipped,
     return ok ? d.n : 0;
 }
 
-bool solver_likho(Solver *s) {
-    solver_init_majority(s);
+/* One neutral flip per rogue clause: it breaks nothing, so it only removes
+ * clauses from the rogue set. Returns true if anything fired. */
+static bool likho_neutral_pass(Solver *s, const size_t *snap, size_t nr,
+                               unsigned char *flipped) {
+    bool moved = false;
+    for (size_t i = 0; i < nr; i++) {
+        size_t c = snap[i];
+        if (!solver_clause_is_rogue(s, c)) continue;
+        const Lit *cl = cnf_clause(s->cnf, c);
+        size_t len = cnf_clause_len(s->cnf, c);
+        for (size_t k = 0; k < len; k++) {
+            size_t v = cl[k].var;
+            if (flipped[v]) continue;
+            if (solver_refresh_var(s, v).state != VAR_NEUTRAL) continue;
+            solver_flip(s, v);
+            flipped[v] = 1;
+            moved = true;
+            break;
+        }
+    }
+    return moved;
+}
+
+/* One closed switch domain per rogue clause. A closed domain adds no rogue
+ * clause, so this pass can keep going and the next round re-derives the states
+ * it changed. Returns true if anything fired. */
+static bool likho_domain_pass(Solver *s, const size_t *snap, size_t nr,
+                              unsigned char *flipped, unsigned char *in, size_t *dom,
+                              size_t max_vars, size_t max_nodes) {
+    bool moved = false;
+    for (size_t i = 0; i < nr; i++) {
+        size_t c = snap[i];
+        if (!solver_clause_is_rogue(s, c)) continue;
+        const Lit *cl = cnf_clause(s->cnf, c);
+        size_t len = cnf_clause_len(s->cnf, c);
+        for (size_t k = 0; k < len; k++) {
+            size_t v = cl[k].var;
+            if (flipped[v]) continue;
+            size_t n = likho_domain(s, v, flipped, in, dom, max_vars, max_nodes);
+            if (n == 0) continue;
+            for (size_t j = 0; j < n; j++) { solver_flip(s, dom[j]); flipped[dom[j]] = 1; }
+            moved = true;
+            break;
+        }
+    }
+    return moved;
+}
+
+bool solver_likho(Solver *s, const SolverConfig *cfg) {
     size_t nv = s->cnf->n_vars, nc = s->cnf->n_clauses;
+    size_t max_vars = cfg && cfg->likho_domain_max ? cfg->likho_domain_max : LIKHO_DOMAIN_MAX;
+    size_t max_nodes = cfg && cfg->likho_search_nodes ? cfg->likho_search_nodes : LIKHO_SEARCH_NODES;
+    bool domains_first = cfg && cfg->likho_domains_first;
+    InitMode pre = cfg ? cfg->likho_pre_cook : INIT_ZERO;
+    if (max_vars > nv) max_vars = nv;   /* a domain cannot be larger than the formula */
+    if (max_vars == 0) max_vars = 1;    /* domain of one: the prime alone, no repair */
+    if (pre == INIT_MAJORITY) solver_init_majority(s);
+    else if (pre == INIT_RAREST) { if (!solver_init_rarest(s)) return false; }
+    else {
+        memset(s->assignment, 0, nv * sizeof *s->assignment);
+        rebuild_counts(s);
+    }
     unsigned char *flipped = calloc(nv ? nv : 1, 1);
     unsigned char *in = calloc(nv ? nv : 1, 1);
     size_t *snap = malloc((nc ? nc : 1) * sizeof *snap);
-    size_t *dom = malloc(LIKHO_DOMAIN_MAX * sizeof *dom);
+    size_t *dom = malloc(max_vars * sizeof *dom);
     if (!flipped || !in || !snap || !dom) {
         free(flipped); free(in); free(snap); free(dom);
         return false;
@@ -671,44 +735,16 @@ bool solver_likho(Solver *s) {
     while (s->n_rogue > 0) {
         size_t nr = s->n_rogue;
         memcpy(snap, s->rogue, nr * sizeof *snap);
-        bool moved = false;
-        /* Neutrals first: a neutral flip breaks nothing, so it only removes
-         * clauses from the rogue set. Re-scanning next round also catches the
-         * primes this pass liberated (they are neutral now). */
-        for (size_t i = 0; i < nr; i++) {
-            size_t c = snap[i];
-            if (!solver_clause_is_rogue(s, c)) continue;
-            const Lit *cl = cnf_clause(s->cnf, c);
-            size_t len = cnf_clause_len(s->cnf, c);
-            for (size_t k = 0; k < len; k++) {
-                size_t v = cl[k].var;
-                if (flipped[v]) continue;
-                if (solver_refresh_var(s, v).state != VAR_NEUTRAL) continue;
-                solver_flip(s, v);
-                flipped[v] = 1;
-                moved = true;
-                break;
-            }
-        }
-        if (moved) continue;   /* prefer neutrals, including freshly liberated primes */
-        /* Switch domains: only reached when no rogue clause has a neutral
-         * left. A closed domain adds no rogue clause, so this pass can keep
-         * going and the next round re-derives the states it changed. */
-        for (size_t i = 0; i < nr; i++) {
-            size_t c = snap[i];
-            if (!solver_clause_is_rogue(s, c)) continue;
-            const Lit *cl = cnf_clause(s->cnf, c);
-            size_t len = cnf_clause_len(s->cnf, c);
-            for (size_t k = 0; k < len; k++) {
-                size_t v = cl[k].var;
-                if (flipped[v]) continue;
-                size_t n = likho_domain(s, v, flipped, in, dom);
-                if (n == 0) continue;
-                for (size_t j = 0; j < n; j++) { solver_flip(s, dom[j]); flipped[dom[j]] = 1; }
-                moved = true;
-                break;
-            }
-        }
+        /* With -deep-dive the domain pass goes first; either way the other
+         * pass runs only when this one found nothing, then the next round
+         * re-snapshots so freshly liberated primes are seen as neutral. */
+        bool moved = domains_first
+            ? likho_domain_pass(s, snap, nr, flipped, in, dom, max_vars, max_nodes)
+            : likho_neutral_pass(s, snap, nr, flipped);
+        if (!moved)
+            moved = domains_first
+                ? likho_neutral_pass(s, snap, nr, flipped)
+                : likho_domain_pass(s, snap, nr, flipped, in, dom, max_vars, max_nodes);
         if (!moved) break;   /* stuck: no neutral and no switch domain anywhere */
     }
     free(flipped); free(in); free(snap); free(dom);
@@ -784,7 +820,7 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
         } else if (restart == 0 && cfg->init == INIT_RAREST) {
             if (!solver_init_rarest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_LIKHO) {
-            if (!solver_likho(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+            if (!solver_likho(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else {
             random_assignment(s, restart == 0);
         }

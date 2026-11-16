@@ -547,86 +547,160 @@ static void test_init_rarest_properties(void) {
     }
 }
 
-/* ---- Likho: majority + neutral/switch-domain repair --------------------- */
+/* ---- Likho: zero start + neutral/switch-domain repair ------------------- */
+
+/* Likho's phase 1: every variable false. */
+static void init_zero(Solver *s, size_t nv) {
+    bool *z = calloc(nv ? nv : 1, sizeof *z);
+    solver_set_assignment(s, z);
+    free(z);
+}
 
 static void test_likho_neutral_repair(void) {
-    /* Majority leaves (1 2 3) rogue with every variable neutral: each true
-     * literal sits in a clause that has two other true literals. One neutral
-     * flip satisfies the rogue clause and breaks nothing. */
+    /* Zero start leaves the all-positive clause (1 2 3) rogue. Each of its
+     * literals sits in a two-negative clause, so every variable is neutral and
+     * flipping one satisfies the rogue clause and breaks nothing. */
     Cnf c = must_parse("p cnf 4 7\n"
                        "1 2 3 0\n"
                        "-1 -2 4 0\n-1 -3 4 0\n-2 -1 4 0\n"
                        "-2 -3 4 0\n-3 -1 4 0\n-3 -2 4 0\n");
     Solver *s = must_solver(&c, 1);
-    solver_init_majority(s);
+    init_zero(s, c.n_vars);
     CHECK(solver_unsatisfied_count(s) == 1);
     for (size_t k = 0; k < 3; k++)
         CHECK(solver_refresh_var(s, k).state == VAR_NEUTRAL);
-    CHECK(solver_likho(s));
+    CHECK(solver_likho(s, NULL));
     CHECK(solver_unsatisfied_count(s) == 0);
     CHECK(verify(&c, solver_assignment(s), c.n_vars));
     solver_free(s); cnf_free(&c);
 }
 
-static void test_likho_twin_repair(void) {
-    /* Majority leaves (-1 2 3) rogue. x1 is the sole support of (1 2 3) and x2
-     * of (-1 -2 3), so neither can flip alone; flipping both satisfies the
-     * rogue clause and each other's broken clause, and breaks nothing. */
-    Cnf c = must_parse("p cnf 4 10\n"
+static void test_likho_domain_repair(void) {
+    /* Zero start leaves (1 2 3) rogue. All three literals are primes, so no
+     * neutral is available: x1's flip breaks (-1 4 5), repaired by the neutral
+     * x4, giving the two-variable domain {x1, x4}. */
+    Cnf c = must_parse("p cnf 7 5\n"
                        "1 2 3 0\n"
-                       "-1 -2 3 0\n"
-                       "-1 2 3 0\n"
-                       "-3 -1 2 0\n"
-                       "-2 4 1 0\n-2 4 1 0\n-2 4 1 0\n"
-                       "-3 4 1 0\n-3 4 1 0\n-3 4 1 0\n");
+                       "-1 4 5 0\n"
+                       "-2 6 7 0\n"
+                       "-3 6 7 0\n"
+                       "-4 -5 6 0\n");
     Solver *s = must_solver(&c, 1);
-    solver_init_majority(s);
+    init_zero(s, c.n_vars);
     CHECK(solver_unsatisfied_count(s) == 1);
     for (size_t k = 0; k < 3; k++)
         CHECK(solver_refresh_var(s, k).state == VAR_PRIME);
-    CHECK(solver_likho(s));
+    CHECK(solver_refresh_var(s, 3).state == VAR_NEUTRAL);  /* x4 is a free repair */
+    CHECK(solver_likho(s, NULL));
     CHECK(solver_unsatisfied_count(s) == 0);
     CHECK(verify(&c, solver_assignment(s), c.n_vars));
+    /* the accepted domain was {x1, x4}: each fired exactly once */
+    const bool *a = solver_assignment(s);
+    for (size_t v = 0; v < c.n_vars; v++)
+        CHECK(a[v] == (v == 0 || v == 3));
     solver_free(s); cnf_free(&c);
 }
 
 static void test_likho_switch_domain_chain(void) {
-    /* Majority leaves the unit clause (-1) rogue. x1 solely supports
-     * (1 -2 -3), and both x2 and x3 are primes, so no pair flip is clean: the
-     * only repair is the chain x1 -> x2 -> x4, where x4 is neutral. */
-    Cnf c = must_parse("p cnf 8 13\n"
-                       "-1 0\n"
-                       "1 -2 -3 0\n"
-                       "2 -4 -5 0\n"
-                       "3 -4 -5 0\n"
-                       "1 6 7 0\n2 6 7 0\n3 6 7 0\n"
-                       "4 6 7 0\n4 7 8 0\n4 6 8 0\n"
-                       "5 6 7 0\n5 7 8 0\n5 6 8 0\n");
+    /* Zero start leaves (1 2 3) rogue with all three literals primes. x1's
+     * flip breaks (-1 2 3), whose false literals are primes too, so the only
+     * repair chains x1 -> x2 -> x4, where x4 is neutral. */
+    Cnf c = must_parse("p cnf 7 5\n"
+                       "1 2 3 0\n"
+                       "-1 2 3 0\n"
+                       "-2 4 5 0\n"
+                       "-3 6 7 0\n"
+                       "-4 -6 7 0\n");
     Solver *s = must_solver(&c, 1);
-    solver_init_majority(s);
+    init_zero(s, c.n_vars);
     CHECK(solver_unsatisfied_count(s) == 1);
-    CHECK(solver_refresh_var(s, 0).state == VAR_PRIME);    /* x1 breaks (1 -2 -3) */
-    CHECK(solver_refresh_var(s, 1).state == VAR_PRIME);    /* x2 breaks (2 -4 -5) */
+    CHECK(solver_refresh_var(s, 0).state == VAR_PRIME);    /* x1 breaks (-1 2 3) */
+    CHECK(solver_refresh_var(s, 1).state == VAR_PRIME);    /* x2 breaks (-2 4 5) */
     CHECK(solver_refresh_var(s, 3).state == VAR_NEUTRAL);  /* x4 is a free repair */
-    CHECK(solver_likho(s));
+    CHECK(solver_likho(s, NULL));
     CHECK(solver_unsatisfied_count(s) == 0);
     CHECK(verify(&c, solver_assignment(s), c.n_vars));
     /* the accepted domain was {x1, x2, x4}: each fired exactly once */
     const bool *a = solver_assignment(s);
     for (size_t v = 0; v < c.n_vars; v++)
-        CHECK(a[v] == (v != 0 && v != 1 && v != 3));
+        CHECK(a[v] == (v == 0 || v == 1 || v == 3));
     solver_free(s); cnf_free(&c);
+}
+
+static void test_likho_deep_dive_domains_first(void) {
+    /* Zero start leaves (1 2 3) rogue. Neutrals first would flip the neutral
+     * x2; domains first must instead fire x1's domain {x1, x4}. */
+    Cnf c = must_parse("p cnf 5 3\n"
+                       "1 2 3 0\n"
+                       "-1 4 5 0\n"
+                       "-2 -4 3 0\n");
+    SolverConfig cfg = solver_config_default();
+    cfg.likho_domains_first = true;
+    Solver *s = must_solver(&c, 1);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(solver_unsatisfied_count(s) == 0);
+    CHECK(verify(&c, solver_assignment(s), c.n_vars));
+    const bool *a = solver_assignment(s);
+    for (size_t v = 0; v < c.n_vars; v++) CHECK(a[v] == (v == 0 || v == 3));
+    solver_free(s);
+
+    /* With the domain capped at one variable x1 has no repair, so the same
+     * deep-dive falls back to the neutral x2. */
+    cfg.likho_domain_max = 1;
+    s = must_solver(&c, 1);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(solver_unsatisfied_count(s) == 0);
+    CHECK(verify(&c, solver_assignment(s), c.n_vars));
+    a = solver_assignment(s);
+    for (size_t v = 0; v < c.n_vars; v++) CHECK(a[v] == (v == 1));
+    solver_free(s);
+
+    /* Same fallback when the node budget is too small to close x1's domain. */
+    cfg.likho_domain_max = 4;
+    cfg.likho_search_nodes = 1;
+    s = must_solver(&c, 1);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(solver_unsatisfied_count(s) == 0);
+    a = solver_assignment(s);
+    for (size_t v = 0; v < c.n_vars; v++) CHECK(a[v] == (v == 1));
+    solver_free(s); cnf_free(&c);
+}
+
+static void test_likho_pre_cook(void) {
+    /* The pre-cook assignment is Likho's phase 1. On this formula both
+     * majority and rarest already solve it, so the repair must leave the
+     * pre-cooked assignment untouched. */
+    Cnf c = must_parse("p cnf 5 3\n"
+                       "1 2 3 0\n"
+                       "-1 4 5 0\n"
+                       "-2 -4 3 0\n");
+    SolverConfig cfg = solver_config_default();
+    cfg.likho_pre_cook = INIT_MAJORITY;
+    Solver *m = must_solver(&c, 1), *s = must_solver(&c, 1);
+    solver_init_majority(m);
+    CHECK(solver_unsatisfied_count(m) == 0);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
+    solver_free(m); solver_free(s);
+
+    cfg.likho_pre_cook = INIT_RAREST;
+    m = must_solver(&c, 1); s = must_solver(&c, 1);
+    CHECK(solver_init_rarest(m));
+    CHECK(solver_unsatisfied_count(m) == 0);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
+    solver_free(m); solver_free(s); cnf_free(&c);
 }
 
 static void test_likho_properties(void) {
     for (int i = 0; i < 25; i++) {
         Cnf c = random_cnf(60 + 20 * (i % 4), (int)((60 + 20 * (i % 4)) * (2.0 + 0.4 * (i % 5))), 700 + (uint64_t)i);
         Solver *base = must_solver(&c, 7), *a = must_solver(&c, 7), *b = must_solver(&c, 7);
-        solver_init_majority(base);
+        init_zero(base, c.n_vars);
         size_t before = solver_unsatisfied_count(base);
-        CHECK(solver_likho(a) && solver_likho(b));
+        CHECK(solver_likho(a, NULL) && solver_likho(b, NULL));
         CHECK(memcmp(solver_assignment(a), solver_assignment(b), c.n_vars) == 0);   /* same seed => same repair */
-        CHECK(solver_unsatisfied_count(a) <= before);                               /* never worse than majority */
+        CHECK(solver_unsatisfied_count(a) <= before);                               /* never worse than the zero start */
         CHECK(solver_unsatisfied_count(a) == brute_unsat(&c, solver_assignment(a)));/* counters consistent */
         solver_free(base); solver_free(a); solver_free(b);
 
@@ -751,7 +825,7 @@ static void test_likho_refreshed_states(void) {
     Cnf t = must_parse("p cnf 4 10\n1 2 3 0\n-1 -2 3 0\n-1 2 3 0\n-3 -1 2 0\n"
                        "-2 4 1 0\n-2 4 1 0\n-2 4 1 0\n-3 4 1 0\n-3 4 1 0\n-3 4 1 0\n");
     Solver *s = must_solver(&t, 1);
-    CHECK(solver_likho(s) && solver_unsatisfied_count(s) == 0);
+    CHECK(solver_likho(s, NULL) && solver_unsatisfied_count(s) == 0);
     const VarStats *st = solver_var_stats(s);
     for (size_t v = 0; v < t.n_vars; v++)
         CHECK((st[v].state == VAR_PRIME) == (st[v].break_count >= 1));
@@ -759,7 +833,7 @@ static void test_likho_refreshed_states(void) {
     for (int i = 0; i < 40; i++) {
         Cnf c = random_cnf(100, 330 + 6 * i, 5100 + (uint64_t)i);
         Solver *l = must_solver(&c, 3);
-        CHECK(solver_likho(l));
+        CHECK(solver_likho(l, NULL));
         const VarStats *ls = solver_var_stats(l);
         for (size_t v = 0; v < c.n_vars; v++)
             CHECK((ls[v].state == VAR_PRIME) == (ls[v].break_count >= 1));   /* invariant holds after the pass */
@@ -767,22 +841,23 @@ static void test_likho_refreshed_states(void) {
     }
 }
 
-/* If a rogue clause contains a neutral variable after majority, one free flip exists, so Likho
- * must strictly reduce the rogue count; otherwise it must never increase it. */
+/* If a rogue clause contains a neutral variable after the zero start, one free
+ * flip exists, so Likho must strictly reduce the rogue count; otherwise it must
+ * never increase it. */
 static void test_likho_strictly_improves_when_a_free_move_exists(void) {
     size_t with_free = 0;
     for (int i = 0; i < 80; i++) {
         int n = 60 + 20 * (i % 4);
         Cnf c = random_cnf(n, (int)(n * (2.0 + 0.4 * (i % 6))), 6100 + (uint64_t)i);
-        Solver *m = must_solver(&c, 9), *l = must_solver(&c, 9);   /* same seed => same majority start */
-        solver_init_majority(m);
+        Solver *m = must_solver(&c, 9), *l = must_solver(&c, 9);   /* same seed => same zero start */
+        init_zero(m, c.n_vars);
         size_t before = solver_unsatisfied_count(m);
         bool free_move = false;
         const size_t *rl = solver_rogue_list(m);
         for (size_t r = 0; r < before; r++)
             for (size_t k = 0; k < cnf_clause_len(&c, rl[r]); k++)
                 if (solver_refresh_var(m, cnf_clause(&c, rl[r])[k].var).state == VAR_NEUTRAL) free_move = true;
-        CHECK(solver_likho(l));
+        CHECK(solver_likho(l, NULL));
         size_t after = solver_unsatisfied_count(l);
         if (free_move) { CHECK(after < before); with_free++; }
         else CHECK(after <= before);
@@ -796,8 +871,8 @@ static void test_likho_general_cnf_and_edge_cases(void) {
         int n = 6 + (i % 6) * 7;
         Cnf c = random_general_cnf(n * 2, n + (i % 5) * 6, 1 + (i % 6), 8100 + (uint64_t)i);
         Solver *base = must_solver(&c, 2), *a = must_solver(&c, 2), *b = must_solver(&c, 2);
-        solver_init_majority(base);
-        CHECK(solver_likho(a) && solver_likho(b));
+        init_zero(base, c.n_vars);
+        CHECK(solver_likho(a, NULL) && solver_likho(b, NULL));
         CHECK(c.n_vars == 0 || memcmp(solver_assignment(a), solver_assignment(b), c.n_vars) == 0);
         CHECK(solver_unsatisfied_count(a) <= solver_unsatisfied_count(base));
         CHECK(solver_unsatisfied_count(a) == brute_unsat(&c, solver_assignment(a)));
@@ -808,7 +883,7 @@ static void test_likho_general_cnf_and_edge_cases(void) {
     for (size_t i = 0; i < sizeof edge / sizeof edge[0]; i++) {
         Cnf c = must_parse(edge[i]);
         Solver *s = must_solver(&c, 1);
-        CHECK(solver_likho(s));
+        CHECK(solver_likho(s, NULL));
         CHECK(solver_unsatisfied_count(s) == brute_unsat(&c, solver_assignment(s)));
         solver_free(s); cnf_free(&c);
     }
@@ -918,8 +993,10 @@ int main(void) {
     test_init_rarest_hand_checked();
     test_init_rarest_properties();
     test_likho_neutral_repair();
-    test_likho_twin_repair();
+    test_likho_domain_repair();
     test_likho_switch_domain_chain();
+    test_likho_deep_dive_domains_first();
+    test_likho_pre_cook();
     test_likho_properties();
     test_init_rarest_matches_reference();
     test_likho_refreshed_states();

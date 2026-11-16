@@ -102,9 +102,30 @@ static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
     else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|likho)", flag, value);
     return OK_UNIT(ResultUnit);
 }
+static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
+    if (strcmp(value, "zero") == 0) cli->cfg.likho_pre_cook = INIT_ZERO;
+    else if (strcmp(value, "majority") == 0) cli->cfg.likho_pre_cook = INIT_MAJORITY;
+    else if (strcmp(value, "rarest") == 0) cli->cfg.likho_pre_cook = INIT_RAREST;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected zero|majority|rarest)", flag, value);
+    cli->cfg.init = INIT_LIKHO;   /* pre-cook is a Likho mode */
+    return OK_UNIT(ResultUnit);
+}
 static ResultUnit opt_group_len(Cli *cli, const char *flag, const char *value) {
     return parse_size(flag, value, &cli->gcfg.group_len);
 }
+/* -deep-dive VARS NODES: cap switch domains, and fire them before neutrals. */
+static ResultUnit opt_deep_dive(Cli *cli, const char *flag, const char *vars, const char *nodes) {
+    TRY0(ResultUnit, parse_size(flag, vars, &cli->cfg.likho_domain_max));
+    TRY0(ResultUnit, parse_size(flag, nodes, &cli->cfg.likho_search_nodes));
+    if (cli->cfg.likho_domain_max < 1)
+        return ERRF(ResultUnit, ERR_USAGE, "%s needs at least 1 variable per domain", flag);
+    if (cli->cfg.likho_search_nodes < 1)
+        return ERRF(ResultUnit, ERR_USAGE, "%s needs at least 1 search node", flag);
+    cli->cfg.likho_domains_first = true;
+    cli->cfg.init = INIT_LIKHO;   /* deep-dive is a Likho mode */
+    return OK_UNIT(ResultUnit);
+}
+
 static ResultUnit opt_diversify(Cli *cli, const char *flag, const char *value) {
     return parse_size(flag, value, &cli->gcfg.diversify);
 }
@@ -128,7 +149,8 @@ static const OptSpec OPTS[] = {
     { "--mode", opt_mode },       { "--max-groups", opt_max_groups },
     { "--merge", opt_merge },     { "--diversify", opt_diversify },
     { "--group-len", opt_group_len }, { "-group-len", opt_group_len },
-    { "--init", opt_init },
+    { "--init", opt_init },           { "-pre-cook", opt_pre_cook },
+    { "--pre-cook", opt_pre_cook },
 };
 
 static void usage(void) {
@@ -137,13 +159,20 @@ static void usage(void) {
         "                      [--strategy ranked|greedy|random] [--progress N] [--out FILE]\n"
         "                      [--mode plain|groups] [--max-groups 1..1024] [--merge free|directed]\n"
         "                      [--diversify N] [--group-len N]\n"
-        "                      [--init majority|rarest|likho]\n");
+        "                      [--init majority|rarest|likho] [-deep-dive VARS NODES]\n"
+        "                      [-pre-cook zero|majority|rarest]\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
     if (argc < 2) return ERRF(ResultUnit, ERR_USAGE, "Missing INPUT.cnf");
     cli->input = argv[1];
     for (int i = 2; i < argc; i += 2) {
+        if (strcmp(argv[i], "-deep-dive") == 0 || strcmp(argv[i], "--deep-dive") == 0) {
+            if (i + 2 >= argc) return ERRF(ResultUnit, ERR_USAGE, "Missing values for %s", argv[i]);
+            TRY0(ResultUnit, opt_deep_dive(cli, argv[i], argv[i + 1], argv[i + 2]));
+            i += 1;   /* consumed two values; the loop's step lands on the next flag */
+            continue;
+        }
         const OptSpec *spec = NULL;
         for (size_t k = 0; k < sizeof OPTS / sizeof OPTS[0]; k++)
             if (strcmp(OPTS[k].flag, argv[i]) == 0) { spec = &OPTS[k]; break; }

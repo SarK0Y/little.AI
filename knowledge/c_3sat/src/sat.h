@@ -98,7 +98,8 @@ PickFn pick_fn_by_name(const char *name); /* NULL if unknown */
 typedef enum {
     INIT_MAJORITY,  /* every variable takes its majority polarity (default) */
     INIT_RAREST,    /* constructive: rarest variables first, see solver_init_rarest() */
-    INIT_LIKHO      /* majority, then a one-flip-per-variable repair pass */
+    INIT_LIKHO,     /* pre-cooked start (all false by default), then a one-flip-per-variable repair pass */
+    INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
 
 typedef struct {
@@ -109,6 +110,10 @@ typedef struct {
     PickFn pick;      /* NULL => pick_ranked */
     const bool *initial;  /* optional start for restart 0 (n_vars entries); NULL => use `init` */
     InitMode init;
+    size_t likho_domain_max;    /* Likho: variables per switch domain, prime included */
+    size_t likho_search_nodes;  /* Likho: backtracking budget per prime */
+    bool likho_domains_first;   /* Likho: fire switch domains before neutral repairs */
+    InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY or INIT_RAREST */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -162,11 +167,13 @@ void solver_flip(Solver *s, size_t var);
  * false only on allocation failure. */
 bool solver_init_rarest(Solver *s);
 void solver_init_majority(Solver *s);                  /* majority-polarity start (ties use the solver RNG) */
-/* Likho: majority start, then a repair pass that flips an unflipped neutral
- * variable in a rogue clause (always safe), or a switch domain: a prime plus
- * the neutrals/primes that must flip with it so no satisfied clause breaks.
- * Each variable is flipped at most once. false only on allocation failure. */
-bool solver_likho(Solver *s);
+/* Likho: phase 1 is cfg->likho_pre_cook (all-false by default), then a repair
+ * pass that flips an unflipped neutral variable in a rogue clause (always
+ * safe), or a switch domain: a prime plus the neutrals/primes that must flip
+ * with it so no satisfied clause breaks. Each variable is flipped at most
+ * once. The domain size, search budget, pass order and pre-cook come from cfg
+ * (NULL uses the defaults). false only on allocation failure. */
+bool solver_likho(Solver *s, const SolverConfig *cfg);
 const size_t *solver_rogue_list(const Solver *s);      /* solver_unsatisfied_count() clause ids */
 VarStats solver_refresh_var(Solver *s, size_t var);    /* fresh stats of one variable, O(occurrences) */
 size_t solver_occ_count(const Solver *s, size_t var);  /* clauses containing var */
