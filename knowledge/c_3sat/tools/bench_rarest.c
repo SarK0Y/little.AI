@@ -1,9 +1,10 @@
-/* Benchmark of the starts -- majority, old/new rarest, Likho, Likho deep-dive,
- * Likho pre-cooked with majority -- on random 3-SAT or a DIMACS file.
+/* Benchmark of the starts -- majority, old/new rarest, glowest, min-overlapping,
+ * Likho, Likho deep-dive, Likho pre-cooked with majority -- on random 3-SAT or a
+ * DIMACS file.
  *
  * The previous total-occurrence rarest order is reimplemented here as a
  * baseline (O(nv * clauses), benchmark-sized inputs only) and injected through
- * SolverConfig.initial, so all four starts run the same search code.
+ * SolverConfig.initial, so all starts run the same search code.
  *
  * usage:
  *   bench_rarest <n> <ratio> <seeds> <steps> <restarts>
@@ -141,9 +142,10 @@ int main(int argc, char **argv) {
     cfg.max_steps = steps;
     cfg.restarts = restarts;
 
-    Row rows[6] = {
+    Row rows[8] = {
         { .name = "majority" }, { .name = "rarest-old" },
-        { .name = "rarest-new" }, { .name = "likho" },
+        { .name = "rarest-new" }, { .name = "glowest" },
+        { .name = "min-overlap" }, { .name = "likho" },
         { .name = "likho-dd" }, { .name = "likho-pc" },
     };
     for (size_t sd = 1; sd <= seeds; sd++) {
@@ -162,7 +164,7 @@ int main(int argc, char **argv) {
         Cnf cnf = rc.val;
         nv = cnf.n_vars; nc = cnf.n_clauses;
 
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 8; i++) {
             ResultSolver rs = solver_new(&cnf, cfg.seed);
             if (!rs.ok) { fprintf(stderr, "solver: %s\n", rs.err.msg); return 1; }
             Solver *s = rs.val;
@@ -178,11 +180,21 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "init: out of memory\n");
                     return 1;
                 }
+            } else if (i == 3) {
+                if (!solver_init_glowest(s)) {
+                    fprintf(stderr, "init: out of memory\n");
+                    return 1;
+                }
+            } else if (i == 4) {
+                if (!solver_init_min_overlap(s)) {
+                    fprintf(stderr, "init: out of memory\n");
+                    return 1;
+                }
             } else {
                 SolverConfig lc = cfg;
-                lc.likho_domains_first = i == 4;   /* likho-dd fires domains first */
-                if (i == 4) { lc.likho_domain_max = 32; lc.likho_search_nodes = 128; }   /* -deep-dive 32 128 */
-                if (i == 5) lc.likho_pre_cook = INIT_MAJORITY;                          /* -pre-cook majority */
+                lc.likho_domains_first = i == 6;   /* likho-dd fires domains first */
+                if (i == 6) { lc.likho_domain_max = 32; lc.likho_search_nodes = 128; }   /* -deep-dive 32 128 */
+                if (i == 7) lc.likho_pre_cook = INIT_MAJORITY;                          /* -pre-cook majority */
                 if (!solver_likho(s, &lc)) {
                     fprintf(stderr, "init: out of memory\n");
                     return 1;
@@ -222,7 +234,7 @@ int main(int argc, char **argv) {
     else printf("n=%zu ratio=%.1f clauses=%zu seeds=%zu\n", nv, ratio, nc, seeds);
     printf("budget=%zu steps x %zu attempts\n", steps, restarts + 1);
     printf("%-12s %12s %8s %12s %8s\n", "init", "init_unsat", "solved", "mean_steps", "sec");
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 8; i++) {
         double init = (double)rows[i].init_unsat / (double)seeds;
         double mean = rows[i].solved ? (double)rows[i].sum_steps / (double)rows[i].solved : 0.0;
         printf("%-12s %12.1f %5zu/%-2zu %12.0f %8.1f\n",

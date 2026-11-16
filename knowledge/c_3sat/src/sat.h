@@ -98,6 +98,8 @@ PickFn pick_fn_by_name(const char *name); /* NULL if unknown */
 typedef enum {
     INIT_MAJORITY,  /* every variable takes its majority polarity (default) */
     INIT_RAREST,    /* constructive: rarest variables first, see solver_init_rarest() */
+    INIT_GLOWEST,   /* constructive: most frequent variables first, see solver_init_glowest() */
+    INIT_MIN_OVERLAP, /* constructive: most frequent first, then least-overlapping, see solver_init_min_overlap() */
     INIT_LIKHO,     /* pre-cooked start (all false by default), then a one-flip-per-variable repair pass */
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
@@ -113,7 +115,7 @@ typedef struct {
     size_t likho_domain_max;    /* Likho: variables per switch domain, prime included */
     size_t likho_search_nodes;  /* Likho: backtracking budget per prime */
     bool likho_domains_first;   /* Likho: fire switch domains before neutral repairs */
-    InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY or INIT_RAREST */
+    InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY, INIT_RAREST, INIT_GLOWEST or INIT_MIN_OVERLAP */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -166,6 +168,17 @@ void solver_flip(Solver *s, size_t var);
  *   3. else has the larger total polarity, else false.
  * false only on allocation failure. */
 bool solver_init_rarest(Solver *s);
+/* Same constructive start as solver_init_rarest(), but takes the most frequent
+ * unset variable first (most clauses holding x or !x, the larger of the two
+ * counts, satisfied clauses excluded, ties by id). Deterministic, no RNG.
+ * false only on allocation failure. */
+bool solver_init_glowest(Solver *s);
+/* Same constructive value rule, but the order is: first the most frequent
+ * variable (glowest's pick, ties by id), then at every step the unset variable
+ * with the smallest share of its occurrences already in satisfied clauses
+ * (ties by id, variables with no occurrences last). Deterministic, no RNG.
+ * false only on allocation failure. */
+bool solver_init_min_overlap(Solver *s);
 void solver_init_majority(Solver *s);                  /* majority-polarity start (ties use the solver RNG) */
 /* Likho: phase 1 is cfg->likho_pre_cook (all-false by default), then a repair
  * pass that flips an unflipped neutral variable in a rogue clause (always

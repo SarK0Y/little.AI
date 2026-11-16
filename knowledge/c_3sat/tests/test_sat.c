@@ -519,6 +519,96 @@ static void test_init_rarest_hand_checked(void) {
     solver_free(s); cnf_free(&e);
 }
 
+static void test_init_glowest_hand_checked(void) {
+    /* Glowest by max(#x,#!x): x1 has 2, x2 and x3 have 1, so x1 goes first.
+     * Both clauses are open and positive for x1, so it goes true and satisfies
+     * them; x2 and x3 then have no open clause and tie on total polarity, so
+     * both go false. */
+    Cnf c = must_parse("p cnf 3 3\n1 2 0\n1 3 0\n-2 -3 0\n");
+    Solver *s = must_solver(&c, 1);
+    CHECK(solver_init_glowest(s));
+    const bool *a = solver_assignment(s);
+    CHECK(a[0] && !a[1] && !a[2]);
+    CHECK(solver_unsatisfied_count(s) == 0);
+    solver_free(s);
+
+    /* solver_solve's restart-0 dispatch must take the same start. */
+    Solver *d = must_solver(&c, 1);
+    SolverConfig sc = solver_config_default();
+    sc.init = INIT_GLOWEST;
+    sc.max_steps = 0;
+    sc.restarts = 0;
+    ResultSolve r = solver_solve(d, &sc);
+    const bool *da = solver_assignment(d);
+    CHECK(r.ok && da[0] && !da[1] && !da[2]);
+    if (r.ok) solve_result_free(&r.val);
+    solver_free(d);
+
+    SolverConfig cfg = solver_config_default();          /* and the group solver */
+    cfg.init = INIT_GLOWEST;
+    GroupConfig gc = group_config_default();
+    gc.max_groups = 8;
+    ResultGroup g = group_solve(&c, &cfg, &gc);
+    CHECK(g.ok);
+    if (g.ok) { check_group_result(&c, &g.val); group_result_free(&g.val); }
+    cnf_free(&c);
+
+    /* variable that occurs nowhere is set false */
+    Cnf e = must_parse("p cnf 3 1\n1 2 0\n");
+    s = must_solver(&e, 1);
+    CHECK(solver_init_glowest(s));
+    CHECK(!solver_assignment(s)[2]);
+    solver_free(s); cnf_free(&e);
+}
+
+static void test_init_min_overlap_hand_checked(void) {
+    /* Step 0 is glowest's pick: x4 and x5 both have max(#x,#!x)=3, so x4 (lower
+     * id) goes first and, all-negative, goes false. That satisfies clauses 1, 4
+     * and 5. The least-overlapping unset variable is then x1 (0 of 1
+     * occurrences already satisfied), not x5 (3 of 5), so x1 goes true. Next x2
+     * and x6 tie at 1 of 2 and x2 wins by id; it goes true. x5 (5/5) and x6
+     * (2/2) follow, both false. Glowest instead takes x5 at step 1 and ends with
+     * x2 false, so this pins the order. */
+    Cnf c = must_parse("p cnf 6 5\n"
+                       "5 -4 -2 0\n"
+                       "-5 2 6 0\n"
+                       "-5 1 0\n"
+                       "-4 -5 0\n"
+                       "-6 5 -4 0\n");
+    Solver *s = must_solver(&c, 1);
+    CHECK(solver_init_min_overlap(s));
+    const bool *a = solver_assignment(s);
+    CHECK(a[0] && a[1] && !a[2] && !a[3] && !a[4] && !a[5]);
+    CHECK(solver_unsatisfied_count(s) == 0);
+    solver_free(s);
+
+    Solver *g = must_solver(&c, 1);                      /* glowest's order differs */
+    CHECK(solver_init_glowest(g));
+    CHECK(!solver_assignment(g)[1]);
+    solver_free(g);
+
+    /* solver_solve's restart-0 dispatch must take the same start. */
+    Solver *d = must_solver(&c, 1);
+    SolverConfig sc = solver_config_default();
+    sc.init = INIT_MIN_OVERLAP;
+    sc.max_steps = 0;
+    sc.restarts = 0;
+    ResultSolve r = solver_solve(d, &sc);
+    const bool *da = solver_assignment(d);
+    CHECK(r.ok && da[0] && da[1] && !da[2] && !da[3] && !da[4] && !da[5]);
+    if (r.ok) solve_result_free(&r.val);
+    solver_free(d);
+
+    SolverConfig cfg = solver_config_default();          /* and the group solver */
+    cfg.init = INIT_MIN_OVERLAP;
+    GroupConfig gc = group_config_default();
+    gc.max_groups = 8;
+    ResultGroup gr = group_solve(&c, &cfg, &gc);
+    CHECK(gr.ok);
+    if (gr.ok) { check_group_result(&c, &gr.val); group_result_free(&gr.val); }
+    cnf_free(&c);
+}
+
 static void test_init_rarest_properties(void) {
     SolverConfig cfg = solver_config_default();
     cfg.init = INIT_RAREST;
@@ -667,9 +757,9 @@ static void test_likho_deep_dive_domains_first(void) {
 }
 
 static void test_likho_pre_cook(void) {
-    /* The pre-cook assignment is Likho's phase 1. On this formula both
-     * majority and rarest already solve it, so the repair must leave the
-     * pre-cooked assignment untouched. */
+    /* The pre-cook assignment is Likho's phase 1. On this formula all three
+     * pre-cooks already solve it, so the repair must leave the pre-cooked
+     * assignment untouched. */
     Cnf c = must_parse("p cnf 5 3\n"
                        "1 2 3 0\n"
                        "-1 4 5 0\n"
@@ -686,6 +776,22 @@ static void test_likho_pre_cook(void) {
     cfg.likho_pre_cook = INIT_RAREST;
     m = must_solver(&c, 1); s = must_solver(&c, 1);
     CHECK(solver_init_rarest(m));
+    CHECK(solver_unsatisfied_count(m) == 0);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
+    solver_free(m); solver_free(s);
+
+    cfg.likho_pre_cook = INIT_GLOWEST;
+    m = must_solver(&c, 1); s = must_solver(&c, 1);
+    CHECK(solver_init_glowest(m));
+    CHECK(solver_unsatisfied_count(m) == 0);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
+    solver_free(m); solver_free(s);
+
+    cfg.likho_pre_cook = INIT_MIN_OVERLAP;
+    m = must_solver(&c, 1); s = must_solver(&c, 1);
+    CHECK(solver_init_min_overlap(m));
     CHECK(solver_unsatisfied_count(m) == 0);
     CHECK(solver_likho(s, &cfg));
     CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
@@ -738,26 +844,42 @@ static Cnf random_general_cnf(int n, int m, int maxlen, uint64_t seed) {
     return c;
 }
 
-/* Naive spec of --init rarest: every step recomputes, for each unset variable, max(#x, #!x) over the
- * clauses not yet satisfied, takes the smallest (ties: lowest id), then applies forced > open > total
- * polarity > false. No heap, no incremental counters. */
-static void rarest_reference(const Cnf *c, bool *out) {
+/* Naive spec of the constructive starts: every step recomputes, for each unset
+ * variable, the pick key from scratch. rarest/glowest use max(#x, #!x) over the
+ * clauses not yet satisfied, smallest/largest first. min-overlap takes the
+ * glowest pick first, then the smallest (#occurrences in satisfied clauses) /
+ * (#occurrences), with a zero denominator last. Ties: lowest id. Then the value
+ * rule forced > open > total polarity > false. No heap, no incremental counters. */
+enum { REF_RAREST, REF_GLOWEST, REF_MIN_OVERLAP };
+
+static void order_reference(const Cnf *c, bool *out, int mode) {
     size_t nv = c->n_vars, nc = c->n_clauses;
     bool *set = calloc(nv ? nv : 1, 1), *done = calloc(nc ? nc : 1, 1);
     for (size_t step = 0; step < nv; step++) {
-        size_t best = SIZE_MAX, best_key = 0;
+        size_t best = SIZE_MAX, best_key = 0, best_den = 1;
         for (size_t v = 0; v < nv; v++) {
             if (set[v]) continue;
-            size_t p = 0, n = 0;
-            for (size_t ci = 0; ci < nc; ci++) {
-                if (done[ci]) continue;
+            size_t p = 0, n = 0, tot = 0, ov = 0;
+            for (size_t ci = 0; ci < nc; ci++)
                 for (size_t k = 0; k < cnf_clause_len(c, ci); k++) {
                     Lit l = cnf_clause(c, ci)[k];
-                    if (l.var == v) { if (l.positive) p++; else n++; }
+                    if (l.var != v) continue;
+                    tot++;
+                    if (done[ci]) { ov++; continue; }
+                    if (l.positive) p++; else n++;
                 }
+            bool overlap = mode == REF_MIN_OVERLAP && step > 0;
+            size_t key = overlap ? ov : (p > n ? p : n), den = overlap ? tot : 1;
+            bool better;
+            if (overlap) {
+                if (best == SIZE_MAX) better = true;
+                else if ((den == 0) != (best_den == 0)) better = best_den == 0;
+                else better = (unsigned __int128)key * best_den < (unsigned __int128)best_key * den;
+            } else {
+                bool most = mode == REF_GLOWEST || mode == REF_MIN_OVERLAP;   /* min-overlap's first pick is glowest's */
+                better = best == SIZE_MAX || (most ? key > best_key : key < best_key);
             }
-            size_t key = p > n ? p : n;
-            if (best == SIZE_MAX || key < best_key) { best = v; best_key = key; }
+            if (better) { best = v; best_key = key; best_den = den; }
         }
         size_t v = best, fp = 0, fn = 0, op = 0, on = 0, tp = 0, tn = 0;
         for (size_t ci = 0; ci < nc; ci++) {
@@ -785,37 +907,44 @@ static void rarest_reference(const Cnf *c, bool *out) {
     free(set); free(done);
 }
 
-static void check_rarest_matches_reference(const Cnf *c) {
+static void check_order_matches_reference(const Cnf *c, int mode) {
     Solver *s = must_solver(c, 1);
     bool *ref = malloc(c->n_vars ? c->n_vars : 1);
-    CHECK(solver_init_rarest(s));
-    rarest_reference(c, ref);
+    bool ok = mode == REF_RAREST ? solver_init_rarest(s)
+            : mode == REF_GLOWEST ? solver_init_glowest(s)
+            : solver_init_min_overlap(s);
+    CHECK(ok);
+    order_reference(c, ref, mode);
     CHECK(c->n_vars == 0 || memcmp(solver_assignment(s), ref, c->n_vars) == 0);
     CHECK(solver_unsatisfied_count(s) == brute_unsat(c, ref));
     free(ref);
     solver_free(s);
 }
 
-static void test_init_rarest_matches_reference(void) {
+static void check_order_corpus(int mode) {
     for (int i = 0; i < 150; i++) {                           /* random 3-SAT, easy to hard */
         int n = 8 + (i % 7) * 9;
         Cnf c = random_cnf(n, (int)(n * (1.0 + 0.5 * (i % 9))), 9000 + (uint64_t)i);
-        check_rarest_matches_reference(&c);
+        check_order_matches_reference(&c, mode);
         cnf_free(&c);
     }
     for (int i = 0; i < 150; i++) {                           /* general CNF: units, long clauses, unused vars */
         int n = 5 + (i % 6) * 7;
         Cnf c = random_general_cnf(n * 2, n + (i % 5) * 6, 1 + (i % 6), 4000 + (uint64_t)i);
-        check_rarest_matches_reference(&c);
+        check_order_matches_reference(&c, mode);
         cnf_free(&c);
     }
     Cnf e = must_parse("p cnf 0 0\n");
-    check_rarest_matches_reference(&e);
+    check_order_matches_reference(&e, mode);
     cnf_free(&e);
     Cnf one = must_parse("p cnf 1 1\n-1 0\n");
-    check_rarest_matches_reference(&one);
+    check_order_matches_reference(&one, mode);
     cnf_free(&one);
 }
+
+static void test_init_rarest_matches_reference(void) { check_order_corpus(REF_RAREST); }
+static void test_init_glowest_matches_reference(void) { check_order_corpus(REF_GLOWEST); }
+static void test_init_min_overlap_matches_reference(void) { check_order_corpus(REF_MIN_OVERLAP); }
 
 /* ---- Likho: properties the repair pass promises ---------------------------- */
 
@@ -991,6 +1120,8 @@ int main(void) {
     test_group_len_limits_group_size();
     test_more_than_64_groups();
     test_init_rarest_hand_checked();
+    test_init_glowest_hand_checked();
+    test_init_min_overlap_hand_checked();
     test_init_rarest_properties();
     test_likho_neutral_repair();
     test_likho_domain_repair();
@@ -999,6 +1130,8 @@ int main(void) {
     test_likho_pre_cook();
     test_likho_properties();
     test_init_rarest_matches_reference();
+    test_init_glowest_matches_reference();
+    test_init_min_overlap_matches_reference();
     test_likho_refreshed_states();
     test_likho_strictly_improves_when_a_free_move_exists();
     test_likho_general_cnf_and_edge_cases();

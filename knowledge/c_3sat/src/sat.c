@@ -471,10 +471,17 @@ static void random_assignment(Solver *s, bool majority) {
     rebuild_counts(s);
 }
 
-typedef struct { size_t key, var; } Rare;
+typedef struct { size_t key, den, var; } Rare;
 
+/* Ascending key/den, ties by variable id. den is 1 for the frequency orders and
+ * the variable's occurrence count for the overlap order; ratios are compared by
+ * cross-multiplication so the order stays exact. A zero denominator (variable
+ * with no occurrences) sorts last. */
 static bool rare_before(Rare a, Rare b) {
-    if (a.key != b.key) return a.key < b.key;
+    if ((a.den == 0) != (b.den == 0)) return b.den == 0;
+    unsigned __int128 l = (unsigned __int128)a.key * b.den;
+    unsigned __int128 r = (unsigned __int128)b.key * a.den;
+    if (l != r) return l < r;
     return a.var < b.var;
 }
 
@@ -508,40 +515,86 @@ static Rare rare_pop(Rare *h, size_t *n) {
     return top;
 }
 
-/* Rarest = fewest clauses holding x or !x, whichever is larger. Only clauses
- * that are still unsatisfied count, so satisfying a clause removes the
- * overlapping occurrences of every variable it contains. */
-static size_t rare_key(const uint32_t *pos, const uint32_t *neg, size_t v) {
-    return pos[v] > neg[v] ? pos[v] : neg[v];
+/* Rarest = fewest clauses holding x or !x, whichever is larger; glowest = most.
+ * Only clauses that are still unsatisfied count, so satisfying a clause removes
+ * the overlapping occurrences of every variable it contains. */
+static size_t rare_key(const uint32_t *pos, const uint32_t *neg, size_t v, bool most) {
+    size_t m = pos[v] > neg[v] ? pos[v] : neg[v];
+    return most ? SIZE_MAX - m : m;
 }
 
-bool solver_init_rarest(Solver *s) {
+typedef enum { ORDER_RAREST, ORDER_GLOWEST, ORDER_MIN_OVERLAP } InitOrder;
+
+/* Current key and denominator of v. min-overlap ranks a variable by the share of
+ * its occurrences that sit in already satisfied clauses. */
+static void order_key(InitOrder mode, const uint32_t *pos, const uint32_t *neg,
+                      const uint32_t *overlap, const size_t *total,
+                      size_t v, size_t *key, size_t *den) {
+    if (mode == ORDER_MIN_OVERLAP) { *key = overlap[v]; *den = total[v]; }
+    else { *key = rare_key(pos, neg, v, mode == ORDER_GLOWEST); *den = 1; }
+}
+
+static void order_push(Rare *h, size_t *hn, InitOrder mode, const uint32_t *pos,
+                       const uint32_t *neg, const uint32_t *overlap,
+                       const size_t *total, size_t v) {
+    size_t key, den;
+    order_key(mode, pos, neg, overlap, total, v, &key, &den);
+    rare_push(h, hn, (Rare){ key, den, v });
+}
+
+/* Constructive start. rarest/glowest take at every step the unset variable with
+ * the fewest/most open clauses holding x or !x (the larger polarity count, ties
+ * by id). min-overlap takes the most frequent variable first (glowest's pick,
+ * ties by id), then the one with the smallest share of its occurrences already
+ * in satisfied clauses, ties by id. A key only moves one way, so the current
+ * entry is re-pushed whenever it changes and a stale entry is discarded when it
+ * pops. */
+static bool init_order(Solver *s, InitOrder mode) {
     const Cnf *cnf = s->cnf;
     size_t nv = cnf->n_vars, nc = cnf->n_clauses;
     uint32_t *unset = malloc((nc ? nc : 1) * sizeof *unset);   /* unassigned variables left in each clause */
     unsigned char *done = calloc(nc ? nc : 1, 1);              /* clause already has a true literal */
-    uint32_t *pos = calloc(nv ? nv : 1, sizeof *pos);          /* effective: satisfied clauses dropped */
+    uint32_t *pos = calloc(nv ? nv : 1, sizeof *pos);          /* polarity counts of open clauses (frequency orders) */
     uint32_t *neg = calloc(nv ? nv : 1, sizeof *neg);
+    uint32_t *overlap = calloc(nv ? nv : 1, sizeof *overlap);  /* satisfied occurrences, min-overlap order */
+    size_t *total = calloc(nv ? nv : 1, sizeof *total);        /* all occurrences, min-overlap denominator */
     unsigned char *assigned = calloc(nv ? nv : 1, 1);
     Rare *heap = malloc((nv + s->occ_off[nv] + 1) * sizeof *heap);
-    if (!unset || !done || !pos || !neg || !assigned || !heap) {
-        free(unset); free(done); free(pos); free(neg); free(assigned); free(heap);
+    if (!unset || !done || !pos || !neg || !overlap || !total || !assigned || !heap) {
+        free(unset); free(done); free(pos); free(neg); free(overlap); free(total);
+        free(assigned); free(heap);
         return false;
     }
     for (size_t c = 0; c < nc; c++) unset[c] = (uint32_t)cnf_clause_len(cnf, c);
     size_t hn = 0;
     for (size_t v = 0; v < nv; v++) {
+        total[v] = occ_count(s, v);
         for (size_t k = s->occ_off[v]; k < s->occ_off[v + 1]; k++)
             if (s->occ[k].positive) pos[v]++; else neg[v]++;
-        rare_push(heap, &hn, (Rare){ rare_key(pos, neg, v), v });
     }
+    /* min-overlap's first pick is glowest's, so its heap starts after step 0. */
+    if (mode != ORDER_MIN_OVERLAP)
+        for (size_t v = 0; v < nv; v++)
+            order_push(heap, &hn, mode, pos, neg, overlap, total, v);
 
     for (size_t step = 0; step < nv; step++) {
-        Rare top;
-        do {
-            top = rare_pop(heap, &hn);
-        } while (assigned[top.var] || top.key != rare_key(pos, neg, top.var));
-        size_t v = top.var;
+        size_t v;
+        if (mode == ORDER_MIN_OVERLAP && step == 0) {
+            v = 0;
+            for (size_t u = 1; u < nv; u++) {
+                size_t m = pos[u] > neg[u] ? pos[u] : neg[u];
+                size_t bm = pos[v] > neg[v] ? pos[v] : neg[v];
+                if (m > bm) v = u;
+            }
+        } else {
+            Rare top;
+            size_t key, den;
+            do {
+                top = rare_pop(heap, &hn);
+                order_key(mode, pos, neg, overlap, total, top.var, &key, &den);
+            } while (assigned[top.var] || top.key != key || top.den != den);
+            v = top.var;
+        }
         size_t fp = 0, fn = 0, op = 0, on = 0, tp = 0, tn = 0;
         for (size_t k = s->occ_off[v]; k < s->occ_off[v + 1]; k++) {
             Occ o = s->occ[k];
@@ -567,15 +620,27 @@ bool solver_init_rarest(Solver *s) {
             for (size_t j = 0; j < len; j++) {
                 size_t u = cl[j].var;
                 if (assigned[u]) continue;
-                if (cl[j].positive) pos[u]--; else neg[u]--;
-                rare_push(heap, &hn, (Rare){ rare_key(pos, neg, u), u });
+                if (mode == ORDER_MIN_OVERLAP) overlap[u]++;
+                else if (cl[j].positive) pos[u]--; else neg[u]--;
+                if (mode == ORDER_MIN_OVERLAP && step == 0) continue;   /* heap is built after this step */
+                order_push(heap, &hn, mode, pos, neg, overlap, total, u);
             }
         }
+        if (mode == ORDER_MIN_OVERLAP && step == 0) {
+            hn = 0;   /* every unset variable gets an overlap entry, not a glowest one */
+            for (size_t u = 0; u < nv; u++)
+                if (!assigned[u]) order_push(heap, &hn, mode, pos, neg, overlap, total, u);
+        }
     }
-    free(unset); free(done); free(pos); free(neg); free(assigned); free(heap);
+    free(unset); free(done); free(pos); free(neg); free(overlap); free(total);
+    free(assigned); free(heap);
     rebuild_counts(s);
     return true;
 }
+
+bool solver_init_rarest(Solver *s) { return init_order(s, ORDER_RAREST); }
+bool solver_init_glowest(Solver *s) { return init_order(s, ORDER_GLOWEST); }
+bool solver_init_min_overlap(Solver *s) { return init_order(s, ORDER_MIN_OVERLAP); }
 
 /* ---- Likho: zero start + switch-domain repair pass --------------------- */
 
@@ -720,6 +785,8 @@ bool solver_likho(Solver *s, const SolverConfig *cfg) {
     if (max_vars == 0) max_vars = 1;    /* domain of one: the prime alone, no repair */
     if (pre == INIT_MAJORITY) solver_init_majority(s);
     else if (pre == INIT_RAREST) { if (!solver_init_rarest(s)) return false; }
+    else if (pre == INIT_GLOWEST) { if (!solver_init_glowest(s)) return false; }
+    else if (pre == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(s)) return false; }
     else {
         memset(s->assignment, 0, nv * sizeof *s->assignment);
         rebuild_counts(s);
@@ -819,6 +886,10 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             rebuild_counts(s);
         } else if (restart == 0 && cfg->init == INIT_RAREST) {
             if (!solver_init_rarest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_GLOWEST) {
+            if (!solver_init_glowest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_MIN_OVERLAP) {
+            if (!solver_init_min_overlap(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_LIKHO) {
             if (!solver_likho(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else {
