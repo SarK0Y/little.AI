@@ -1,6 +1,6 @@
 /* Benchmark of the starts -- majority, old/new rarest, glowest, min-overlapping,
- * Gob, Likho, Likho deep-dive, Likho pre-cooked with majority -- on random 3-SAT
- * or a DIMACS file.
+ * Gob, Likho, Likho deep-dive, Likho pre-cooked with majority, Gob on a square
+ * subsystem -- on random 3-SAT or a DIMACS file.
  *
  * The previous total-occurrence rarest order is reimplemented here as a
  * baseline (O(nv * clauses), benchmark-sized inputs only) and injected through
@@ -104,6 +104,7 @@ static void old_rarest(const Cnf *cnf, bool *a) {
 typedef struct {
     const char *name;
     size_t init_unsat, solved, sum_steps;
+    size_t sq_sel_bad, sq_rest_bad, sq_rest_total;   /* gob-square phase 3 only */
     double sec;
 } Row;
 
@@ -142,11 +143,12 @@ int main(int argc, char **argv) {
     cfg.max_steps = steps;
     cfg.restarts = restarts;
 
-    Row rows[9] = {
+    Row rows[10] = {
         { .name = "majority" }, { .name = "rarest-old" },
         { .name = "rarest-new" }, { .name = "glowest" },
         { .name = "min-overlap" }, { .name = "gob" },
         { .name = "likho" }, { .name = "likho-dd" }, { .name = "likho-pc" },
+        { .name = "gob-square" },
     };
     for (size_t sd = 1; sd <= seeds; sd++) {
         Gen g = { 0 };
@@ -164,7 +166,7 @@ int main(int argc, char **argv) {
         Cnf cnf = rc.val;
         nv = cnf.n_vars; nc = cnf.n_clauses;
 
-        for (int i = 0; i < 9; i++) {
+        for (int i = 0; i < 10; i++) {
             ResultSolver rs = solver_new(&cnf, cfg.seed);
             if (!rs.ok) { fprintf(stderr, "solver: %s\n", rs.err.msg); return 1; }
             Solver *s = rs.val;
@@ -195,6 +197,15 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "init: out of memory\n");
                     return 1;
                 }
+            } else if (i == 9) {
+                GobSquareCheck chk;
+                if (!solver_init_gob_square(s, &chk)) {
+                    fprintf(stderr, "init: out of memory\n");
+                    return 1;
+                }
+                rows[i].sq_sel_bad += chk.selected_bad;
+                rows[i].sq_rest_bad += chk.other_bad;
+                rows[i].sq_rest_total += chk.other_total;
             } else {
                 SolverConfig lc = cfg;
                 lc.likho_domains_first = i == 7;   /* likho-dd fires domains first */
@@ -239,11 +250,18 @@ int main(int argc, char **argv) {
     else printf("n=%zu ratio=%.1f clauses=%zu seeds=%zu\n", nv, ratio, nc, seeds);
     printf("budget=%zu steps x %zu attempts\n", steps, restarts + 1);
     printf("%-12s %12s %8s %12s %8s\n", "init", "init_unsat", "solved", "mean_steps", "sec");
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < 10; i++) {
         double init = (double)rows[i].init_unsat / (double)seeds;
         double mean = rows[i].solved ? (double)rows[i].sum_steps / (double)rows[i].solved : 0.0;
         printf("%-12s %12.1f %5zu/%-2zu %12.0f %8.1f\n",
                rows[i].name, init, rows[i].solved, seeds, mean, rows[i].sec);
+    }
+    {   /* phase 3 of gob-square: what the square solve does to the other rows */
+        const Row *r = &rows[9];
+        fprintf(stderr, "gob-square phase 3: selected rows missed %.1f, other rows missed %.1f of %.1f\n",
+               (double)r->sq_sel_bad / (double)seeds,
+               (double)r->sq_rest_bad / (double)seeds,
+               (double)r->sq_rest_total / (double)seeds);
     }
     return 0;
 }

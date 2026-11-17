@@ -101,6 +101,7 @@ typedef enum {
     INIT_GLOWEST,   /* constructive: most frequent variables first, see solver_init_glowest() */
     INIT_MIN_OVERLAP, /* constructive: most frequent first, then least-overlapping, see solver_init_min_overlap() */
     INIT_GOB,       /* linear relaxation of the clause system, see solver_init_gob() */
+    INIT_GOB_SQUARE, /* square subsystem of that system, see solver_init_gob_square() */
     INIT_LIKHO,     /* pre-cooked start (all false by default), then a one-flip-per-variable repair pass */
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
@@ -116,7 +117,7 @@ typedef struct {
     size_t likho_domain_max;    /* Likho: variables per switch domain, prime included */
     size_t likho_search_nodes;  /* Likho: backtracking budget per prime */
     bool likho_domains_first;   /* Likho: fire switch domains before neutral repairs */
-    InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY, INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP or INIT_GOB */
+    InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY, INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP, INIT_GOB or INIT_GOB_SQUARE */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -185,6 +186,19 @@ bool solver_init_min_overlap(Solver *s);
  * then a greedy pass flips bits that satisfy more rogue clauses than they break.
  * Deterministic, no RNG. false only on allocation failure. */
 bool solver_init_gob(Solver *s);
+/* What the square subsystem's solution does to the equations it was not built
+ * from: phase 3 of solver_init_gob_square(). */
+typedef struct {
+    size_t selected_bad;   /* selected (square) equations the real solution misses */
+    size_t other_bad;      /* unselected equations the real solution misses */
+    size_t other_total;    /* unselected equations checked */
+} GobSquareCheck;
+/* Gob over a square subsystem: pick n of the m equations (strided, one every
+ * m/n clauses), solve just those by Kaczmarz, report what the solution does to
+ * the rest, then decode and repair exactly like solver_init_gob(). The rows can
+ * be dependent and the values are fractional, so this is a seed, not a solve.
+ * `check` may be NULL. Deterministic, no RNG. false only on allocation failure. */
+bool solver_init_gob_square(Solver *s, GobSquareCheck *check);
 void solver_init_majority(Solver *s);                  /* majority-polarity start (ties use the solver RNG) */
 /* Likho: phase 1 is cfg->likho_pre_cook (all-false by default), then a repair
  * pass that flips an unflipped neutral variable in a rogue clause (always

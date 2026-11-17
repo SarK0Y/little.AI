@@ -642,7 +642,7 @@ bool solver_init_rarest(Solver *s) { return init_order(s, ORDER_RAREST); }
 bool solver_init_glowest(Solver *s) { return init_order(s, ORDER_GLOWEST); }
 bool solver_init_min_overlap(Solver *s) { return init_order(s, ORDER_MIN_OVERLAP); }
 
-/* ---- Gob: linear relaxation of the clause system ------------------------ */
+/* ---- Gob: linear relaxation of the clause system (full or square) ------ */
 
 /* Every clause becomes the signed equation sum(+-x) = 1: a positive literal is
  * +x, a negative one -x. Cyclic Kaczmarz projections (one per clause per sweep)
@@ -652,27 +652,25 @@ bool solver_init_min_overlap(Solver *s) { return init_order(s, ORDER_MIN_OVERLAP
  * satisfies more rogue clauses than it breaks, adapting the bits to the formula.
  * Deterministic, no RNG. */
 #define GOB_SWEEPS 64     /* Kaczmarz passes over the whole clause system */
+#define GOB_SQUARE_SWEEPS 512  /* the square system converges slower than the full one */
 #define GOB_PASSES 4      /* greedy adaptation passes over the decoded bits */
 
-bool solver_init_gob(Solver *s) {
-    const Cnf *cnf = s->cnf;
-    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
-    double *v = calloc(nv ? nv : 1, sizeof *v);
-    bool *a = malloc((nv ? nv : 1) * sizeof *a);
-    if (!v || !a) { free(v); free(a); return false; }
-    for (size_t sweep = 0; sweep < GOB_SWEEPS; sweep++) {
-        for (size_t ci = 0; ci < nc; ci++) {
-            const Lit *cl = cnf_clause(cnf, ci);
-            size_t len = cnf_clause_len(cnf, ci);
-            if (len == 0) continue;
-            double sum = 0;
-            for (size_t k = 0; k < len; k++)
-                sum += cl[k].positive ? v[cl[k].var] : -v[cl[k].var];
-            double step = (1.0 - sum) / (double)len;
-            for (size_t k = 0; k < len; k++)
-                v[cl[k].var] += cl[k].positive ? step : -step;
-        }
-    }
+/* One exact Kaczmarz projection of the real vector onto clause ci's equation. */
+static void gob_project(const Cnf *cnf, double *v, size_t ci) {
+    const Lit *cl = cnf_clause(cnf, ci);
+    size_t len = cnf_clause_len(cnf, ci);
+    if (len == 0) return;
+    double sum = 0;
+    for (size_t k = 0; k < len; k++)
+        sum += cl[k].positive ? v[cl[k].var] : -v[cl[k].var];
+    double step = (1.0 - sum) / (double)len;
+    for (size_t k = 0; k < len; k++)
+        v[cl[k].var] += cl[k].positive ? step : -step;
+}
+
+/* Decode the real vector to booleans, then run the greedy repair passes. */
+static void gob_decode_and_repair(Solver *s, const double *v, bool *a) {
+    size_t nv = s->cnf->n_vars;
     for (size_t i = 0; i < nv; i++) {
         double u = v[i];
         if (u < 0) {                                  /* shift the negative away */
@@ -683,7 +681,6 @@ bool solver_init_gob(Solver *s) {
         a[i] = (((long long)(u + 0.5)) & 1) != 0;     /* round to nearest, mod 2 */
     }
     solver_set_assignment(s, a);
-    free(v); free(a);
     for (int pass = 0; pass < GOB_PASSES; pass++) {   /* step 4: best correlation */
         size_t flips = 0;
         for (size_t i = 0; i < nv; i++) {
@@ -693,6 +690,48 @@ bool solver_init_gob(Solver *s) {
         }
         if (flips == 0) break;
     }
+}
+
+bool solver_init_gob(Solver *s) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
+    double *v = calloc(nv ? nv : 1, sizeof *v);
+    bool *a = malloc((nv ? nv : 1) * sizeof *a);
+    if (!v || !a) { free(v); free(a); return false; }
+    for (size_t sweep = 0; sweep < GOB_SWEEPS; sweep++)
+        for (size_t ci = 0; ci < nc; ci++) gob_project(cnf, v, ci);
+    gob_decode_and_repair(s, v, a);
+    free(v); free(a);
+    return true;
+}
+
+bool solver_init_gob_square(Solver *s, GobSquareCheck *check) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
+    double *v = calloc(nv ? nv : 1, sizeof *v);
+    bool *a = malloc((nv ? nv : 1) * sizeof *a);
+    bool *sel = calloc(nc ? nc : 1, 1);
+    if (!v || !a || !sel) { free(v); free(a); free(sel); return false; }
+    size_t neq = nv < nc ? nv : nc;                 /* phase 1: n of the m equations */
+    for (size_t ei = 0; ei < neq; ei++) sel[ei * nc / neq] = true;
+    for (size_t sweep = 0; sweep < GOB_SQUARE_SWEEPS; sweep++)      /* phase 2 */
+        for (size_t ci = 0; ci < nc; ci++)
+            if (sel[ci]) gob_project(cnf, v, ci);
+    if (check) {                                    /* phase 3: the rest of the system */
+        check->selected_bad = check->other_bad = check->other_total = 0;
+        for (size_t ci = 0; ci < nc; ci++) {
+            const Lit *cl = cnf_clause(cnf, ci);
+            size_t len = cnf_clause_len(cnf, ci);
+            double sum = 0;
+            for (size_t k = 0; k < len; k++)
+                sum += cl[k].positive ? v[cl[k].var] : -v[cl[k].var];
+            bool bad = len && (sum < 1.0 - 1e-9 || sum > 1.0 + 1e-9);
+            if (sel[ci]) { if (bad) check->selected_bad++; }
+            else { check->other_total++; if (bad) check->other_bad++; }
+        }
+    }
+    gob_decode_and_repair(s, v, a);
+    free(v); free(a); free(sel);
     return true;
 }
 
@@ -842,6 +881,7 @@ bool solver_likho(Solver *s, const SolverConfig *cfg) {
     else if (pre == INIT_GLOWEST) { if (!solver_init_glowest(s)) return false; }
     else if (pre == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(s)) return false; }
     else if (pre == INIT_GOB) { if (!solver_init_gob(s)) return false; }
+    else if (pre == INIT_GOB_SQUARE) { if (!solver_init_gob_square(s, NULL)) return false; }
     else {
         memset(s->assignment, 0, nv * sizeof *s->assignment);
         rebuild_counts(s);
@@ -947,6 +987,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_min_overlap(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GOB) {
             if (!solver_init_gob(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_GOB_SQUARE) {
+            if (!solver_init_gob_square(s, NULL)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_LIKHO) {
             if (!solver_likho(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else {

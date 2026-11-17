@@ -651,6 +651,77 @@ static void test_init_gob_hand_checked(void) {
     solver_free(s); cnf_free(&g);
 }
 
+static void test_init_gob_square_hand_checked(void) {
+    /* Square system == the whole system here (n == m), so the decode matches gob:
+     * (true, false, true). Phase 3 has no other rows to check. */
+    Cnf c = must_parse("p cnf 3 3\n1 0\n-2 0\n3 0\n");
+    Solver *s = must_solver(&c, 1);
+    GobSquareCheck chk;
+    CHECK(solver_init_gob_square(s, &chk));
+    const bool *a = solver_assignment(s);
+    CHECK(a[0] && !a[1] && a[2]);
+    CHECK(solver_unsatisfied_count(s) == 0);
+    CHECK(chk.selected_bad == 0);
+    CHECK(chk.other_total == 0 && chk.other_bad == 0);
+    solver_free(s); cnf_free(&c);
+
+    /* m > n: exactly n rows are selected, the other m - n are reported on. */
+    Cnf d = must_parse("p cnf 2 3\n1 2 0\n1 -2 0\n-1 2 0\n");
+    s = must_solver(&d, 1);
+    CHECK(solver_init_gob_square(s, &chk));
+    CHECK(chk.other_total == 1);
+    CHECK(chk.other_bad <= chk.other_total);
+    CHECK(solver_unsatisfied_count(s) == brute_unsat(&d, solver_assignment(s)));
+    solver_free(s); cnf_free(&d);
+
+    /* Empty clause and empty formula: no crash; the empty clause stays rogue. */
+    Cnf f = must_parse("p cnf 1 1\n0\n");
+    s = must_solver(&f, 1);
+    CHECK(solver_init_gob_square(s, NULL));                /* the check is optional */
+    CHECK(solver_unsatisfied_count(s) == 1);
+    solver_free(s); cnf_free(&f);
+
+    Cnf g = must_parse("p cnf 0 0\n");
+    s = must_solver(&g, 1);
+    CHECK(solver_init_gob_square(s, &chk));
+    CHECK(solver_unsatisfied_count(s) == 0);
+    CHECK(chk.selected_bad == 0 && chk.other_bad == 0);
+    solver_free(s); cnf_free(&g);
+}
+
+static void test_init_gob_square_properties(void) {
+    SolverConfig cfg = solver_config_default();
+    cfg.init = INIT_GOB_SQUARE;
+    cfg.max_steps = 20000; cfg.restarts = 2;
+    for (int i = 0; i < 25; i++) {
+        int n = 60 + 20 * (i % 4);
+        Cnf c = random_cnf(n, (int)(n * (2.0 + 0.4 * (i % 5))), 1000 + (uint64_t)i);
+        Solver *a = must_solver(&c, 1), *b = must_solver(&c, 99);   /* different RNG seeds: no randomness used */
+        GobSquareCheck ca, cb;
+        CHECK(solver_init_gob_square(a, &ca) && solver_init_gob_square(b, &cb));
+        CHECK(memcmp(solver_assignment(a), solver_assignment(b), c.n_vars) == 0);   /* deterministic */
+        CHECK(ca.selected_bad == cb.selected_bad && ca.other_bad == cb.other_bad);  /* check too */
+        CHECK(solver_unsatisfied_count(a) == brute_unsat(&c, solver_assignment(a)));/* counters consistent */
+        CHECK(ca.selected_bad + ca.other_bad <= c.n_clauses);
+        CHECK(ca.other_total <= c.n_clauses);
+        solver_free(a); solver_free(b);
+
+        Solver *s = must_solver(&c, 5);                       /* plain solver from the square start */
+        ResultSolve r = solver_solve(s, &cfg);
+        CHECK(r.ok);
+        if (r.ok && r.val.status == SOLVE_SAT) CHECK(verify(&c, r.val.assignment, r.val.n_vars));
+        if (r.ok) solve_result_free(&r.val);
+        solver_free(s);
+
+        GroupConfig gc = group_config_default();               /* and the group solver */
+        gc.max_groups = 64;
+        ResultGroup g = group_solve(&c, &cfg, &gc);
+        CHECK(g.ok);
+        if (g.ok) { check_group_result(&c, &g.val); group_result_free(&g.val); }
+        cnf_free(&c);
+    }
+}
+
 static void test_init_gob_properties(void) {
     SolverConfig cfg = solver_config_default();
     cfg.init = INIT_GOB;
@@ -871,6 +942,14 @@ static void test_likho_pre_cook(void) {
     cfg.likho_pre_cook = INIT_GOB;
     m = must_solver(&c, 1); s = must_solver(&c, 1);
     CHECK(solver_init_gob(m));
+    CHECK(solver_unsatisfied_count(m) == 0);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
+    solver_free(m); solver_free(s);
+
+    cfg.likho_pre_cook = INIT_GOB_SQUARE;
+    m = must_solver(&c, 1); s = must_solver(&c, 1);
+    CHECK(solver_init_gob_square(m, NULL));
     CHECK(solver_unsatisfied_count(m) == 0);
     CHECK(solver_likho(s, &cfg));
     CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
@@ -1202,8 +1281,10 @@ int main(void) {
     test_init_glowest_hand_checked();
     test_init_min_overlap_hand_checked();
     test_init_gob_hand_checked();
+    test_init_gob_square_hand_checked();
     test_init_rarest_properties();
     test_init_gob_properties();
+    test_init_gob_square_properties();
     test_likho_neutral_repair();
     test_likho_domain_repair();
     test_likho_switch_domain_chain();
