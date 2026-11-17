@@ -100,8 +100,9 @@ static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "rarest") == 0) cli->cfg.init = INIT_RAREST;
     else if (strcmp(value, "glowest") == 0) cli->cfg.init = INIT_GLOWEST;
     else if (strcmp(value, "min-overlapping") == 0) cli->cfg.init = INIT_MIN_OVERLAP;
+    else if (strcmp(value, "gob") == 0) cli->cfg.init = INIT_GOB;
     else if (strcmp(value, "likho") == 0) cli->cfg.init = INIT_LIKHO;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|likho)", flag, value);
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|likho)", flag, value);
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
@@ -110,7 +111,8 @@ static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "rarest") == 0) cli->cfg.likho_pre_cook = INIT_RAREST;
     else if (strcmp(value, "glowest") == 0) cli->cfg.likho_pre_cook = INIT_GLOWEST;
     else if (strcmp(value, "min-overlapping") == 0) cli->cfg.likho_pre_cook = INIT_MIN_OVERLAP;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected zero|majority|rarest|glowest|min-overlapping)", flag, value);
+    else if (strcmp(value, "gob") == 0) cli->cfg.likho_pre_cook = INIT_GOB;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected zero|majority|rarest|glowest|min-overlapping|gob)", flag, value);
     cli->cfg.init = INIT_LIKHO;   /* pre-cook is a Likho mode */
     return OK_UNIT(ResultUnit);
 }
@@ -163,9 +165,9 @@ static void usage(void) {
         "                      [--strategy ranked|greedy|random] [--progress N] [--out FILE]\n"
         "                      [--mode plain|groups] [--max-groups 1..1024] [--merge free|directed]\n"
         "                      [--diversify N] [--group-len N]\n"
-        "                      [--init majority|rarest|glowest|min-overlapping|likho]\n"
+        "                      [--init majority|rarest|glowest|min-overlapping|gob|likho]\n"
         "                      [-deep-dive VARS NODES]\n"
-        "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping]\n");
+        "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob]\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {

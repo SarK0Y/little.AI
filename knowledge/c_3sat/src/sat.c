@@ -642,6 +642,60 @@ bool solver_init_rarest(Solver *s) { return init_order(s, ORDER_RAREST); }
 bool solver_init_glowest(Solver *s) { return init_order(s, ORDER_GLOWEST); }
 bool solver_init_min_overlap(Solver *s) { return init_order(s, ORDER_MIN_OVERLAP); }
 
+/* ---- Gob: linear relaxation of the clause system ------------------------ */
+
+/* Every clause becomes the signed equation sum(+-x) = 1: a positive literal is
+ * +x, a negative one -x. Cyclic Kaczmarz projections (one per clause per sweep)
+ * solve it in the least-squares sense. Each value is then shifted by the
+ * smallest non-negative amount (so -x = 1 decodes to false, not true), rounded,
+ * and taken mod 2. A greedy pass then flips a decoded variable whenever it
+ * satisfies more rogue clauses than it breaks, adapting the bits to the formula.
+ * Deterministic, no RNG. */
+#define GOB_SWEEPS 64     /* Kaczmarz passes over the whole clause system */
+#define GOB_PASSES 4      /* greedy adaptation passes over the decoded bits */
+
+bool solver_init_gob(Solver *s) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
+    double *v = calloc(nv ? nv : 1, sizeof *v);
+    bool *a = malloc((nv ? nv : 1) * sizeof *a);
+    if (!v || !a) { free(v); free(a); return false; }
+    for (size_t sweep = 0; sweep < GOB_SWEEPS; sweep++) {
+        for (size_t ci = 0; ci < nc; ci++) {
+            const Lit *cl = cnf_clause(cnf, ci);
+            size_t len = cnf_clause_len(cnf, ci);
+            if (len == 0) continue;
+            double sum = 0;
+            for (size_t k = 0; k < len; k++)
+                sum += cl[k].positive ? v[cl[k].var] : -v[cl[k].var];
+            double step = (1.0 - sum) / (double)len;
+            for (size_t k = 0; k < len; k++)
+                v[cl[k].var] += cl[k].positive ? step : -step;
+        }
+    }
+    for (size_t i = 0; i < nv; i++) {
+        double u = v[i];
+        if (u < 0) {                                  /* shift the negative away */
+            long long sh = (long long)(-u);
+            if ((double)sh < -u) sh++;
+            u += (double)sh;
+        }
+        a[i] = (((long long)(u + 0.5)) & 1) != 0;     /* round to nearest, mod 2 */
+    }
+    solver_set_assignment(s, a);
+    free(v); free(a);
+    for (int pass = 0; pass < GOB_PASSES; pass++) {   /* step 4: best correlation */
+        size_t flips = 0;
+        for (size_t i = 0; i < nv; i++) {
+            refresh_var(s, i);
+            const VarStats *st = &s->stats[i];
+            if (st->make_count > st->break_count) { solver_flip(s, i); flips++; }
+        }
+        if (flips == 0) break;
+    }
+    return true;
+}
+
 /* ---- Likho: zero start + switch-domain repair pass --------------------- */
 
 /* A switch domain of a prime is the set of unflipped variables that must flip
@@ -787,6 +841,7 @@ bool solver_likho(Solver *s, const SolverConfig *cfg) {
     else if (pre == INIT_RAREST) { if (!solver_init_rarest(s)) return false; }
     else if (pre == INIT_GLOWEST) { if (!solver_init_glowest(s)) return false; }
     else if (pre == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(s)) return false; }
+    else if (pre == INIT_GOB) { if (!solver_init_gob(s)) return false; }
     else {
         memset(s->assignment, 0, nv * sizeof *s->assignment);
         rebuild_counts(s);
@@ -890,6 +945,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_glowest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_MIN_OVERLAP) {
             if (!solver_init_min_overlap(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_GOB) {
+            if (!solver_init_gob(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_LIKHO) {
             if (!solver_likho(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else {

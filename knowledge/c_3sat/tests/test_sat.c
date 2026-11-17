@@ -609,6 +609,77 @@ static void test_init_min_overlap_hand_checked(void) {
     cnf_free(&c);
 }
 
+static void test_init_gob_hand_checked(void) {
+    /* Units pin the decode: 1 is +x = 1, -2 is -x = 1 (shifted to false), 3 is
+     * +x = 1, so the start is exactly (true, false, true). */
+    Cnf c = must_parse("p cnf 3 3\n1 0\n-2 0\n3 0\n");
+    Solver *s = must_solver(&c, 1);
+    CHECK(solver_init_gob(s));
+    const bool *a = solver_assignment(s);
+    CHECK(a[0] && !a[1] && a[2]);
+    CHECK(solver_unsatisfied_count(s) == 0);
+    solver_free(s); cnf_free(&c);
+
+    /* A single clause 1 2 projects to (1/2, 1/2): both round up, so it holds. */
+    Cnf d = must_parse("p cnf 2 1\n1 2 0\n");
+    s = must_solver(&d, 1);
+    CHECK(solver_init_gob(s));
+    a = solver_assignment(s);
+    CHECK(a[0] && a[1] && solver_unsatisfied_count(s) == 0);
+    solver_free(s); cnf_free(&d);
+
+    /* Mixed signs: (1 -2) projects to (1/2, -1/2); -1/2 shifts to +1/2, so both
+     * decode true and the clause holds. */
+    Cnf e = must_parse("p cnf 2 1\n1 -2 0\n");
+    s = must_solver(&e, 1);
+    CHECK(solver_init_gob(s));
+    a = solver_assignment(s);
+    CHECK(a[0] && a[1] && solver_unsatisfied_count(s) == 0);
+    solver_free(s); cnf_free(&e);
+
+    /* Empty clause and empty formula: no crash, the empty clause stays rogue. */
+    Cnf f = must_parse("p cnf 1 1\n0\n");
+    s = must_solver(&f, 1);
+    CHECK(solver_init_gob(s));
+    CHECK(solver_unsatisfied_count(s) == 1);
+    solver_free(s); cnf_free(&f);
+
+    Cnf g = must_parse("p cnf 0 0\n");
+    s = must_solver(&g, 1);
+    CHECK(solver_init_gob(s));
+    CHECK(solver_unsatisfied_count(s) == 0);
+    solver_free(s); cnf_free(&g);
+}
+
+static void test_init_gob_properties(void) {
+    SolverConfig cfg = solver_config_default();
+    cfg.init = INIT_GOB;
+    cfg.max_steps = 20000; cfg.restarts = 2;
+    for (int i = 0; i < 25; i++) {
+        int n = 60 + 20 * (i % 4);
+        Cnf c = random_cnf(n, (int)(n * (2.0 + 0.4 * (i % 5))), 900 + (uint64_t)i);
+        Solver *a = must_solver(&c, 1), *b = must_solver(&c, 99);   /* different RNG seeds: no randomness used */
+        CHECK(solver_init_gob(a) && solver_init_gob(b));
+        CHECK(memcmp(solver_assignment(a), solver_assignment(b), c.n_vars) == 0);   /* deterministic */
+        CHECK(solver_unsatisfied_count(a) == brute_unsat(&c, solver_assignment(a))); /* counters consistent */
+        solver_free(a); solver_free(b);
+
+        Solver *s = must_solver(&c, 5);                       /* plain solver from the gob start */
+        ResultSolve r = solver_solve(s, &cfg);
+        CHECK(r.ok);
+        if (r.ok && r.val.status == SOLVE_SAT) CHECK(verify(&c, r.val.assignment, r.val.n_vars));
+        if (r.ok) solve_result_free(&r.val);
+        solver_free(s);
+
+        GroupConfig gc = group_config_default();               /* and the group solver */
+        gc.max_groups = 64;
+        ResultGroup g = group_solve(&c, &cfg, &gc);
+        CHECK(g.ok);
+        if (g.ok) { check_group_result(&c, &g.val); group_result_free(&g.val); }
+        cnf_free(&c);
+    }
+}
+
 static void test_init_rarest_properties(void) {
     SolverConfig cfg = solver_config_default();
     cfg.init = INIT_RAREST;
@@ -792,6 +863,14 @@ static void test_likho_pre_cook(void) {
     cfg.likho_pre_cook = INIT_MIN_OVERLAP;
     m = must_solver(&c, 1); s = must_solver(&c, 1);
     CHECK(solver_init_min_overlap(m));
+    CHECK(solver_unsatisfied_count(m) == 0);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
+    solver_free(m); solver_free(s);
+
+    cfg.likho_pre_cook = INIT_GOB;
+    m = must_solver(&c, 1); s = must_solver(&c, 1);
+    CHECK(solver_init_gob(m));
     CHECK(solver_unsatisfied_count(m) == 0);
     CHECK(solver_likho(s, &cfg));
     CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
@@ -1122,7 +1201,9 @@ int main(void) {
     test_init_rarest_hand_checked();
     test_init_glowest_hand_checked();
     test_init_min_overlap_hand_checked();
+    test_init_gob_hand_checked();
     test_init_rarest_properties();
+    test_init_gob_properties();
     test_likho_neutral_repair();
     test_likho_domain_repair();
     test_likho_switch_domain_chain();

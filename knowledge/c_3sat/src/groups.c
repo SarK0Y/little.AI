@@ -203,6 +203,7 @@ ResultGroup group_solve(const Cnf *cnf, const SolverConfig *cfg, const GroupConf
     if (cfg->init == INIT_RAREST) { if (!solver_init_rarest(full)) NOMEM(); }
     else if (cfg->init == INIT_GLOWEST) { if (!solver_init_glowest(full)) NOMEM(); }
     else if (cfg->init == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(full)) NOMEM(); }
+    else if (cfg->init == INIT_GOB) { if (!solver_init_gob(full)) NOMEM(); }
     else if (cfg->init == INIT_LIKHO) { if (!solver_likho(full, cfg)) NOMEM(); }
     else solver_init_majority(full);
     bool converged = false;

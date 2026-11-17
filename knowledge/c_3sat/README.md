@@ -85,22 +85,24 @@ Adding a heuristic = write a `PickFn`, add one row to `STRATEGIES`.
 
 ## Initial assignment (`--init`)
 
-Restart 0 starts from one of five starts (later restarts are always random):
+Restart 0 starts from one of six starts (later restarts are always random):
 
 - `--init majority` (default): every variable takes its majority polarity.
 - `--init rarest`: deterministic constructive start (no RNG), rarest variables first.
 - `--init glowest`: deterministic constructive start, most frequent variables first.
 - `--init min-overlapping`: deterministic constructive start, first the most
   frequent variable, then the one overlapping the solved part least.
+- `--init gob`: deterministic linear-relaxation start (no RNG), clauses as signed
+  equations solved by Kaczmarz sweeps and decoded mod 2.
 - `--init likho`: all false, then a neutral/switch-domain repair pass.
 - `-deep-dive VARS NODES`: implies `--init likho`, caps switch domains at VARS
   variables, gives each prime at most NODES search nodes, and fires domains
   before neutral repairs.
-- `-pre-cook zero|majority|rarest|glowest|min-overlapping`: implies `--init likho`;
+- `-pre-cook zero|majority|rarest|glowest|min-overlapping|gob`: implies `--init likho`;
   phase 1 is that assignment instead of the default all-false one (a partially
   solved input).
 
-The five starts work in both `plain` and `groups` mode; `-deep-dive` is a variant
+The six starts work in both `plain` and `groups` mode; `-deep-dive` is a variant
 of `likho`.
 
 ### Rarest / Glowest / Min-overlapping
@@ -121,6 +123,21 @@ They differ only in which unset variable is picked next:
   occurrences)** (ties by id). A variable that occurs nowhere has no ratio and
   goes last. The point is to keep picking variables mostly outside the clauses
   the first pick already satisfied, instead of following the same subsystem.
+
+### Gob
+
+`--init gob` is a linear relaxation, not a clause walk. Each clause becomes the
+signed equation `sum(±x) = 1` (a positive literal is `+x`, a negative one `-x`),
+and 64 cyclic Kaczmarz sweeps project the all-zero vector onto that system (one
+exact projection per clause per sweep). Each value is then shifted by the
+smallest non-negative amount, rounded to the nearest integer and taken mod 2,
+which decodes the real vector to booleans. The shift is per variable, not global,
+because a global shift cannot satisfy mixed-sign units: `(x)` and `(-x)` always
+decode to the same parity.
+
+The decode is only a starting point, so four greedy passes follow: a variable
+whose bit satisfies more rogue clauses than it breaks is flipped, using the same
+incremental counts as the search. Deterministic, no RNG.
 
 ### Likho
 
@@ -156,15 +173,15 @@ inherits the majority phase's RNG tie-breaking.
 Measured on random 3-SAT, 10 seeds per row (3 seeds for the 5000-var row), 20
 restarts, default solver seed. "old" is the previous total-occurrence rarest order,
 kept for comparison; "likho-dd" is `-deep-dive 32 128`, "likho-pc" is
-`-pre-cook majority`. All eight starts share the same search code:
+`-pre-cook majority`. All nine starts share the same search code:
 
-| instance | broken after init (maj / old / new / glow / mo / likho / dd / pc) | solved | mean flips over solved (maj / old / new / glow / mo / likho / dd / pc) |
+| instance | broken after init (maj / old / new / glow / mo / gob / likho / dd / pc) | solved | mean flips over solved (maj / old / new / glow / mo / gob / likho / dd / pc) |
 |---|---|---|---|
-| 1000 vars, ratio 2.0 | 78 / 15 / 28 / 4.5 / 12.7 / 0 / 0.2 / 0 | 10/10 each | 88 / 47 / 67 / 26 / 27 / 0 / 1 / 0 |
-| 1000 vars, ratio 3.5 | 187 / 77 / 98 / 37 / 58 / 34 / 32 / 10 | 10/10 each | 11.1k / 16.1k / 12.0k / 19.4k / 7.2k / 18.1k / 17.6k / 9.8k |
-| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 / 783 / 1213 / 742 / 637 / 209 | 9/10, 9/10, 9/10, 10/10, 8/10, 0/10, 0/10, 9/10 | 123k / 169k / 162k / 129k / 143k / — / — / 129k |
-| 5000 vars, ratio 3.9 | 1098 / 482 / 631 / 274 / 396 / 385 / 337 / 126 | 2/3 each | 3.06M / 0.76M / 1.84M / 4.40M / 4.40M / 4.40M / 4.40M / 5.68M |
-| AIM yes-set, 48 instances | 46 / 18 / 21 / 16.7 / 19.0 / 23 / 22 / 22 | 27 / 31 / 31 / 31 / 31 / 31 / 31 / 27 | — |
+| 1000 vars, ratio 2.0 | 78 / 15 / 28 / 4.5 / 12.7 / 14.2 / 0 / 0.2 / 0 | 10/10 each | 88 / 47 / 67 / 26 / 27 / 110 / 0 / 1 / 0 |
+| 1000 vars, ratio 3.5 | 187 / 77 / 98 / 37 / 58 / 61 / 34 / 32 / 10 | 10/10 each | 11.1k / 16.1k / 12.0k / 19.4k / 7.2k / 14.1k / 18.1k / 17.6k / 9.8k |
+| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 / 783 / 1213 / 1275 / 742 / 637 / 209 | 9/10, 9/10, 9/10, 10/10, 8/10, 0/10, 0/10, 0/10, 9/10 | 123k / 169k / 162k / 129k / 143k / — / — / — / 129k |
+| 5000 vars, ratio 3.9 | 1098 / 482 / 631 / 274 / 396 / 411 / 385 / 337 / 126 | 2/3 each | 3.06M / 0.76M / 1.84M / 4.40M / 4.40M / 1.88M / 4.40M / 4.40M / 5.68M |
+| AIM yes-set, 48 instances | 46 / 18 / 21 / 16.7 / 19.0 / 17.2 / 23 / 22 / 22 | 27 / 31 / 31 / 31 / 31 / 31 / 31 / 31 / 27 | — |
 
 `glowest` is the best init here. It leaves fewer broken clauses than rarest-new on
 every random row (4.5 vs 28, 37 vs 98, 274 vs 631, 783 vs 2024) and at 20000/3.5 it
@@ -179,6 +196,13 @@ rarest's low-overlap-first pass leaves clauses hanging on a single literal.
 variables mostly outside the solved part, so the search does not re-enter the same
 subsystem. It does not scale as well, though: at 20000/3.5 it solves 8/10 where
 glowest solves 10/10.
+
+`gob` is competitive at 1000 vars (init 14.2 / 61, next to min-overlapping's
+12.7 / 58; 110 / 14.1k flips) and on the AIM yes-set (17.2 broken, second only to
+glowest's 16.7, and the same 31/48). At 5000/3.9 its 1.88M mean flips is second
+only to rarest-old, but at 20000/3.5 it solves 0/10 like the zero start: 1275
+broken clauses still sit in a deep basin. The linear relaxation finds a good
+decode, not a good basin.
 
 The zero start still leaves 3-5x fewer broken clauses than majority, and it solves
 1000/2.0 outright at init (zero flips), but it is a much deeper local minimum. At
@@ -216,7 +240,7 @@ is hit the same way: its leftover barely changed (e.g. 105.7 -> 95.0 unmerged at
 ### Coverage: instances no start can solve
 
 The per-start counts above hide whether a failure is shared. Taking the union over
-all eight starts:
+all nine starts:
 
 - **Random 3-SAT: 0 unsolved by all.** Every generated instance in the table was
   solved by at least one start, even where individual starts missed it (e.g. the
@@ -226,17 +250,17 @@ all eight starts:
   50-var `50-1_6-yes1-{1,2}` (2), 100-var `100-1_6-yes1-{1..4}` and
   `100-2_0-yes1-{1,2,4}` (7), 200-var `200-1_6-yes1-{1..4}` and
   `200-2_0-yes1-{1..4}` (8).
-- The AIM union is exactly rarest's 31: `glowest`, `min-overlapping`, zero-start
-  Likho and deep-dive each solve that identical set, so the extra starts add no
-  new instance beyond rarest. Only `majority` and the majority pre-cook miss four
-  of them.
+- The AIM union is exactly rarest's 31: `glowest`, `min-overlapping`, `gob`,
+  zero-start Likho and deep-dive each solve that identical set, so the extra starts
+  add no new instance beyond rarest. Only `majority` and the majority pre-cook miss
+  four of them.
 
 Reproduce with `make bench-rarest ARGS="1000 3.5 10 200000 9"` (or
 `ARGS="file.cnf 100000 20"`); `steps = 0` measures init quality only. The harness
-also reimplements the old total-occurrence order as a baseline, so all eight starts
+also reimplements the old total-occurrence order as a baseline, so all nine starts
 run the same search code; its glowest row is `--init glowest`, its min-overlapping
-row is `--init min-overlapping`, its deep-dive row uses `-deep-dive 32 128` and its
-pre-cook row uses `-pre-cook majority`.
+row is `--init min-overlapping`, its gob row is `--init gob`, its deep-dive row
+uses `-deep-dive 32 128` and its pre-cook row uses `-pre-cook majority`.
 
 ## Group mode (`--mode groups`)
 
