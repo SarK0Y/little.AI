@@ -1,0 +1,218 @@
+/* context-3sat (C port): incremental 3-SAT stochastic local search.
+ *
+ * Returns SAT when it finds a verified satisfying assignment and UNKNOWN when
+ * the budget ends. Local search cannot prove UNSAT, but a contradictory unit
+ * pair -- `(x)` and `(-x)` -- is checked up front and reported as UNSAT.
+ */
+#ifndef C3SAT_SAT_H
+#define C3SAT_SAT_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "result.h"
+
+/* ---- CNF -------------------------------------------------------------- */
+
+typedef struct {
+    uint32_t var;   /* 0-based */
+    bool positive;
+} Lit;
+
+/* Flat (CSR) layout: clause i is lits[off[i] .. off[i+1]). Owns its memory. */
+typedef struct {
+    size_t n_vars;
+    size_t n_clauses;
+    size_t *off;    /* n_clauses + 1 entries */
+    Lit *lits;
+} Cnf;
+
+typedef RESULT(Cnf) ResultCnf;
+
+ResultCnf cnf_from_dimacs_str(const char *input);
+ResultCnf cnf_from_dimacs_file(const char *path);
+void cnf_free(Cnf *cnf);
+/* Build a clause-system copy with synchronous and asynchronous twin clauses removed.
+ * Clause literal order is ignored; async twins invert every literal. Keeps the first. */
+bool no_twins(const Cnf *src, Cnf *out);
+bool cnf_is_3sat(const Cnf *cnf);
+static inline size_t cnf_clause_len(const Cnf *c, size_t i) { return c->off[i + 1] - c->off[i]; }
+static inline const Lit *cnf_clause(const Cnf *c, size_t i) { return c->lits + c->off[i]; }
+static inline bool lit_value(Lit l, bool assignment) { return assignment == l.positive; }
+
+bool verify(const Cnf *cnf, const bool *assignment, size_t len);
+
+/* ---- RNG (xorshift64) ------------------------------------------------- */
+
+typedef struct { uint64_t state; } Rng;
+
+static inline Rng rng_new(uint64_t seed) {
+    return (Rng){ seed ? seed : 0xa0761d6478bd642fULL };
+}
+static inline uint64_t rng_next_u64(Rng *r) {
+    uint64_t x = r->state;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return r->state = x;
+}
+static inline bool rng_bool(Rng *r) { return rng_next_u64(r) & 1; }
+static inline double rng_f64(Rng *r) { return (double)(rng_next_u64(r) >> 11) / 9007199254740992.0; }
+static inline size_t rng_index(Rng *r, size_t upper) { return (size_t)rng_next_u64(r) % upper; }
+
+/* ---- states ----------------------------------------------------------- */
+
+/* Rogue is deliberately NOT a variable state: only clauses can be rogue. */
+typedef enum { VAR_UNUSED, VAR_PRIME, VAR_NEUTRAL } VarState;
+
+typedef struct {
+    VarState state;
+    size_t min_support;            /* meaningful for VAR_NEUTRAL */
+    size_t satisfied_occurrences;  /* clauses where this var's literal is true */
+    size_t rogue_occurrences;      /* incidence count only; never makes the var rogue */
+    size_t break_count;
+    size_t make_count;
+    size_t rank;                   /* position among the last ranked candidates */
+} VarStats;
+
+/* One flip candidate from a rogue clause, already scored. */
+typedef struct {
+    size_t var;
+    uint8_t cls;      /* 0 neutral, 1 prime, 2 unused */
+    size_t support;
+    size_t breaks;
+    size_t makes;
+} Candidate;
+
+/* ---- function-as-variable hooks --------------------------------------- */
+
+/* Choose which variable to flip from n >= 1 candidates sorted best-first. */
+typedef size_t (*PickFn)(Rng *rng, const Candidate *cands, size_t n, double noise);
+/* Optional observer, called every `progress_every` flips. */
+typedef void (*ProgressFn)(void *ctx, size_t steps, size_t unsatisfied);
+
+size_t pick_ranked(Rng *rng, const Candidate *c, size_t n, double noise); /* default */
+size_t pick_greedy(Rng *rng, const Candidate *c, size_t n, double noise); /* noise-free */
+size_t pick_random(Rng *rng, const Candidate *c, size_t n, double noise); /* uniform */
+
+typedef struct { const char *name; PickFn fn; } Strategy;
+extern const Strategy STRATEGIES[];
+extern const size_t N_STRATEGIES;
+PickFn pick_fn_by_name(const char *name); /* NULL if unknown */
+
+/* Where restart 0 starts from (later restarts are random). */
+typedef enum {
+    INIT_MAJORITY,  /* every variable takes its majority polarity (default) */
+    INIT_RAREST,    /* constructive: rarest variables first, see solver_init_rarest() */
+    INIT_GLOWEST,   /* constructive: most frequent variables first, see solver_init_glowest() */
+    INIT_MIN_OVERLAP, /* constructive: most frequent first, then least-overlapping, see solver_init_min_overlap() */
+    INIT_GOB,       /* linear relaxation of the clause system, see solver_init_gob() */
+    INIT_GOB_SQUARE, /* square subsystem of that system, see solver_init_gob_square() */
+    INIT_LIKHO,     /* pre-cooked start (all false by default), then a one-flip-per-variable repair pass */
+    INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
+} InitMode;
+
+typedef struct {
+    size_t max_steps;
+    size_t restarts;
+    double noise;     /* probability of a random pick among top candidates */
+    uint64_t seed;
+    PickFn pick;      /* NULL => pick_ranked */
+    const bool *initial;  /* optional start for restart 0 (n_vars entries); NULL => use `init` */
+    InitMode init;
+    size_t likho_domain_max;    /* Likho: variables per switch domain, prime included */
+    size_t likho_search_nodes;  /* Likho: backtracking budget per prime */
+    bool likho_domains_first;   /* Likho: fire switch domains before neutral repairs */
+    InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY, INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP, INIT_GOB or INIT_GOB_SQUARE */
+    ProgressFn on_progress;
+    void *progress_ctx;
+    size_t progress_every;
+} SolverConfig;
+
+SolverConfig solver_config_default(void);
+
+/* ---- solver ----------------------------------------------------------- */
+
+typedef struct Solver Solver;   /* borrows the Cnf: keep it alive */
+typedef RESULT(Solver *) ResultSolver;
+
+/* Two unit clauses with opposite signs: clause b == not clause a. */
+typedef struct { size_t a, b; } Contradiction;
+
+typedef enum { SOLVE_SAT, SOLVE_UNKNOWN, SOLVE_UNSAT } SolveStatus;
+typedef struct {
+    SolveStatus status;
+    bool *assignment;        /* owned; SAT only (else NULL) */
+    size_t n_vars;
+    size_t steps;
+    size_t restart;          /* SAT only */
+    size_t best_unsatisfied; /* UNKNOWN only */
+    Contradiction *contradictions; /* owned; UNSAT only (else NULL) */
+    size_t n_contradictions;
+} SolveResult;
+typedef RESULT(SolveResult) ResultSolve;
+
+ResultSolver solver_new(const Cnf *cnf, uint64_t seed);
+void solver_free(Solver *s);
+ResultSolve solver_solve(Solver *s, const SolverConfig *cfg);
+/* Contradictory unit pairs (x)/(-x); false only on allocation failure. Caller frees *out. */
+bool cnf_find_contradictions(const Cnf *cnf, Contradiction **out, size_t *out_n);
+void solve_result_free(SolveResult *r);
+
+/* Introspection (also used by the tests). */
+const bool *solver_assignment(const Solver *s);
+size_t solver_unsatisfied_count(const Solver *s);
+bool solver_clause_is_rogue(const Solver *s, size_t clause);
+size_t solver_clause_support(const Solver *s, size_t clause);
+const VarStats *solver_var_stats(Solver *s);  /* refreshes lazily if stale */
+void solver_set_assignment(Solver *s, const bool *assignment);
+void solver_flip(Solver *s, size_t var);
+/* Deterministic constructive start (no RNG). Repeatedly takes the rarest unset
+ * variable: fewest clauses holding x or !x (the larger of the two polarity counts,
+ * satisfied clauses excluded, ties by id), recomputed after each assignment so a
+ * satisfied clause drops its overlap from every remaining variable. A variable takes the value that
+ *   1. satisfies more *forced* clauses (open clauses where it is the last unset variable),
+ *   2. else satisfies more open (not yet satisfied) clauses,
+ *   3. else has the larger total polarity, else false.
+ * false only on allocation failure. */
+bool solver_init_rarest(Solver *s);
+/* Same constructive start as solver_init_rarest(), but takes the most frequent
+ * unset variable first (most clauses holding x or !x, the larger of the two
+ * counts, satisfied clauses excluded, ties by id). Deterministic, no RNG.
+ * false only on allocation failure. */
+bool solver_init_glowest(Solver *s);
+/* Same constructive value rule, but the order is: first the most frequent
+ * variable (glowest's pick, ties by id), then at every step the unset variable
+ * with the smallest share of its occurrences already in satisfied clauses
+ * (ties by id, variables with no occurrences last). Deterministic, no RNG.
+ * false only on allocation failure. */
+bool solver_init_min_overlap(Solver *s);
+/* Linear start: each clause is the signed equation sum(+-x) = 1, solved by
+ * Kaczmarz sweeps; each value is shifted non-negative, rounded and taken mod 2,
+ * then a greedy pass flips bits that satisfy more rogue clauses than they break.
+ * Deterministic, no RNG. false only on allocation failure. */
+bool solver_init_gob(Solver *s);
+/* What the square subsystem's solution does to the equations it was not built
+ * from: phase 3 of solver_init_gob_square(). */
+typedef struct {
+    size_t selected_bad;   /* selected (square) equations the real solution misses */
+    size_t other_bad;      /* unselected equations the real solution misses */
+    size_t other_total;    /* unselected equations checked */
+} GobSquareCheck;
+/* Gob over a square subsystem: pick n of the m equations (strided, one every
+ * m/n clauses), solve just those by Kaczmarz, report what the solution does to
+ * the rest, then decode and repair exactly like solver_init_gob(). The rows can
+ * be dependent and the values are fractional, so this is a seed, not a solve.
+ * `check` may be NULL. Deterministic, no RNG. false only on allocation failure. */
+bool solver_init_gob_square(Solver *s, GobSquareCheck *check);
+void solver_init_majority(Solver *s);                  /* majority-polarity start (ties use the solver RNG) */
+/* Likho: phase 1 is cfg->likho_pre_cook (all-false by default), then a repair
+ * pass that flips an unflipped neutral variable in a rogue clause (always
+ * safe), or a switch domain: a prime plus the neutrals/primes that must flip
+ * with it so no satisfied clause breaks. Each variable is flipped at most
+ * once. The domain size, search budget, pass order and pre-cook come from cfg
+ * (NULL uses the defaults). false only on allocation failure. */
+bool solver_likho(Solver *s, const SolverConfig *cfg);
+const size_t *solver_rogue_list(const Solver *s);      /* solver_unsatisfied_count() clause ids */
+VarStats solver_refresh_var(Solver *s, size_t var);    /* fresh stats of one variable, O(occurrences) */
+size_t solver_occ_count(const Solver *s, size_t var);  /* clauses containing var */
+size_t solver_occ_clause(const Solver *s, size_t var, size_t i);
+
+#endif

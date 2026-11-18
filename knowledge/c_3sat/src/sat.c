@@ -1,0 +1,1140 @@
+#include "sat.h"
+
+#include <errno.h>
+#include <stdlib.h>
+
+/* Likho switch-domain defaults; the CLI -deep-dive flag overrides both. */
+#define LIKHO_DOMAIN_MAX 8      /* variables in one domain, prime included */
+#define LIKHO_SEARCH_NODES 64   /* backtracking budget per prime */
+
+/* ======================================================================== */
+/* small helpers                                                            */
+/* ======================================================================== */
+
+static bool vec_reserve(void **data, size_t *cap, size_t elem, size_t need) {
+    if (need <= *cap) return true;
+    size_t ncap = *cap ? *cap : 16;
+    while (ncap < need) {
+        if (ncap > SIZE_MAX / 2) return false;
+        ncap *= 2;
+    }
+    if (ncap > SIZE_MAX / elem) return false;
+    void *p = realloc(*data, ncap * elem);
+    if (!p) return false;
+    *data = p;
+    *cap = ncap;
+    return true;
+}
+
+static bool is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+}
+
+/* Strict integer parsing (optional sign, digits only), like Rust's parse(). */
+static bool parse_u64(const char *s, size_t len, uint64_t *out, bool allow_sign, bool *neg) {
+    size_t i = 0;
+    *neg = false;
+    if (allow_sign && i < len && (s[i] == '+' || s[i] == '-')) { *neg = s[i] == '-'; i++; }
+    else if (!allow_sign && i < len && s[i] == '+') i++;
+    if (i == len) return false;
+    uint64_t acc = 0;
+    for (; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        unsigned d = (unsigned)(s[i] - '0');
+        if (acc > (UINT64_MAX - d) / 10) return false;
+        acc = acc * 10 + d;
+    }
+    *out = acc;
+    return true;
+}
+
+static bool parse_i64(const char *s, size_t len, int64_t *out) {
+    uint64_t mag; bool neg;
+    if (!parse_u64(s, len, &mag, true, &neg)) return false;
+    if (neg) {
+        if (mag > (uint64_t)INT64_MAX + 1) return false;
+        *out = (int64_t)(0 - mag);
+    } else {
+        if (mag > (uint64_t)INT64_MAX) return false;
+        *out = (int64_t)mag;
+    }
+    return true;
+}
+
+static bool parse_usize(const char *s, size_t len, size_t *out) {
+    uint64_t mag; bool neg;
+    if (!parse_u64(s, len, &mag, false, &neg) || mag > SIZE_MAX) return false;
+    *out = (size_t)mag;
+    return true;
+}
+
+/* ======================================================================== */
+/* CNF                                                                      */
+/* ======================================================================== */
+
+void cnf_free(Cnf *cnf) {
+    free(cnf->off);
+    free(cnf->lits);
+    cnf->off = NULL;
+    cnf->lits = NULL;
+    cnf->n_vars = cnf->n_clauses = 0;
+}
+
+bool cnf_is_3sat(const Cnf *cnf) {
+    for (size_t i = 0; i < cnf->n_clauses; i++)
+        if (cnf_clause_len(cnf, i) > 3) return false;
+    return true;
+}
+
+typedef struct { uint64_t hash; size_t clause; bool occupied; } TwinSlot;
+
+static uint64_t twin_mix(uint64_t x) {
+    x ^= x >> 30; x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27; x *= UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31);
+}
+
+/* Commutative signature: literal order is irrelevant. Exact comparison below
+ * resolves the (very unlikely) hash collision. */
+static uint64_t clause_signature(const Lit *cl, size_t n, bool invert) {
+    uint64_t sum = 0, xors = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t key = ((uint64_t)cl[i].var << 1) | (uint64_t)(cl[i].positive ^ invert);
+        uint64_t h = twin_mix(key + UINT64_C(0x9e3779b97f4a7c15));
+        sum += h;
+        xors ^= (h << (key & 31)) | (h >> ((64 - (key & 31)) & 63));
+    }
+    return twin_mix(sum ^ xors ^ twin_mix((uint64_t)n));
+}
+
+static bool clause_matches(const Lit *a, size_t na, const Lit *b, size_t nb, bool async) {
+    if (na != nb) return false;
+    for (size_t i = 0; i < na; i++) {
+        size_t ac = 0, bc = 0;
+        for (size_t j = 0; j < na; j++) {
+            ac += a[j].var == a[i].var && a[j].positive == a[i].positive;
+            bc += b[j].var == a[i].var && b[j].positive == (async ? !a[i].positive : a[i].positive);
+        }
+        if (ac != bc) return false;
+    }
+    return true;
+}
+
+static bool twin_table_contains(const TwinSlot *table, size_t cap, uint64_t hash,
+                                const Lit *cl, size_t n, const Cnf *kept, bool async) {
+    size_t slot = (size_t)hash & (cap - 1);
+    while (table[slot].occupied) {
+        if (table[slot].hash == hash) {
+            size_t ci = table[slot].clause;
+            if (clause_matches(cl, n, cnf_clause(kept, ci), cnf_clause_len(kept, ci), async))
+                return true;
+        }
+        slot = (slot + 1) & (cap - 1);
+    }
+    return false;
+}
+
+static void twin_table_insert(TwinSlot *table, size_t cap, uint64_t hash, size_t clause) {
+    size_t slot = (size_t)hash & (cap - 1);
+    while (table[slot].occupied) slot = (slot + 1) & (cap - 1);
+    table[slot] = (TwinSlot){ .hash = hash, .clause = clause, .occupied = true };
+}
+
+bool no_twins(const Cnf *src, Cnf *out) {
+    if (!src || !out || !src->off) return false;
+    *out = (Cnf){0};
+    size_t max_lits = src->off[src->n_clauses];
+    if (src->n_clauses > (SIZE_MAX - 1) / 2) return false;
+    size_t need = src->n_clauses * 2 + 1;
+    size_t cap = 8;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) return false;
+        cap *= 2;
+    }
+    TwinSlot *sync = calloc(cap, sizeof *sync);
+    TwinSlot *async = calloc(cap, sizeof *async);
+    out->off = calloc(src->n_clauses + 1, sizeof *out->off);
+    out->lits = malloc((max_lits ? max_lits : 1) * sizeof *out->lits);
+    if (!sync || !async || !out->off || !out->lits) {
+        free(sync); free(async); cnf_free(out); return false;
+    }
+    out->n_vars = src->n_vars;
+    for (size_t i = 0; i < src->n_clauses; i++) {
+        const Lit *cl = cnf_clause(src, i);
+        size_t n = cnf_clause_len(src, i);
+        uint64_t hs = clause_signature(cl, n, false);
+        bool duplicate = twin_table_contains(sync, cap, hs, cl, n, out, false) ||
+                         twin_table_contains(async, cap, hs, cl, n, out, true);
+        if (!duplicate) {
+            size_t kept = out->n_clauses;
+            if (n) memcpy(out->lits + out->off[kept], cl, n * sizeof *out->lits);
+            out->n_clauses++;
+            out->off[out->n_clauses] = out->off[kept] + n;
+            twin_table_insert(sync, cap, hs, kept);
+            twin_table_insert(async, cap, clause_signature(cl, n, true), kept);
+        } else {
+            out->off[out->n_clauses + 1] = out->off[out->n_clauses];
+        }
+    }
+    free(sync); free(async);
+    return true;
+}
+
+ResultCnf cnf_from_dimacs_str(const char *input) {
+    Error err = {0};
+    int64_t *tok = NULL; size_t ntok = 0, captok = 0;
+    Lit *cur = NULL; size_t ncur = 0, capcur = 0;
+    size_t capoff = 0, caplit = 0, nlit = 0;
+    Cnf cnf = {0};
+    size_t n_vars = 0, expected = 0;
+    bool have_header = false;
+
+#define FAIL(kind, ...) do { err = error_make((kind), __VA_ARGS__); goto fail; } while (0)
+
+    /* Pass 1: header + raw integer tokens. */
+    size_t line_no = 0;
+    const char *p = input;
+    while (*p) {
+        line_no++;
+        const char *eol = strchr(p, '\n');
+        size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+        const char *line = p;
+        p = eol ? eol + 1 : p + llen;
+        while (llen && is_ws(*line)) { line++; llen--; }
+        while (llen && is_ws(line[llen - 1])) llen--;
+        if (llen == 0 || line[0] == 'c') continue;
+        if (line[0] == '%') break;   /* DIMACS end-of-file marker; trailing tokens are ignored */
+
+        if (line[0] == 'p') {
+            struct { const char *s; size_t n; } f[5];
+            size_t nf = 0, i = 0;
+            while (i < llen) {
+                while (i < llen && is_ws(line[i])) i++;
+                if (i >= llen) break;
+                size_t st = i;
+                while (i < llen && !is_ws(line[i])) i++;
+                if (nf < 5) { f[nf].s = line + st; f[nf].n = i - st; }
+                nf++;
+            }
+            if (nf != 4 || f[1].n != 3 || memcmp(f[1].s, "cnf", 3) != 0)
+                FAIL(ERR_PARSE, "line %zu: expected `p cnf VARS CLAUSES`", line_no);
+            if (!parse_usize(f[2].s, f[2].n, &n_vars))
+                FAIL(ERR_PARSE, "line %zu: invalid variable count", line_no);
+            if (!parse_usize(f[3].s, f[3].n, &expected))
+                FAIL(ERR_PARSE, "line %zu: invalid clause count", line_no);
+            have_header = true;
+            continue;
+        }
+
+        size_t i = 0;
+        while (i < llen) {
+            while (i < llen && is_ws(line[i])) i++;
+            if (i >= llen) break;
+            size_t st = i;
+            while (i < llen && !is_ws(line[i])) i++;
+            int64_t v;
+            if (!parse_i64(line + st, i - st, &v))
+                FAIL(ERR_PARSE, "line %zu: invalid DIMACS token `%.*s`", line_no, (int)(i - st), line + st);
+            if (!vec_reserve((void **)&tok, &captok, sizeof *tok, ntok + 1)) FAIL(ERR_NOMEM, "out of memory");
+            tok[ntok++] = v;
+        }
+    }
+    if (!have_header) FAIL(ERR_PARSE, "missing `p cnf` header");
+    if (n_vars > UINT32_MAX) FAIL(ERR_PARSE, "variable count %zu is too large", n_vars);
+
+    /* Pass 2: build clauses; drop duplicate literals and tautologies. */
+    cnf.n_vars = n_vars;
+    if (!vec_reserve((void **)&cnf.off, &capoff, sizeof *cnf.off, 1)) FAIL(ERR_NOMEM, "out of memory");
+    cnf.off[0] = 0;
+
+    for (size_t t = 0; t < ntok; t++) {
+        int64_t value = tok[t];
+        if (value != 0) {
+            if (value == INT64_MIN) FAIL(ERR_PARSE, "literal integer overflow");
+            uint64_t abs = value < 0 ? (uint64_t)(-value) : (uint64_t)value;
+            if (abs > n_vars) FAIL(ERR_PARSE, "literal %lld is outside 1..=%zu", (long long)value, n_vars);
+            if (!vec_reserve((void **)&cur, &capcur, sizeof *cur, ncur + 1)) FAIL(ERR_NOMEM, "out of memory");
+            cur[ncur++] = (Lit){ (uint32_t)(abs - 1), value > 0 };
+            continue;
+        }
+        size_t start = cnf.off[cnf.n_clauses], appended = 0;
+        bool taut = false;
+        for (size_t c = 0; c < ncur && !taut; c++) {
+            bool dup = false;
+            for (size_t k = 0; k < appended; k++) {
+                Lit e = cnf.lits[start + k];
+                if (e.var != cur[c].var) continue;
+                if (e.positive != cur[c].positive) taut = true; else dup = true;
+                break;
+            }
+            if (taut || dup) continue;
+            if (!vec_reserve((void **)&cnf.lits, &caplit, sizeof *cnf.lits, start + appended + 1)) FAIL(ERR_NOMEM, "out of memory");
+            cnf.lits[start + appended++] = cur[c];
+        }
+        ncur = 0;
+        if (taut) continue;
+        if (!vec_reserve((void **)&cnf.off, &capoff, sizeof *cnf.off, cnf.n_clauses + 2)) FAIL(ERR_NOMEM, "out of memory");
+        cnf.off[++cnf.n_clauses] = start + appended;
+        nlit = start + appended;
+    }
+    (void)nlit;
+    if (ncur != 0) FAIL(ERR_PARSE, "unterminated clause: missing 0");
+    if (cnf.n_clauses > expected)
+        FAIL(ERR_PARSE, "header declares %zu clauses, parsed %zu", expected, cnf.n_clauses);
+
+    free(tok);
+    free(cur);
+    if (!cnf.lits) cnf.lits = malloc(sizeof *cnf.lits); /* keep non-NULL for empty formulas */
+    return OK(ResultCnf, cnf);
+
+fail:
+    free(tok);
+    free(cur);
+    cnf_free(&cnf);
+    return ERR(ResultCnf, err);
+#undef FAIL
+}
+
+ResultCnf cnf_from_dimacs_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return ERRF(ResultCnf, ERR_IO, "cannot open %s: %s", path, strerror(errno));
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    for (;;) {
+        if (!vec_reserve((void **)&buf, &cap, 1, len + 4097)) { free(buf); fclose(f); return ERRF(ResultCnf, ERR_NOMEM, "out of memory"); }
+        size_t n = fread(buf + len, 1, 4096, f);
+        len += n;
+        if (n < 4096) break;
+    }
+    bool bad = ferror(f);
+    fclose(f);
+    if (bad) { free(buf); return ERRF(ResultCnf, ERR_IO, "cannot read %s", path); }
+    buf[len] = '\0';
+    ResultCnf r = cnf_from_dimacs_str(buf);
+    free(buf);
+    return r;
+}
+
+bool verify(const Cnf *cnf, const bool *assignment, size_t len) {
+    if (len < cnf->n_vars) return false;
+    for (size_t i = 0; i < cnf->n_clauses; i++) {
+        const Lit *c = cnf_clause(cnf, i);
+        size_t n = cnf_clause_len(cnf, i);
+        bool any = false;
+        for (size_t k = 0; k < n && !any; k++) any = lit_value(c[k], assignment[c[k].var]);
+        if (!any) return false;
+    }
+    return true;
+}
+
+/* ======================================================================== */
+/* pick strategies (the function-as-variable part)                          */
+/* ======================================================================== */
+
+size_t pick_ranked(Rng *rng, const Candidate *c, size_t n, double noise) {
+    size_t neutral = 0;
+    while (neutral < n && c[neutral].cls == 0) neutral++;
+    size_t pool = neutral > 0 ? neutral : n;
+    if (rng_f64(rng) < noise) return c[rng_index(rng, pool)].var;
+    return c[0].var;
+}
+
+size_t pick_greedy(Rng *rng, const Candidate *c, size_t n, double noise) {
+    (void)rng; (void)n; (void)noise;
+    return c[0].var;
+}
+
+size_t pick_random(Rng *rng, const Candidate *c, size_t n, double noise) {
+    (void)noise;
+    return c[rng_index(rng, n)].var;
+}
+
+const Strategy STRATEGIES[] = {
+    { "ranked", pick_ranked },
+    { "greedy", pick_greedy },
+    { "random", pick_random },
+};
+const size_t N_STRATEGIES = sizeof STRATEGIES / sizeof STRATEGIES[0];
+
+PickFn pick_fn_by_name(const char *name) {
+    for (size_t i = 0; i < N_STRATEGIES; i++)
+        if (strcmp(STRATEGIES[i].name, name) == 0) return STRATEGIES[i].fn;
+    return NULL;
+}
+
+SolverConfig solver_config_default(void) {
+    return (SolverConfig){
+        .max_steps = 100000, .restarts = 20, .noise = 0.22,
+        .seed = 0x9e3779b97f4a7c15ULL, .pick = pick_ranked,
+        .likho_domain_max = LIKHO_DOMAIN_MAX, .likho_search_nodes = LIKHO_SEARCH_NODES,
+        .likho_domains_first = false, .likho_pre_cook = INIT_ZERO,
+        .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
+    };
+}
+
+/* ======================================================================== */
+/* solver                                                                   */
+/* ======================================================================== */
+
+typedef struct { uint32_t clause; bool positive; } Occ;
+
+struct Solver {
+    const Cnf *cnf;
+    bool *assignment;
+    uint32_t *sat;          /* currently-true literal count per clause (0 == rogue) */
+    size_t *occ_off;        /* CSR occurrence index, n_vars + 1 entries */
+    Occ *occ;
+    size_t *rogue;          /* clause ids currently rogue, for O(1) selection */
+    size_t n_rogue;
+    size_t *rogue_pos;      /* SIZE_MAX when not rogue */
+    VarStats *stats;
+    bool stats_dirty;       /* variable states are derived lazily */
+    Candidate *cands;
+    size_t max_len;
+    Rng rng;
+};
+
+static size_t occ_count(const Solver *s, size_t v) { return s->occ_off[v + 1] - s->occ_off[v]; }
+
+void solver_free(Solver *s) {
+    if (!s) return;
+    free(s->assignment); free(s->sat); free(s->occ_off); free(s->occ);
+    free(s->rogue); free(s->rogue_pos); free(s->stats); free(s->cands);
+    free(s);
+}
+
+static void add_rogue(Solver *s, size_t c) {
+    if (s->rogue_pos[c] != SIZE_MAX) return;
+    s->rogue_pos[c] = s->n_rogue;
+    s->rogue[s->n_rogue++] = c;
+}
+
+static void remove_rogue(Solver *s, size_t c) {
+    size_t pos = s->rogue_pos[c];
+    if (pos == SIZE_MAX) return;
+    size_t last = s->rogue[--s->n_rogue];
+    if (pos < s->n_rogue) { s->rogue[pos] = last; s->rogue_pos[last] = pos; }
+    s->rogue_pos[c] = SIZE_MAX;
+}
+
+static void rebuild_counts(Solver *s) {
+    const Cnf *cnf = s->cnf;
+    s->n_rogue = 0;
+    for (size_t ci = 0; ci < cnf->n_clauses; ci++) {
+        const Lit *c = cnf_clause(cnf, ci);
+        size_t n = cnf_clause_len(cnf, ci), count = 0;
+        for (size_t k = 0; k < n; k++) count += lit_value(c[k], s->assignment[c[k].var]);
+        s->sat[ci] = (uint32_t)count;
+        s->rogue_pos[ci] = SIZE_MAX;
+    }
+    for (size_t ci = 0; ci < cnf->n_clauses; ci++)
+        if (s->sat[ci] == 0) add_rogue(s, ci);
+    s->stats_dirty = true;
+}
+
+ResultSolver solver_new(const Cnf *cnf, uint64_t seed) {
+    if (cnf->n_clauses > UINT32_MAX) return ERRF(ResultSolver, ERR_PARSE, "too many clauses (%zu)", cnf->n_clauses);
+    Solver *s = calloc(1, sizeof *s);
+    if (!s) return ERRF(ResultSolver, ERR_NOMEM, "out of memory");
+    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
+    size_t total = cnf->off[nc];
+    s->cnf = cnf;
+    s->rng = rng_new(seed);
+    s->assignment = calloc(nv ? nv : 1, sizeof *s->assignment);
+    s->sat = calloc(nc ? nc : 1, sizeof *s->sat);
+    s->occ_off = calloc(nv + 1, sizeof *s->occ_off);
+    s->occ = malloc((total ? total : 1) * sizeof *s->occ);
+    s->rogue = malloc((nc ? nc : 1) * sizeof *s->rogue);
+    s->rogue_pos = malloc((nc ? nc : 1) * sizeof *s->rogue_pos);
+    s->stats = calloc(nv ? nv : 1, sizeof *s->stats);
+    if (!s->assignment || !s->sat || !s->occ_off || !s->occ || !s->rogue || !s->rogue_pos || !s->stats) {
+        solver_free(s);
+        return ERRF(ResultSolver, ERR_NOMEM, "out of memory");
+    }
+    for (size_t ci = 0; ci < nc; ci++) {
+        size_t n = cnf_clause_len(cnf, ci);
+        if (n > s->max_len) s->max_len = n;
+        for (size_t k = 0; k < n; k++) s->occ_off[cnf_clause(cnf, ci)[k].var + 1]++;
+    }
+    for (size_t v = 0; v < nv; v++) s->occ_off[v + 1] += s->occ_off[v];
+    size_t *fill = malloc((nv ? nv : 1) * sizeof *fill);
+    s->cands = malloc((s->max_len ? s->max_len : 1) * sizeof *s->cands);
+    if (!fill || !s->cands) { free(fill); solver_free(s); return ERRF(ResultSolver, ERR_NOMEM, "out of memory"); }
+    memcpy(fill, s->occ_off, nv * sizeof *fill);
+    for (size_t ci = 0; ci < nc; ci++) {
+        size_t n = cnf_clause_len(cnf, ci);
+        for (size_t k = 0; k < n; k++) {
+            Lit l = cnf_clause(cnf, ci)[k];
+            s->occ[fill[l.var]++] = (Occ){ (uint32_t)ci, l.positive };
+        }
+    }
+    free(fill);
+    for (size_t v = 0; v < nv; v++) s->stats[v].rank = SIZE_MAX;
+    rebuild_counts(s);
+    return OK(ResultSolver, s);
+}
+
+/* Re-derive one variable's state, break and make counts from the current
+ * assignment in a single pass over its occurrences.
+ *
+ * Ranking invariant (relied on by the group merge):
+ *   VAR_PRIME   <=> break_count >= 1   (sole support of at least one solved clause)
+ *   VAR_NEUTRAL <=> break_count == 0   (flipping can never un-solve a clause)
+ * Neutrality is a property of the *current* assignment, not of the variable. */
+static void refresh_var(Solver *s, size_t v) {
+    size_t satisfied = 0, rogue_occ = 0, breaks = 0, min_support = SIZE_MAX;
+    bool prime = false;
+    bool val = s->assignment[v];
+    for (size_t i = s->occ_off[v]; i < s->occ_off[v + 1]; i++) {
+        Occ o = s->occ[i];
+        uint32_t c = s->sat[o.clause];
+        if (c == 0) { rogue_occ++; continue; }
+        if (val == o.positive) {
+            satisfied++;
+            if (c < min_support) min_support = c;
+            if (c == 1) { prime = true; breaks++; }
+        }
+    }
+    VarStats *st = &s->stats[v];
+    st->satisfied_occurrences = satisfied;
+    st->rogue_occurrences = rogue_occ;
+    st->break_count = breaks;
+    st->make_count = rogue_occ;  /* a rogue clause has no true literal, so every incidence is a "make" */
+    st->rank = SIZE_MAX;
+    if (occ_count(s, v) == 0) { st->state = VAR_UNUSED; st->min_support = 0; }
+    else if (prime) { st->state = VAR_PRIME; st->min_support = 1; }
+    else { st->state = VAR_NEUTRAL; st->min_support = satisfied == 0 ? 0 : min_support; }
+}
+
+static void refresh_all(Solver *s) {
+    for (size_t v = 0; v < s->cnf->n_vars; v++) refresh_var(s, v);
+    s->stats_dirty = false;
+}
+
+void solver_flip(Solver *s, size_t var) {
+    s->assignment[var] = !s->assignment[var];
+    s->stats_dirty = true;  /* states are re-derived lazily, only for candidates actually examined */
+    for (size_t i = s->occ_off[var]; i < s->occ_off[var + 1]; i++) {
+        Occ o = s->occ[i];
+        uint32_t old = s->sat[o.clause];
+        bool now_true = s->assignment[var] == o.positive;
+        uint32_t nw = now_true ? old + 1 : old - 1;
+        s->sat[o.clause] = nw;
+        if (old == 0 && nw > 0) remove_rogue(s, o.clause);
+        else if (old > 0 && nw == 0) add_rogue(s, o.clause);
+    }
+}
+
+static int cand_cmp(const Candidate *a, const Candidate *b) {
+    if (a->cls != b->cls) return a->cls < b->cls ? -1 : 1;                 /* neutral before prime */
+    if (a->support != b->support) return a->support > b->support ? -1 : 1; /* stronger support first */
+    if (a->breaks != b->breaks) return a->breaks < b->breaks ? -1 : 1;     /* fewer breaks */
+    if (a->makes != b->makes) return a->makes > b->makes ? -1 : 1;         /* more makes */
+    return a->var < b->var ? -1 : (a->var > b->var);
+}
+
+/* Score the variables of one rogue clause and sort them best-first. */
+static size_t rank_candidates(Solver *s, size_t clause) {
+    const Lit *c = cnf_clause(s->cnf, clause);
+    size_t n = cnf_clause_len(s->cnf, clause);
+    for (size_t k = 0; k < n; k++) {
+        size_t v = c[k].var;
+        refresh_var(s, v);
+        const VarStats *st = &s->stats[v];
+        Candidate cd = { v, 0, 0, st->break_count, st->make_count };
+        switch (st->state) {
+            case VAR_NEUTRAL: cd.cls = 0; cd.support = st->min_support; break;
+            case VAR_PRIME:   cd.cls = 1; cd.support = 1; break;
+            case VAR_UNUSED:  cd.cls = 2; cd.support = SIZE_MAX; break;
+        }
+        size_t j = k;  /* insertion sort: clauses are tiny */
+        while (j > 0 && cand_cmp(&cd, &s->cands[j - 1]) < 0) { s->cands[j] = s->cands[j - 1]; j--; }
+        s->cands[j] = cd;
+    }
+    for (size_t r = 0; r < n; r++) s->stats[s->cands[r].var].rank = r;
+    return n;
+}
+
+static void random_assignment(Solver *s, bool majority) {
+    for (size_t v = 0; v < s->cnf->n_vars; v++) {
+        size_t pos = 0, total = occ_count(s, v);
+        for (size_t i = s->occ_off[v]; i < s->occ_off[v + 1]; i++) pos += s->occ[i].positive;
+        size_t neg = total - pos;
+        s->assignment[v] = (majority && pos != neg) ? pos > neg : rng_bool(&s->rng);
+    }
+    rebuild_counts(s);
+}
+
+typedef struct { size_t key, den, var; } Rare;
+
+/* Ascending key/den, ties by variable id. den is 1 for the frequency orders and
+ * the variable's occurrence count for the overlap order; ratios are compared by
+ * cross-multiplication so the order stays exact. A zero denominator (variable
+ * with no occurrences) sorts last. */
+static bool rare_before(Rare a, Rare b) {
+    if ((a.den == 0) != (b.den == 0)) return b.den == 0;
+    unsigned __int128 l = (unsigned __int128)a.key * b.den;
+    unsigned __int128 r = (unsigned __int128)b.key * a.den;
+    if (l != r) return l < r;
+    return a.var < b.var;
+}
+
+static void rare_push(Rare *h, size_t *n, Rare x) {
+    size_t i = (*n)++;
+    while (i > 0) {
+        size_t p = (i - 1) / 2;
+        if (!rare_before(x, h[p])) break;
+        h[i] = h[p];
+        i = p;
+    }
+    h[i] = x;
+}
+
+static void rare_sift_down(Rare *h, size_t n, size_t i, Rare x) {
+    for (;;) {
+        size_t l = 2 * i + 1;
+        if (l >= n) break;
+        size_t c = l;
+        if (l + 1 < n && rare_before(h[l + 1], h[l])) c = l + 1;
+        if (!rare_before(h[c], x)) break;
+        h[i] = h[c];
+        i = c;
+    }
+    h[i] = x;
+}
+
+static Rare rare_pop(Rare *h, size_t *n) {
+    Rare top = h[0], last = h[--(*n)];
+    if (*n) rare_sift_down(h, *n, 0, last);
+    return top;
+}
+
+/* Rarest = fewest clauses holding x or !x, whichever is larger; glowest = most.
+ * Only clauses that are still unsatisfied count, so satisfying a clause removes
+ * the overlapping occurrences of every variable it contains. */
+static size_t rare_key(const uint32_t *pos, const uint32_t *neg, size_t v, bool most) {
+    size_t m = pos[v] > neg[v] ? pos[v] : neg[v];
+    return most ? SIZE_MAX - m : m;
+}
+
+typedef enum { ORDER_RAREST, ORDER_GLOWEST, ORDER_MIN_OVERLAP } InitOrder;
+
+/* Current key and denominator of v. min-overlap ranks a variable by the share of
+ * its occurrences that sit in already satisfied clauses. */
+static void order_key(InitOrder mode, const uint32_t *pos, const uint32_t *neg,
+                      const uint32_t *overlap, const size_t *total,
+                      size_t v, size_t *key, size_t *den) {
+    if (mode == ORDER_MIN_OVERLAP) { *key = overlap[v]; *den = total[v]; }
+    else { *key = rare_key(pos, neg, v, mode == ORDER_GLOWEST); *den = 1; }
+}
+
+static void order_push(Rare *h, size_t *hn, InitOrder mode, const uint32_t *pos,
+                       const uint32_t *neg, const uint32_t *overlap,
+                       const size_t *total, size_t v) {
+    size_t key, den;
+    order_key(mode, pos, neg, overlap, total, v, &key, &den);
+    rare_push(h, hn, (Rare){ key, den, v });
+}
+
+/* Constructive start. rarest/glowest take at every step the unset variable with
+ * the fewest/most open clauses holding x or !x (the larger polarity count, ties
+ * by id). min-overlap takes the most frequent variable first (glowest's pick,
+ * ties by id), then the one with the smallest share of its occurrences already
+ * in satisfied clauses, ties by id. A key only moves one way, so the current
+ * entry is re-pushed whenever it changes and a stale entry is discarded when it
+ * pops. */
+static bool init_order(Solver *s, InitOrder mode) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
+    uint32_t *unset = malloc((nc ? nc : 1) * sizeof *unset);   /* unassigned variables left in each clause */
+    unsigned char *done = calloc(nc ? nc : 1, 1);              /* clause already has a true literal */
+    uint32_t *pos = calloc(nv ? nv : 1, sizeof *pos);          /* polarity counts of open clauses (frequency orders) */
+    uint32_t *neg = calloc(nv ? nv : 1, sizeof *neg);
+    uint32_t *overlap = calloc(nv ? nv : 1, sizeof *overlap);  /* satisfied occurrences, min-overlap order */
+    size_t *total = calloc(nv ? nv : 1, sizeof *total);        /* all occurrences, min-overlap denominator */
+    unsigned char *assigned = calloc(nv ? nv : 1, 1);
+    Rare *heap = malloc((nv + s->occ_off[nv] + 1) * sizeof *heap);
+    if (!unset || !done || !pos || !neg || !overlap || !total || !assigned || !heap) {
+        free(unset); free(done); free(pos); free(neg); free(overlap); free(total);
+        free(assigned); free(heap);
+        return false;
+    }
+    for (size_t c = 0; c < nc; c++) unset[c] = (uint32_t)cnf_clause_len(cnf, c);
+    size_t hn = 0;
+    for (size_t v = 0; v < nv; v++) {
+        total[v] = occ_count(s, v);
+        for (size_t k = s->occ_off[v]; k < s->occ_off[v + 1]; k++)
+            if (s->occ[k].positive) pos[v]++; else neg[v]++;
+    }
+    /* min-overlap's first pick is glowest's, so its heap starts after step 0. */
+    if (mode != ORDER_MIN_OVERLAP)
+        for (size_t v = 0; v < nv; v++)
+            order_push(heap, &hn, mode, pos, neg, overlap, total, v);
+
+    for (size_t step = 0; step < nv; step++) {
+        size_t v;
+        if (mode == ORDER_MIN_OVERLAP && step == 0) {
+            v = 0;
+            for (size_t u = 1; u < nv; u++) {
+                size_t m = pos[u] > neg[u] ? pos[u] : neg[u];
+                size_t bm = pos[v] > neg[v] ? pos[v] : neg[v];
+                if (m > bm) v = u;
+            }
+        } else {
+            Rare top;
+            size_t key, den;
+            do {
+                top = rare_pop(heap, &hn);
+                order_key(mode, pos, neg, overlap, total, top.var, &key, &den);
+            } while (assigned[top.var] || top.key != key || top.den != den);
+            v = top.var;
+        }
+        size_t fp = 0, fn = 0, op = 0, on = 0, tp = 0, tn = 0;
+        for (size_t k = s->occ_off[v]; k < s->occ_off[v + 1]; k++) {
+            Occ o = s->occ[k];
+            if (o.positive) tp++; else tn++;
+            if (done[o.clause]) continue;
+            if (unset[o.clause] == 1) { if (o.positive) fp++; else fn++; }
+            else                      { if (o.positive) op++; else on++; }
+        }
+        bool val;
+        if (fp != fn) val = fp > fn;
+        else if (op != on) val = op > on;
+        else if (tp != tn) val = tp > tn;
+        else val = false;
+        s->assignment[v] = val;
+        assigned[v] = 1;
+        for (size_t k = s->occ_off[v]; k < s->occ_off[v + 1]; k++) {
+            Occ o = s->occ[k];
+            unset[o.clause]--;
+            if (done[o.clause] || o.positive != val) continue;
+            done[o.clause] = 1;
+            const Lit *cl = cnf_clause(cnf, o.clause);
+            size_t len = cnf_clause_len(cnf, o.clause);
+            for (size_t j = 0; j < len; j++) {
+                size_t u = cl[j].var;
+                if (assigned[u]) continue;
+                if (mode == ORDER_MIN_OVERLAP) overlap[u]++;
+                else if (cl[j].positive) pos[u]--; else neg[u]--;
+                if (mode == ORDER_MIN_OVERLAP && step == 0) continue;   /* heap is built after this step */
+                order_push(heap, &hn, mode, pos, neg, overlap, total, u);
+            }
+        }
+        if (mode == ORDER_MIN_OVERLAP && step == 0) {
+            hn = 0;   /* every unset variable gets an overlap entry, not a glowest one */
+            for (size_t u = 0; u < nv; u++)
+                if (!assigned[u]) order_push(heap, &hn, mode, pos, neg, overlap, total, u);
+        }
+    }
+    free(unset); free(done); free(pos); free(neg); free(overlap); free(total);
+    free(assigned); free(heap);
+    rebuild_counts(s);
+    return true;
+}
+
+bool solver_init_rarest(Solver *s) { return init_order(s, ORDER_RAREST); }
+bool solver_init_glowest(Solver *s) { return init_order(s, ORDER_GLOWEST); }
+bool solver_init_min_overlap(Solver *s) { return init_order(s, ORDER_MIN_OVERLAP); }
+
+/* ---- Gob: linear relaxation of the clause system (full or square) ------ */
+
+/* Every clause becomes the signed equation sum(+-x) = 1: a positive literal is
+ * +x, a negative one -x. Cyclic Kaczmarz projections (one per clause per sweep)
+ * solve it in the least-squares sense. Each value is then shifted by the
+ * smallest non-negative amount (so -x = 1 decodes to false, not true), rounded,
+ * and taken mod 2. A greedy pass then flips a decoded variable whenever it
+ * satisfies more rogue clauses than it breaks, adapting the bits to the formula.
+ * Deterministic, no RNG. */
+#define GOB_SWEEPS 64     /* Kaczmarz passes over the whole clause system */
+#define GOB_SQUARE_SWEEPS 512  /* the square system converges slower than the full one */
+#define GOB_PASSES 4      /* greedy adaptation passes over the decoded bits */
+
+/* One exact Kaczmarz projection of the real vector onto clause ci's equation. */
+static void gob_project(const Cnf *cnf, double *v, size_t ci) {
+    const Lit *cl = cnf_clause(cnf, ci);
+    size_t len = cnf_clause_len(cnf, ci);
+    if (len == 0) return;
+    double sum = 0;
+    for (size_t k = 0; k < len; k++)
+        sum += cl[k].positive ? v[cl[k].var] : -v[cl[k].var];
+    double step = (1.0 - sum) / (double)len;
+    for (size_t k = 0; k < len; k++)
+        v[cl[k].var] += cl[k].positive ? step : -step;
+}
+
+/* Decode the real vector to booleans, then run the greedy repair passes. */
+static void gob_decode_and_repair(Solver *s, const double *v, bool *a) {
+    size_t nv = s->cnf->n_vars;
+    for (size_t i = 0; i < nv; i++) {
+        double u = v[i];
+        if (u < 0) {                                  /* shift the negative away */
+            long long sh = (long long)(-u);
+            if ((double)sh < -u) sh++;
+            u += (double)sh;
+        }
+        a[i] = (((long long)(u + 0.5)) & 1) != 0;     /* round to nearest, mod 2 */
+    }
+    solver_set_assignment(s, a);
+    for (int pass = 0; pass < GOB_PASSES; pass++) {   /* step 4: best correlation */
+        size_t flips = 0;
+        for (size_t i = 0; i < nv; i++) {
+            refresh_var(s, i);
+            const VarStats *st = &s->stats[i];
+            if (st->make_count > st->break_count) { solver_flip(s, i); flips++; }
+        }
+        if (flips == 0) break;
+    }
+}
+
+bool solver_init_gob(Solver *s) {
+    Cnf filtered = {0};
+    if (!no_twins(s->cnf, &filtered)) return false;
+    size_t nv = s->cnf->n_vars, nc = filtered.n_clauses;
+    double *v = calloc(nv ? nv : 1, sizeof *v);
+    bool *a = malloc((nv ? nv : 1) * sizeof *a);
+    if (!v || !a) { free(v); free(a); cnf_free(&filtered); return false; }
+    for (size_t sweep = 0; sweep < GOB_SWEEPS; sweep++)
+        for (size_t ci = 0; ci < nc; ci++) gob_project(&filtered, v, ci);
+    gob_decode_and_repair(s, v, a);
+    free(v); free(a); cnf_free(&filtered);
+    return true;
+}
+
+bool solver_init_gob_square(Solver *s, GobSquareCheck *check) {
+    Cnf filtered = {0};
+    if (!no_twins(s->cnf, &filtered)) return false;
+    size_t nv = s->cnf->n_vars, nc = filtered.n_clauses;
+    double *v = calloc(nv ? nv : 1, sizeof *v);
+    bool *a = malloc((nv ? nv : 1) * sizeof *a);
+    bool *sel = calloc(nc ? nc : 1, 1);
+    if (!v || !a || !sel) { free(v); free(a); free(sel); cnf_free(&filtered); return false; }
+    size_t neq = nv < nc ? nv : nc;                 /* phase 1: n of the m filtered equations */
+    if (neq) {
+        for (size_t ei = 0; ei < neq; ei++) sel[ei * nc / neq] = true;
+        for (size_t sweep = 0; sweep < GOB_SQUARE_SWEEPS; sweep++)      /* phase 2 */
+            for (size_t ci = 0; ci < nc; ci++)
+                if (sel[ci]) gob_project(&filtered, v, ci);
+    }
+    if (check) {                                    /* phase 3: the rest of the filtered system */
+        check->selected_bad = check->other_bad = check->other_total = 0;
+        for (size_t ci = 0; ci < nc; ci++) {
+            const Lit *cl = cnf_clause(&filtered, ci);
+            size_t len = cnf_clause_len(&filtered, ci);
+            double sum = 0;
+            for (size_t k = 0; k < len; k++)
+                sum += cl[k].positive ? v[cl[k].var] : -v[cl[k].var];
+            bool bad = len && (sum < 1.0 - 1e-9 || sum > 1.0 + 1e-9);
+            if (sel[ci]) { if (bad) check->selected_bad++; }
+            else { check->other_total++; if (bad) check->other_bad++; }
+        }
+    }
+    gob_decode_and_repair(s, v, a);
+    free(v); free(a); free(sel); cnf_free(&filtered);
+    return true;
+}
+
+/* ---- Likho: zero start + switch-domain repair pass --------------------- */
+
+/* A switch domain of a prime is the set of unflipped variables that must flip
+ * with it so that no currently satisfied clause becomes rogue. A neutral is
+ * its own domain; a prime needs a repair for every clause it solely supports,
+ * and a repair may itself be a prime, so domains can chain. Domains are
+ * recomputed after each firing and `flipped` enforces the gold rule (every
+ * variable fires once): two primes whose domains share a variable share that
+ * single flip, and a prime whose domain conflicts with an already fired one is
+ * simply not fired. */
+/* shortcut: a prime whose domain needs more than either bound is skipped, not
+ * solved; -deep-dive raises the bounds. */
+
+typedef struct {
+    Solver *s;
+    const unsigned char *flipped;
+    unsigned char *in;   /* membership of the domain under construction */
+    size_t *dom;         /* dom[0] is the prime the domain is for */
+    size_t n, nodes, max_vars, max_nodes;
+} LikhoSearch;
+
+/* Support of `clause` after flipping every variable of the domain once.
+ * Clauses with no domain variable keep their count and are never examined. */
+static uint32_t likho_sat_after(const LikhoSearch *d, size_t clause) {
+    const Lit *c = cnf_clause(d->s->cnf, clause);
+    size_t n = cnf_clause_len(d->s->cnf, clause);
+    uint32_t cnt = 0;
+    for (size_t k = 0; k < n; k++)
+        cnt += lit_value(c[k], d->s->assignment[c[k].var]) != d->in[c[k].var];
+    return cnt;
+}
+
+/* true when flipping v alone cannot un-satisfy a clause; those "free" repairs
+ * are tried first because they add no new breakage to the domain. */
+static bool likho_breaks_nothing(const Solver *s, size_t v) {
+    bool val = s->assignment[v];
+    for (size_t i = s->occ_off[v]; i < s->occ_off[v + 1]; i++) {
+        Occ o = s->occ[i];
+        if (o.positive == val && s->sat[o.clause] == 1) return false;
+    }
+    return true;
+}
+
+/* Close the domain: every clause it broke needs a repair from one of its own
+ * false literals, recursively. A clause with no free false literal backtracks. */
+static bool likho_close(LikhoSearch *d) {
+    if (++d->nodes > d->max_nodes) return false;
+    Solver *s = d->s;
+    for (size_t i = 0; i < d->n; i++) {
+        size_t v = d->dom[i];
+        for (size_t j = s->occ_off[v]; j < s->occ_off[v + 1]; j++) {
+            size_t c = s->occ[j].clause;
+            if (likho_sat_after(d, c) != 0) continue;
+            if (d->n >= d->max_vars) return false;
+            const Lit *cl = cnf_clause(s->cnf, c);
+            size_t len = cnf_clause_len(s->cnf, c);
+            for (int pass = 0; pass < 2; pass++)
+                for (size_t k = 0; k < len; k++) {
+                    size_t u = cl[k].var;
+                    if (d->in[u] || d->flipped[u]) continue;
+                    if (lit_value(cl[k], s->assignment[u])) continue;   /* must be false to help */
+                    if ((pass == 0) != likho_breaks_nothing(s, u)) continue;
+                    d->in[u] = 1; d->dom[d->n++] = u;
+                    if (likho_close(d)) return true;
+                    d->n--; d->in[u] = 0;
+                }
+            return false;   /* this clause cannot be repaired: backtrack */
+        }
+    }
+    return true;   /* nothing broke */
+}
+
+/* Switch domain of v, or 0 when none fits the size/node bounds. On success the
+ * membership flags are cleared again; the caller applies dom[0..n). */
+static size_t likho_domain(Solver *s, size_t v, const unsigned char *flipped,
+                           unsigned char *in, size_t *dom,
+                           size_t max_vars, size_t max_nodes) {
+    LikhoSearch d = { s, flipped, in, dom, 1, 0, max_vars, max_nodes };
+    dom[0] = v;
+    in[v] = 1;
+    bool ok = likho_close(&d);
+    for (size_t i = 0; i < d.n; i++) in[dom[i]] = 0;  /* failed search leaves n == 1 */
+    return ok ? d.n : 0;
+}
+
+/* One neutral flip per rogue clause: it breaks nothing, so it only removes
+ * clauses from the rogue set. Returns true if anything fired. */
+static bool likho_neutral_pass(Solver *s, const size_t *snap, size_t nr,
+                               unsigned char *flipped) {
+    bool moved = false;
+    for (size_t i = 0; i < nr; i++) {
+        size_t c = snap[i];
+        if (!solver_clause_is_rogue(s, c)) continue;
+        const Lit *cl = cnf_clause(s->cnf, c);
+        size_t len = cnf_clause_len(s->cnf, c);
+        for (size_t k = 0; k < len; k++) {
+            size_t v = cl[k].var;
+            if (flipped[v]) continue;
+            if (solver_refresh_var(s, v).state != VAR_NEUTRAL) continue;
+            solver_flip(s, v);
+            flipped[v] = 1;
+            moved = true;
+            break;
+        }
+    }
+    return moved;
+}
+
+/* One closed switch domain per rogue clause. A closed domain adds no rogue
+ * clause, so this pass can keep going and the next round re-derives the states
+ * it changed. Returns true if anything fired. */
+static bool likho_domain_pass(Solver *s, const size_t *snap, size_t nr,
+                              unsigned char *flipped, unsigned char *in, size_t *dom,
+                              size_t max_vars, size_t max_nodes) {
+    bool moved = false;
+    for (size_t i = 0; i < nr; i++) {
+        size_t c = snap[i];
+        if (!solver_clause_is_rogue(s, c)) continue;
+        const Lit *cl = cnf_clause(s->cnf, c);
+        size_t len = cnf_clause_len(s->cnf, c);
+        for (size_t k = 0; k < len; k++) {
+            size_t v = cl[k].var;
+            if (flipped[v]) continue;
+            size_t n = likho_domain(s, v, flipped, in, dom, max_vars, max_nodes);
+            if (n == 0) continue;
+            for (size_t j = 0; j < n; j++) { solver_flip(s, dom[j]); flipped[dom[j]] = 1; }
+            moved = true;
+            break;
+        }
+    }
+    return moved;
+}
+
+bool solver_likho(Solver *s, const SolverConfig *cfg) {
+    size_t nv = s->cnf->n_vars, nc = s->cnf->n_clauses;
+    size_t max_vars = cfg && cfg->likho_domain_max ? cfg->likho_domain_max : LIKHO_DOMAIN_MAX;
+    size_t max_nodes = cfg && cfg->likho_search_nodes ? cfg->likho_search_nodes : LIKHO_SEARCH_NODES;
+    bool domains_first = cfg && cfg->likho_domains_first;
+    InitMode pre = cfg ? cfg->likho_pre_cook : INIT_ZERO;
+    if (max_vars > nv) max_vars = nv;   /* a domain cannot be larger than the formula */
+    if (max_vars == 0) max_vars = 1;    /* domain of one: the prime alone, no repair */
+    if (pre == INIT_MAJORITY) solver_init_majority(s);
+    else if (pre == INIT_RAREST) { if (!solver_init_rarest(s)) return false; }
+    else if (pre == INIT_GLOWEST) { if (!solver_init_glowest(s)) return false; }
+    else if (pre == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(s)) return false; }
+    else if (pre == INIT_GOB) { if (!solver_init_gob(s)) return false; }
+    else if (pre == INIT_GOB_SQUARE) { if (!solver_init_gob_square(s, NULL)) return false; }
+    else {
+        memset(s->assignment, 0, nv * sizeof *s->assignment);
+        rebuild_counts(s);
+    }
+    unsigned char *flipped = calloc(nv ? nv : 1, 1);
+    unsigned char *in = calloc(nv ? nv : 1, 1);
+    size_t *snap = malloc((nc ? nc : 1) * sizeof *snap);
+    size_t *dom = malloc(max_vars * sizeof *dom);
+    if (!flipped || !in || !snap || !dom) {
+        free(flipped); free(in); free(snap); free(dom);
+        return false;
+    }
+    while (s->n_rogue > 0) {
+        size_t nr = s->n_rogue;
+        memcpy(snap, s->rogue, nr * sizeof *snap);
+        /* With -deep-dive the domain pass goes first; either way the other
+         * pass runs only when this one found nothing, then the next round
+         * re-snapshots so freshly liberated primes are seen as neutral. */
+        bool moved = domains_first
+            ? likho_domain_pass(s, snap, nr, flipped, in, dom, max_vars, max_nodes)
+            : likho_neutral_pass(s, snap, nr, flipped);
+        if (!moved)
+            moved = domains_first
+                ? likho_neutral_pass(s, snap, nr, flipped)
+                : likho_domain_pass(s, snap, nr, flipped, in, dom, max_vars, max_nodes);
+        if (!moved) break;   /* stuck: no neutral and no switch domain anywhere */
+    }
+    free(flipped); free(in); free(snap); free(dom);
+    return true;
+}
+
+static ResultSolve make_sat(const Solver *s, size_t steps, size_t restart) {
+    size_t nv = s->cnf->n_vars;
+    bool *a = malloc(nv ? nv : 1);
+    if (!a) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+    if (nv) memcpy(a, s->assignment, nv);
+    return OK(ResultSolve, ((SolveResult){ SOLVE_SAT, a, nv, steps, restart, 0, NULL, 0 }));
+}
+
+/* Sound UNSAT pre-check: only a unit clause and its negation are contradictory.
+ * For length >= 2, a clause and its pointwise negation are satisfiable, e.g.
+ * (1 2 3) and (-1 -2 -3) are both true at x1=1, x2=0, x3=0. */
+bool cnf_find_contradictions(const Cnf *cnf, Contradiction **out, size_t *out_n) {
+    size_t nv = cnf->n_vars;
+    size_t *pos = malloc((nv ? nv : 1) * sizeof *pos);
+    size_t *neg = malloc((nv ? nv : 1) * sizeof *neg);
+    *out = NULL;
+    *out_n = 0;
+    if (!pos || !neg) { free(pos); free(neg); return false; }
+    for (size_t v = 0; v < nv; v++) pos[v] = neg[v] = SIZE_MAX;
+    size_t n = 0, cap = 0;
+    Contradiction *list = NULL;
+    for (size_t ci = 0; ci < cnf->n_clauses; ci++) {
+        if (cnf_clause_len(cnf, ci) != 1) continue;
+        Lit l = cnf_clause(cnf, ci)[0];
+        size_t *same = l.positive ? &pos[l.var] : &neg[l.var];
+        size_t *opp = l.positive ? &neg[l.var] : &pos[l.var];
+        if (*opp != SIZE_MAX) {
+            if (n == cap) {
+                size_t ncap = cap ? cap * 2 : 8;
+                Contradiction *p = realloc(list, ncap * sizeof *p);
+                if (!p) { free(pos); free(neg); free(list); return false; }
+                list = p; cap = ncap;
+            }
+            list[n++] = l.positive ? (Contradiction){ ci, *opp }
+                                   : (Contradiction){ *opp, ci };
+        }
+        *same = ci;
+    }
+    free(pos); free(neg);
+    *out = list;
+    *out_n = n;
+    return true;
+}
+
+ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
+    const Cnf *cnf = s->cnf;
+    Contradiction *contradictions = NULL;
+    size_t n_contradictions = 0;
+    if (!cnf_find_contradictions(cnf, &contradictions, &n_contradictions))
+        return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+    if (n_contradictions)
+        return OK(ResultSolve, ((SolveResult){ SOLVE_UNSAT, NULL, cnf->n_vars, 0, 0, 0,
+                                               contradictions, n_contradictions }));
+    for (size_t i = 0; i < cnf->n_clauses; i++)
+        if (cnf_clause_len(cnf, i) == 0)
+            return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, cnf->n_clauses, NULL, 0 }));
+    if (cnf->n_clauses == 0) {
+        memset(s->assignment, 0, cnf->n_vars);
+        return make_sat(s, 0, 0);
+    }
+    PickFn pick = cfg->pick ? cfg->pick : pick_ranked;
+    size_t total = 0, best = SIZE_MAX;
+    for (size_t restart = 0; restart <= cfg->restarts; restart++) {
+        if (restart == 0 && cfg->initial) {
+            if (cnf->n_vars) memcpy(s->assignment, cfg->initial, cnf->n_vars);
+            rebuild_counts(s);
+        } else if (restart == 0 && cfg->init == INIT_RAREST) {
+            if (!solver_init_rarest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_GLOWEST) {
+            if (!solver_init_glowest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_MIN_OVERLAP) {
+            if (!solver_init_min_overlap(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_GOB) {
+            if (!solver_init_gob(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_GOB_SQUARE) {
+            if (!solver_init_gob_square(s, NULL)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_LIKHO) {
+            if (!solver_likho(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else {
+            random_assignment(s, restart == 0);
+        }
+        for (size_t step = 0; step < cfg->max_steps; step++) {
+            if (s->n_rogue == 0) return make_sat(s, total, restart);
+            if (s->n_rogue < best) best = s->n_rogue;
+            size_t clause = s->rogue[rng_index(&s->rng, s->n_rogue)];
+            size_t n = rank_candidates(s, clause);
+            if (n == 0) break;
+            solver_flip(s, pick(&s->rng, s->cands, n, cfg->noise));
+            total++;
+            if (cfg->on_progress && cfg->progress_every && total % cfg->progress_every == 0)
+                cfg->on_progress(cfg->progress_ctx, total, s->n_rogue);
+        }
+        if (s->n_rogue == 0) return make_sat(s, total, restart);  /* last flip solved it */
+    }
+    if (s->n_rogue < best) best = s->n_rogue;
+    return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, total, 0, best, NULL, 0 }));
+}
+
+void solve_result_free(SolveResult *r) {
+    free(r->assignment);
+    free(r->contradictions);
+    r->assignment = NULL;
+    r->contradictions = NULL;
+}
+
+/* ---- introspection ---------------------------------------------------- */
+
+const bool *solver_assignment(const Solver *s) { return s->assignment; }
+size_t solver_unsatisfied_count(const Solver *s) { return s->n_rogue; }
+bool solver_clause_is_rogue(const Solver *s, size_t c) { return s->sat[c] == 0; }
+size_t solver_clause_support(const Solver *s, size_t c) { return s->sat[c]; }
+
+const VarStats *solver_var_stats(Solver *s) {
+    if (s->stats_dirty) refresh_all(s);
+    return s->stats;
+}
+
+void solver_init_majority(Solver *s) { random_assignment(s, true); }
+const size_t *solver_rogue_list(const Solver *s) { return s->rogue; }
+VarStats solver_refresh_var(Solver *s, size_t v) { refresh_var(s, v); return s->stats[v]; }
+size_t solver_occ_count(const Solver *s, size_t v) { return occ_count(s, v); }
+size_t solver_occ_clause(const Solver *s, size_t v, size_t i) { return s->occ[s->occ_off[v] + i].clause; }
+
+void solver_set_assignment(Solver *s, const bool *a) {
+    if (s->cnf->n_vars) memcpy(s->assignment, a, s->cnf->n_vars);
+    rebuild_counts(s);
+}
