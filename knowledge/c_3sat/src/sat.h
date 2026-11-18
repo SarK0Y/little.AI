@@ -104,6 +104,7 @@ typedef enum {
     INIT_GLOWEST,   /* constructive: most frequent variables first, see solver_init_glowest() */
     INIT_MIN_OVERLAP, /* constructive: most frequent first, then least-overlapping, see solver_init_min_overlap() */
     INIT_GOB,       /* linear relaxation of the clause system, see solver_init_gob() */
+    INIT_GOB_SIGN,  /* the same system decoded by sign, see solver_init_gob_sign() */
     INIT_GOB_SQUARE, /* square subsystem of that system, see solver_init_gob_square() */
     INIT_LIKHO,     /* pre-cooked start (all false by default), then a one-flip-per-variable repair pass */
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
@@ -189,6 +190,9 @@ bool solver_init_min_overlap(Solver *s);
  * then a greedy pass flips bits that satisfy more rogue clauses than they break.
  * Deterministic, no RNG. false only on allocation failure. */
 bool solver_init_gob(Solver *s);
+/* The same system and repair, decoded by sign (positive = true) instead of by
+ * magnitude parity. Deterministic, no RNG. false only on allocation failure. */
+bool solver_init_gob_sign(Solver *s);
 /* What the square subsystem's solution does to the equations it was not built
  * from: phase 3 of solver_init_gob_square(). */
 typedef struct {
@@ -198,7 +202,7 @@ typedef struct {
 } GobSquareCheck;
 /* Gob over a square subsystem: pick n of the m equations (strided, one every
  * m/n clauses), solve just those by Kaczmarz, report what the solution does to
- * the rest, then decode and repair exactly like solver_init_gob(). The rows can
+ * the rest, then decode by sign and repair like solver_init_gob_sign(). The rows can
  * be dependent and the values are fractional, so this is a seed, not a solve.
  * `check` may be NULL. Deterministic, no RNG. false only on allocation failure. */
 bool solver_init_gob_square(Solver *s, GobSquareCheck *check);

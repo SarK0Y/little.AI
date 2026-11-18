@@ -622,7 +622,7 @@ static void test_init_min_overlap_hand_checked(void) {
 }
 
 static void test_init_gob_hand_checked(void) {
-    /* Units pin the decode: 1 is +x = 1, -2 is -x = 1 (shifted to false), 3 is
+    /* Units pin the decode: 1 is +x = 1, -2 is -x = 1 (negative, so false), 3 is
      * +x = 1, so the start is exactly (true, false, true). */
     Cnf c = must_parse("p cnf 3 3\n1 0\n-2 0\n3 0\n");
     Solver *s = must_solver(&c, 1);
@@ -632,7 +632,7 @@ static void test_init_gob_hand_checked(void) {
     CHECK(solver_unsatisfied_count(s) == 0);
     solver_free(s); cnf_free(&c);
 
-    /* A single clause 1 2 projects to (1/2, 1/2): both round up, so it holds. */
+    /* A single clause 1 2 projects to (1/2, 1/2): both positive, so it holds. */
     Cnf d = must_parse("p cnf 2 1\n1 2 0\n");
     s = must_solver(&d, 1);
     CHECK(solver_init_gob(s));
@@ -663,9 +663,53 @@ static void test_init_gob_hand_checked(void) {
     solver_free(s); cnf_free(&g);
 }
 
+static void test_init_gob_sign_hand_checked(void) {
+    /* Units: 1 is +x = 1, -2 is -x = 1 (negative, so false), 3 is +x = 1. */
+    Cnf c = must_parse("p cnf 3 3\n1 0\n-2 0\n3 0\n");
+    Solver *s = must_solver(&c, 1);
+    CHECK(solver_init_gob_sign(s));
+    const bool *a = solver_assignment(s);
+    CHECK(a[0] && !a[1] && a[2]);
+    CHECK(solver_unsatisfied_count(s) == 0);
+    solver_free(s); cnf_free(&c);
+
+    /* Mixed signs: (1 -2) projects to (1/2, -1/2); the sign decode makes the
+     * second bit false, where gob's magnitude decode makes it true. The clause
+     * holds on the first literal. */
+    Cnf e = must_parse("p cnf 2 1\n1 -2 0\n");
+    s = must_solver(&e, 1);
+    CHECK(solver_init_gob_sign(s));
+    a = solver_assignment(s);
+    CHECK(a[0] && !a[1] && solver_unsatisfied_count(s) == 0);
+    solver_free(s); cnf_free(&e);
+
+    /* Negative clause (-1 -2) projects to (-1/2, -1/2): both bits false, which
+     * satisfies the clause. gob's magnitude decode makes both true and has to
+     * repair it, so this pins the sign rule for negative fractions. */
+    Cnf k = must_parse("p cnf 2 1\n-1 -2 0\n");
+    s = must_solver(&k, 1);
+    CHECK(solver_init_gob_sign(s));
+    a = solver_assignment(s);
+    CHECK(!a[0] && !a[1] && solver_unsatisfied_count(s) == 0);
+    solver_free(s); cnf_free(&k);
+
+    /* Empty clause and empty formula: no crash; the empty clause stays rogue. */
+    Cnf f = must_parse("p cnf 1 1\n0\n");
+    s = must_solver(&f, 1);
+    CHECK(solver_init_gob_sign(s));
+    CHECK(solver_unsatisfied_count(s) == 1);
+    solver_free(s); cnf_free(&f);
+
+    Cnf g = must_parse("p cnf 0 0\n");
+    s = must_solver(&g, 1);
+    CHECK(solver_init_gob_sign(s));
+    CHECK(solver_unsatisfied_count(s) == 0);
+    solver_free(s); cnf_free(&g);
+}
+
 static void test_init_gob_square_hand_checked(void) {
-    /* Square system == the whole system here (n == m), so the decode matches gob:
-     * (true, false, true). Phase 3 has no other rows to check. */
+    /* Square system == the whole system here (n == m); the sign decode gives the
+     * same (true, false, true) as gob on these units. Phase 3 has no other rows. */
     Cnf c = must_parse("p cnf 3 3\n1 0\n-2 0\n3 0\n");
     Solver *s = must_solver(&c, 1);
     GobSquareCheck chk;
@@ -676,6 +720,14 @@ static void test_init_gob_square_hand_checked(void) {
     CHECK(chk.selected_bad == 0);
     CHECK(chk.other_total == 0 && chk.other_bad == 0);
     solver_free(s); cnf_free(&c);
+
+    /* Same square case as gob: (1 -2) decodes (true, false) by sign. */
+    Cnf m = must_parse("p cnf 2 1\n1 -2 0\n");
+    s = must_solver(&m, 1);
+    CHECK(solver_init_gob_square(s, &chk));
+    a = solver_assignment(s);
+    CHECK(a[0] && !a[1] && solver_unsatisfied_count(s) == 0);
+    solver_free(s); cnf_free(&m);
 
     /* m > n: exactly n rows are selected, the other m - n are reported on. */
     Cnf d = must_parse("p cnf 2 3\n1 2 0\n1 -2 0\n-1 2 0\n");
@@ -749,6 +801,35 @@ static void test_init_gob_properties(void) {
         solver_free(a); solver_free(b);
 
         Solver *s = must_solver(&c, 5);                       /* plain solver from the gob start */
+        ResultSolve r = solver_solve(s, &cfg);
+        CHECK(r.ok);
+        if (r.ok && r.val.status == SOLVE_SAT) CHECK(verify(&c, r.val.assignment, r.val.n_vars));
+        if (r.ok) solve_result_free(&r.val);
+        solver_free(s);
+
+        GroupConfig gc = group_config_default();               /* and the group solver */
+        gc.max_groups = 64;
+        ResultGroup g = group_solve(&c, &cfg, &gc);
+        CHECK(g.ok);
+        if (g.ok) { check_group_result(&c, &g.val); group_result_free(&g.val); }
+        cnf_free(&c);
+    }
+}
+
+static void test_init_gob_sign_properties(void) {
+    SolverConfig cfg = solver_config_default();
+    cfg.init = INIT_GOB_SIGN;
+    cfg.max_steps = 20000; cfg.restarts = 2;
+    for (int i = 0; i < 25; i++) {
+        int n = 60 + 20 * (i % 4);
+        Cnf c = random_cnf(n, (int)(n * (2.0 + 0.4 * (i % 5))), 1100 + (uint64_t)i);
+        Solver *a = must_solver(&c, 1), *b = must_solver(&c, 99);   /* different RNG seeds: no randomness used */
+        CHECK(solver_init_gob_sign(a) && solver_init_gob_sign(b));
+        CHECK(memcmp(solver_assignment(a), solver_assignment(b), c.n_vars) == 0);   /* deterministic */
+        CHECK(solver_unsatisfied_count(a) == brute_unsat(&c, solver_assignment(a))); /* counters consistent */
+        solver_free(a); solver_free(b);
+
+        Solver *s = must_solver(&c, 5);                       /* plain solver from the sign start */
         ResultSolve r = solver_solve(s, &cfg);
         CHECK(r.ok);
         if (r.ok && r.val.status == SOLVE_SAT) CHECK(verify(&c, r.val.assignment, r.val.n_vars));
@@ -955,6 +1036,14 @@ static void test_likho_pre_cook(void) {
     cfg.likho_pre_cook = INIT_GOB;
     m = must_solver(&c, 1); s = must_solver(&c, 1);
     CHECK(solver_init_gob(m));
+    CHECK(solver_unsatisfied_count(m) == 0);
+    CHECK(solver_likho(s, &cfg));
+    CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
+    solver_free(m); solver_free(s);
+
+    cfg.likho_pre_cook = INIT_GOB_SIGN;
+    m = must_solver(&c, 1); s = must_solver(&c, 1);
+    CHECK(solver_init_gob_sign(m));
     CHECK(solver_unsatisfied_count(m) == 0);
     CHECK(solver_likho(s, &cfg));
     CHECK(memcmp(solver_assignment(s), solver_assignment(m), c.n_vars) == 0);
@@ -1343,9 +1432,11 @@ int main(void) {
     test_init_glowest_hand_checked();
     test_init_min_overlap_hand_checked();
     test_init_gob_hand_checked();
+    test_init_gob_sign_hand_checked();
     test_init_gob_square_hand_checked();
     test_init_rarest_properties();
     test_init_gob_properties();
+    test_init_gob_sign_properties();
     test_init_gob_square_properties();
     test_glowest_random();
     test_min_overlap_random();

@@ -85,7 +85,7 @@ Adding a heuristic = write a `PickFn`, add one row to `STRATEGIES`.
 
 ## Initial assignment (`--init`)
 
-Restart 0 starts from one of seven starts (later restarts are always random):
+Restart 0 starts from one of eight starts (later restarts are always random):
 
 - `--init majority` (default): every variable takes its majority polarity.
 - `--init rarest`: deterministic constructive start (no RNG), rarest variables first.
@@ -93,7 +93,8 @@ Restart 0 starts from one of seven starts (later restarts are always random):
 - `--init min-overlapping`: deterministic constructive start, first the most
   frequent variable, then the one overlapping the solved part least.
 - `--init gob`: deterministic linear-relaxation start (no RNG), clauses as signed
-  equations solved by Kaczmarz sweeps and decoded mod 2.
+  equations solved by Kaczmarz sweeps and decoded by magnitude parity.
+- `--init gob-sign`: the same system, decoded by sign instead of magnitude.
 - `--init gob-square`: the same, but only `n` of the `m` equations are solved
   (a square subsystem); it reports how many of the remaining equations the
   solution misses.
@@ -101,11 +102,11 @@ Restart 0 starts from one of seven starts (later restarts are always random):
 - `-deep-dive VARS NODES`: implies `--init likho`, caps switch domains at VARS
   variables, gives each prime at most NODES search nodes, and fires domains
   before neutral repairs.
-- `-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-square`: implies `--init likho`;
+- `-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square`: implies `--init likho`;
   phase 1 is that assignment instead of the default all-false one (a partially
   solved input).
 
-The seven starts work in both `plain` and `groups` mode; `-deep-dive` is a variant
+The eight starts work in both `plain` and `groups` mode; `-deep-dive` is a variant
 of `likho`.
 
 ### Rarest / Glowest / Min-overlapping
@@ -133,19 +134,34 @@ They differ only in which unset variable is picked next:
 relaxation, `no_twins` filters the input equation set: synchronous twins
 (identical clauses) and asynchronous twins (the same literals with every sign
 inverted) are reduced to their first occurrence. Literal order does not matter.
-This filtering is local to Gob/Gob-square; the solver and the greedy repair still
-use the complete original CNF. Each remaining clause becomes the signed equation
-`sum(±x) = 1` (a positive literal is `+x`, a negative one `-x`), and 64 cyclic
-Kaczmarz sweeps project the all-zero vector onto that filtered system (one exact
-projection per remaining clause per sweep). Each value is then shifted by the
-smallest non-negative amount, rounded to the nearest integer and taken mod 2,
-which decodes the real vector to booleans. The shift is per variable, not global,
-because a global shift cannot satisfy mixed-sign units: `(x)` and `(-x)` always
-decode to the same parity.
+This filtering is local to Gob/Gob-sign/Gob-square; the solver and the greedy
+repair still use the complete original CNF. Each remaining clause becomes the
+signed equation `sum(±x) = 1` (a positive literal is `+x`, a negative one `-x`),
+and 64 cyclic Kaczmarz sweeps project the all-zero vector onto that filtered
+system (one exact projection per remaining clause per sweep). Each value is then
+shifted by the smallest non-negative amount, rounded to the nearest integer and
+taken mod 2, which decodes the real vector to booleans. The shift is per
+variable, not global, because a global shift cannot satisfy mixed-sign units:
+`(x)` and `(-x)` always decode to the same parity.
 
 The decode is only a starting point, so four greedy passes follow: a variable
 whose bit satisfies more rogue clauses than it breaks is flipped, using the same
 incremental counts as the search. Deterministic, no RNG.
+
+### Gob-sign
+
+`--init gob-sign` runs the same filter, Kaczmarz sweeps and greedy repair, but
+decodes the real vector by sign: positive is true, zero or negative is false.
+
+Sign, not magnitude, is the signal. The equation asks for **two** true literals
+per clause, which a satisfying assignment usually does not give: on 20000/3.5,
+43% of a solution's clauses have exactly one true literal (signed sum `-1`), and
+15% have all three. So 58% of the equations are violated at the true solution,
+its RMS residual is 1.52 -- worse than the Kaczmarz point's own 1.19. The
+minimum of this system is not near SAT. What survives is the sign: it agrees with
+a found solution 63.5% of the time, where the magnitude decode agrees only 52.5%.
+Search from the sign decode alone solves 6/10 of the 20000/3.5 seeds at this
+budget; the greedy repair brings gob-sign to 8/10, where gob solved 0/10.
 
 ### Gob-square
 
@@ -163,7 +179,7 @@ incremental counts as the search. Deterministic, no RNG.
    bench harness prints the averages as `gob-square phase 3`.
 
 The solution is then decoded and repaired against the complete original CNF,
-exactly like `gob`. This is still a seed, not a solve: the selected rows can be linearly dependent (strided
+exactly like `gob-sign`. This is still a seed, not a solve: the selected rows can be linearly dependent (strided
 selection makes no rank guarantee, e.g. `aim-50-3_4-yes1-1` is singular at
 49/50), the values are fractional, and on the AIM corpus phase 3 finds almost
 every unselected equation violated (`rest_bad` 30/30, 99/100, 200/200 on the
@@ -204,23 +220,24 @@ inherits the majority phase's RNG tie-breaking.
 Measured on random 3-SAT, 10 seeds per row (3 seeds for the 5000-var row), 20
 restarts, default solver seed. "old" is the previous total-occurrence rarest order,
 kept for comparison; "likho-dd" is `-deep-dive 32 128`, "likho-pc" is
-`-pre-cook majority`, "sq" is `--init gob-square`. All ten starts share the same
-search code:
+`-pre-cook majority`, "sign" is `--init gob-sign`, "sq" is `--init gob-square`.
+All eleven starts share the same search code:
 
-| instance | broken after init (maj / old / new / glow / mo / gob / likho / dd / pc / sq) | solved | mean flips over solved (maj / old / new / glow / mo / gob / likho / dd / pc / sq) |
+| instance | broken after init (maj / old / new / glow / mo / gob / sign / likho / dd / pc / sq) | solved | mean flips over solved (maj / old / new / glow / mo / gob / sign / likho / dd / pc / sq) |
 |---|---|---|---|
-| 1000 vars, ratio 2.0 | 78 / 15 / 28 / 4.5 / 12.7 / 14.2 / 0 / 0.2 / 0 / 19.2 | 10/10 each | 88 / 47 / 67 / 26 / 27 / 110 / 0 / 1 / 0 / 119 |
-| 1000 vars, ratio 3.5 | 187 / 77 / 98 / 37 / 58 / 61 / 34 / 32 / 10 / 71.5 | 10/10 each | 11.1k / 16.1k / 12.0k / 19.4k / 7.2k / 14.1k / 18.1k / 17.6k / 9.8k / 26.6k |
-| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 / 783 / 1213 / 1275 / 742 / 637 / 209 / 1380 | 9/10, 9/10, 9/10, 10/10, 8/10, 0/10, 0/10, 0/10, 9/10, 0/10 | 123k / 169k / 162k / 129k / 143k / — / — / — / 129k / — |
-| 5000 vars, ratio 3.9 | 1098 / 482 / 631 / 274 / 396 / 411 / 385 / 337 / 126 / 436 | 2/3 each | 3.06M / 0.76M / 1.84M / 4.40M / 4.40M / 1.88M / 4.40M / 4.40M / 5.68M / 4.40M |
-| AIM yes-set, 48 instances | 46 / 18 / 21 / 16.7 / 19.0 / 17.2 / 23 / 22 / 22 / 16.8 | 27 / 31 / 31 / 31 / 31 / 31 / 31 / 31 / 27 / 31 | — |
+| 1000 vars, ratio 2.0 | 78 / 15 / 28 / 4.5 / 12.7 / 14.2 / 4.0 / 0 / 0.2 / 0 / 13.6 | 10/10 each | 88 / 47 / 67 / 26 / 27 / 110 / 25 / 0 / 1 / 0 / 87 |
+| 1000 vars, ratio 3.5 | 187 / 77 / 98 / 37 / 58 / 61 / 45 / 34 / 32 / 10 / 60 | 10/10 each | 11.1k / 16.1k / 12.0k / 19.4k / 7.2k / 14.1k / 6.5k / 18.1k / 17.6k / 9.8k / 18.7k |
+| 20000 vars, ratio 3.5 | 3802 / 1527 / 2024 / 783 / 1213 / 1275 / 922 / 742 / 637 / 209 / 1240 | 9/10, 9/10, 9/10, 10/10, 8/10, 0/10, 8/10, 0/10, 0/10, 9/10, 0/10 | 123k / 169k / 162k / 129k / 143k / — / 168k / — / — / 129k / — |
+| 5000 vars, ratio 3.9 | 1098 / 482 / 631 / 274 / 396 / 411 / 309 / 385 / 337 / 126 / 392 | 2/3 each | 3.06M / 0.76M / 1.84M / 4.40M / 4.40M / 1.88M / 3.37M / 4.40M / 4.40M / 5.68M / 4.40M |
+| AIM yes-set, 48 instances | 46 / 18 / 21 / 16.7 / 19.0 / 17.2 / 16.9 / 23 / 22 / 22 / 16.4 | 27 / 31 / 31 / 31 / 31 / 31 / 31 / 31 / 31 / 27 / 31 | — |
 
-`glowest` is the best init here. It leaves fewer broken clauses than rarest-new on
-every random row (4.5 vs 28, 37 vs 98, 274 vs 631, 783 vs 2024) and at 20000/3.5 it
-is the only start that solves all 10 seeds (init 783, 129k flips, 0.9 s vs 2.4 s for
-majority). On the AIM yes-set it has the lowest init count (16.7) and solves the same
-31 instances as rarest. Taking the highest-overlap variables first pays off where
-rarest's low-overlap-first pass leaves clauses hanging on a single literal.
+`glowest` is the strongest of the three frequency starts. It leaves fewer broken
+clauses than rarest-new on every random row (4.5 vs 28, 37 vs 98, 274 vs 631,
+783 vs 2024) and at 20000/3.5 it is the only start that solves all 10 seeds (init
+783, 129k flips, 0.9 s vs 2.4 s for majority). On the AIM yes-set it is 16.7
+broken, just behind gob-square's 16.4, and solves the same 31 instances as rarest.
+Taking the highest-overlap variables first pays off where rarest's
+low-overlap-first pass leaves clauses hanging on a single literal.
 
 `min-overlapping` sits between rarest-new and glowest on init (12.7 / 58 / 396 /
 1213 / 19.0 on the same rows) and is the fastest frequency start at 1000/3.5
@@ -229,22 +246,34 @@ variables mostly outside the solved part, so the search does not re-enter the sa
 subsystem. It does not scale as well, though: at 20000/3.5 it solves 8/10 where
 glowest solves 10/10.
 
-`gob` is competitive at 1000 vars (init 14.2 / 61, next to min-overlapping's
-12.7 / 58; 110 / 14.1k flips) and on the AIM yes-set (17.2 broken, third behind
-glowest's 16.7 and gob-square's 16.8, and the same 31/48). At 5000/3.9 its 1.88M
-mean flips is second only to rarest-old, but at 20000/3.5 it solves 0/10 like the
-zero start: 1275 broken clauses still sit in a deep basin. The linear relaxation
-finds a good decode, not a good basin.
+`gob` (magnitude decode) is the weakest of the two full-system starts. It leaves
+14.2 broken at 1000/2.0 (vs gob-sign's 4.0), 61 at 1000/3.5 (vs 45), 1275 at
+20000/3.5 (vs 922) and 411 at 5000/3.9 (vs 309), and at 20000/3.5 it solves
+0/10 where gob-sign solves 8/10. Its flips are 2-4x higher on the 1000-var rows
+(110 vs 25, 14.1k vs 6.5k) and lower at 5000/3.9 (1.88M vs 3.37M, on the two
+seeds both solve). On the AIM yes-set it is 17.2 broken versus 16.9, and both
+solve the same 31/48. The shift-and-parity decode is kept as the baseline the
+sign decode is measured against.
+
+`gob-sign` is the best non-Likho start at 1000/2.0 (4.0 broken vs glowest's 4.5;
+25 vs 26 flips). At 1000/3.5 it starts higher than glowest (45 vs 37 broken) but
+reaches SAT in a third of the flips (6.5k vs 19.4k). At 20000/3.5 it solves 8/10
+(922 broken, 168k flips), where the magnitude decode solves 0/10. On the AIM
+yes-set it is 16.9 broken, behind gob-square's 16.4 and glowest's 16.7, and
+solves the same 31/48. At 5000/3.9 its 3.37M mean flips is behind both rarest
+orders. The sign is what makes the relaxation usable; the equation itself (two
+true literals per clause) is not a SAT objective.
 
 `gob-square` shows what the square subsystem does and does not buy. Its phase-3
 report says the solution does not satisfy the system: at 1000 vars ~89% of the
 selected rows and every unselected row are violated, and at 20000 vars
 17.8k of 20000 selected and 50.0k of 50.0k unselected. Kaczmarz has not converged
 in 512 sweeps, and with `m > n` the full system has no exact solution anyway.
-As a seed it is the second-best init on the AIM yes-set (16.8, behind glowest's
-16.7) and solves the same 31/48, but on random 3-SAT it is worse than the
-full-system gob on every row (19.2 vs 14.2, 71.5 vs 60.6, 1380 vs 1275, 436 vs
-411 broken) and changes no solved count, for 8x the sweeps.
+As a seed it is the best init on the AIM yes-set (16.4, ahead of glowest's 16.7)
+and solves the same 31/48. On random 3-SAT it is marginally better than the
+magnitude `gob` (13.6 vs 14.2, 60 vs 61, 1240 vs 1275, 392 vs 411 broken) but
+clearly behind the sign `gob-sign` on every row (vs 4.0, 45, 922, 309), and at
+20000/3.5 it solves 0/10 where gob-sign solves 8/10, for 8x the sweeps.
 
 The zero start still leaves 3-5x fewer broken clauses than majority, and it solves
 1000/2.0 outright at init (zero flips), but it is a much deeper local minimum. At
@@ -282,7 +311,7 @@ is hit the same way: its leftover barely changed (e.g. 105.7 -> 95.0 unmerged at
 ### Coverage: instances no start can solve
 
 The per-start counts above hide whether a failure is shared. Taking the union over
-all ten starts:
+all eleven starts:
 
 - **Random 3-SAT: 0 unsolved by all.** Every generated instance in the table was
   solved by at least one start, even where individual starts missed it (e.g. the
@@ -293,17 +322,17 @@ all ten starts:
   `100-2_0-yes1-{1,2,4}` (7), 200-var `200-1_6-yes1-{1..4}` and
   `200-2_0-yes1-{1..4}` (8).
 - The AIM union is exactly rarest's 31: `glowest`, `min-overlapping`, `gob`,
-  `gob-square`, zero-start Likho and deep-dive each solve that identical set, so
+  `gob-sign`, `gob-square`, zero-start Likho and deep-dive each solve that identical set, so
   the extra starts add no new instance beyond rarest. Only `majority` and the majority pre-cook miss
   four of them.
 
 Reproduce with `make bench-rarest ARGS="1000 3.5 10 200000 9"` (or
 `ARGS="file.cnf 100000 20"`); `steps = 0` measures init quality only. The harness
-also reimplements the old total-occurrence order as a baseline, so all ten starts
-run the same search code; its glowest row is `--init glowest`, its min-overlapping
-row is `--init min-overlapping`, its gob row is `--init gob`, its gob-square row
-is `--init gob-square`, its deep-dive row uses `-deep-dive 32 128` and its
-pre-cook row uses `-pre-cook majority`.
+also reimplements the old total-occurrence order as a baseline, so all eleven
+starts run the same search code; its glowest row is `--init glowest`, its
+min-overlapping row is `--init min-overlapping`, its gob row is `--init gob`, its
+gob-sign row is `--init gob-sign`, its gob-square row is `--init gob-square`, its
+deep-dive row uses `-deep-dive 32 128` and its pre-cook row uses `-pre-cook majority`.
 
 ## Group mode (`--mode groups`)
 

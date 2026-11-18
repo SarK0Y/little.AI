@@ -740,11 +740,16 @@ bool solver_init_min_overlap(Solver *s) { return init_order(s, ORDER_MIN_OVERLAP
 
 /* Every clause becomes the signed equation sum(+-x) = 1: a positive literal is
  * +x, a negative one -x. Cyclic Kaczmarz projections (one per clause per sweep)
- * solve it in the least-squares sense. Each value is then shifted by the
- * smallest non-negative amount (so -x = 1 decodes to false, not true), rounded,
- * and taken mod 2. A greedy pass then flips a decoded variable whenever it
- * satisfies more rogue clauses than it breaks, adapting the bits to the formula.
- * Deterministic, no RNG. */
+ * solve it in the least-squares sense. A greedy pass then flips a decoded
+ * variable whenever it satisfies more rogue clauses than it breaks, adapting the
+ * bits to the formula. Deterministic, no RNG.
+ *
+ * Two decodes share that system. `gob` shifts each negative value by the
+ * smallest non-negative amount (so -x = 1 decodes to false, not true), rounds
+ * and takes mod 2. `gob-sign` takes the sign instead: the equation asks for two
+ * true literals per clause, which a satisfying assignment usually does not give,
+ * so the Kaczmarz point is not near SAT and the magnitude is not a SAT signal,
+ * but the sign still correlates with a solution. See the sign-decode test. */
 #define GOB_SWEEPS 64     /* Kaczmarz passes over the whole clause system */
 #define GOB_SQUARE_SWEEPS 512  /* the square system converges slower than the full one */
 #define GOB_PASSES 4      /* greedy adaptation passes over the decoded bits */
@@ -762,20 +767,29 @@ static void gob_project(const Cnf *cnf, double *v, size_t ci) {
         v[cl[k].var] += cl[k].positive ? step : -step;
 }
 
-/* Decode the real vector to booleans, then run the greedy repair passes. */
-static void gob_decode_and_repair(Solver *s, const double *v, bool *a) {
-    size_t nv = s->cnf->n_vars;
+/* Magnitude decode: shift the negative away, round to nearest, take mod 2. */
+static void gob_decode_parity(const double *v, bool *a, size_t nv) {
     for (size_t i = 0; i < nv; i++) {
         double u = v[i];
-        if (u < 0) {                                  /* shift the negative away */
+        if (u < 0) {
             long long sh = (long long)(-u);
             if ((double)sh < -u) sh++;
             u += (double)sh;
         }
-        a[i] = (((long long)(u + 0.5)) & 1) != 0;     /* round to nearest, mod 2 */
+        a[i] = (((long long)(u + 0.5)) & 1) != 0;
     }
-    solver_set_assignment(s, a);
-    for (int pass = 0; pass < GOB_PASSES; pass++) {   /* step 4: best correlation */
+}
+
+/* Sign decode: positive is true, zero or negative is false. */
+static void gob_decode_sign(const double *v, bool *a, size_t nv) {
+    for (size_t i = 0; i < nv; i++) a[i] = v[i] > 0;
+}
+
+/* Step 4: flip a decoded variable when it satisfies more rogue clauses than it
+ * breaks. */
+static void gob_repair(Solver *s) {
+    size_t nv = s->cnf->n_vars;
+    for (int pass = 0; pass < GOB_PASSES; pass++) {
         size_t flips = 0;
         for (size_t i = 0; i < nv; i++) {
             refresh_var(s, i);
@@ -786,7 +800,8 @@ static void gob_decode_and_repair(Solver *s, const double *v, bool *a) {
     }
 }
 
-bool solver_init_gob(Solver *s) {
+/* Full-system start: project the filtered clauses, decode, repair. */
+static bool gob_full(Solver *s, bool sign) {
     Cnf filtered = {0};
     if (!no_twins(s->cnf, &filtered)) return false;
     size_t nv = s->cnf->n_vars, nc = filtered.n_clauses;
@@ -795,10 +810,16 @@ bool solver_init_gob(Solver *s) {
     if (!v || !a) { free(v); free(a); cnf_free(&filtered); return false; }
     for (size_t sweep = 0; sweep < GOB_SWEEPS; sweep++)
         for (size_t ci = 0; ci < nc; ci++) gob_project(&filtered, v, ci);
-    gob_decode_and_repair(s, v, a);
+    if (sign) gob_decode_sign(v, a, nv);
+    else gob_decode_parity(v, a, nv);
+    solver_set_assignment(s, a);
+    gob_repair(s);
     free(v); free(a); cnf_free(&filtered);
     return true;
 }
+
+bool solver_init_gob(Solver *s) { return gob_full(s, false); }
+bool solver_init_gob_sign(Solver *s) { return gob_full(s, true); }
 
 bool solver_init_gob_square(Solver *s, GobSquareCheck *check) {
     Cnf filtered = {0};
@@ -828,7 +849,9 @@ bool solver_init_gob_square(Solver *s, GobSquareCheck *check) {
             else { check->other_total++; if (bad) check->other_bad++; }
         }
     }
-    gob_decode_and_repair(s, v, a);
+    gob_decode_sign(v, a, nv);
+    solver_set_assignment(s, a);
+    gob_repair(s);
     free(v); free(a); free(sel); cnf_free(&filtered);
     return true;
 }
@@ -979,6 +1002,7 @@ bool solver_likho(Solver *s, const SolverConfig *cfg) {
     else if (pre == INIT_GLOWEST) { if (!solver_init_glowest(s)) return false; }
     else if (pre == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(s)) return false; }
     else if (pre == INIT_GOB) { if (!solver_init_gob(s)) return false; }
+    else if (pre == INIT_GOB_SIGN) { if (!solver_init_gob_sign(s)) return false; }
     else if (pre == INIT_GOB_SQUARE) { if (!solver_init_gob_square(s, NULL)) return false; }
     else {
         memset(s->assignment, 0, nv * sizeof *s->assignment);
@@ -1085,6 +1109,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_min_overlap(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GOB) {
             if (!solver_init_gob(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_GOB_SIGN) {
+            if (!solver_init_gob_sign(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GOB_SQUARE) {
             if (!solver_init_gob_square(s, NULL)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_LIKHO) {

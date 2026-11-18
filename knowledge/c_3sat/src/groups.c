@@ -204,6 +204,7 @@ ResultGroup group_solve(const Cnf *cnf, const SolverConfig *cfg, const GroupConf
     else if (cfg->init == INIT_GLOWEST) { if (!solver_init_glowest(full)) NOMEM(); }
     else if (cfg->init == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(full)) NOMEM(); }
     else if (cfg->init == INIT_GOB) { if (!solver_init_gob(full)) NOMEM(); }
+    else if (cfg->init == INIT_GOB_SIGN) { if (!solver_init_gob_sign(full)) NOMEM(); }
     else if (cfg->init == INIT_GOB_SQUARE) { if (!solver_init_gob_square(full, NULL)) NOMEM(); }
     else if (cfg->init == INIT_LIKHO) { if (!solver_likho(full, cfg)) NOMEM(); }
     else solver_init_majority(full);

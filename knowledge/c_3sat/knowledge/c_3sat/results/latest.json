@@ -1,13 +1,8 @@
 {
   "status": "SAT",
-  "mode": "groups",
   "variables": 3,
-  "clauses": 3,
+  "clauses": 2,
   "steps": 0,
-  "groups": 0,
-  "group_sizes": [],
-  "merged": false,
-  "merge_flips": 0,
-  "merge_flips_free": 0,
+  "restart": 0,
   "assignment": [true, false, true]
 }
