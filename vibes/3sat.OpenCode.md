@@ -2,7 +2,7 @@
 
 **Session ID:** ses_e2ade9666ffe7ylVHrKuP3nWfB
 **Created:** 11/13/2026, 4:38:19 PM
-**Updated:** 11/19/2026, 3:06:32 AM
+**Updated:** 11/19/2026, 3:07:51 PM
 
 ---
 
@@ -66715,3 +66715,1673 @@ Let me do it.
 [no output; output file: /home/evg/.local/share/opencode/shell/25d999a5397eafbd62f7a45098acc92a6518726d/sh_1f11b61aa001AkPaCStmLsO0Rz.out]
 
 Command interrupted by the user (shell ID: sh_1f11b61aa001AkPaCStmLsO0Rz).
+
+---
+
+## User
+
+cont
+
+---
+
+## Assistant
+
+_Thinking:_
+
+The user said "cont" (continue). The last command was interrupted. Let me re-run a lighter version — maybe skip the 40000 sweeps and just do 2000 and 10000, or write it in C for speed. Actually, let's just do a quick C-based check to see if Kaczmarz converges to order-independent least squares. But maybe this is over-detailed. The core findings are already strong:
+
+- equations == clauses
+- ~33% signs flip under row reordering at 20000 vars
+- init unsat barely moves (869–952)
+- outcome flips: seed 4 (0/1) → 8/8 permutations solve; seed 1 (1/1) → 4/8 fail
+- crossed tests isolate start vs search order
+
+The user said "cont" — likely wants me to continue and finish the answer. Let me do a quick, cheap check (smaller sweeps in C or Python limited) and then deliver the final concise answer. Actually the tool call got interrupted — maybe user wants me to just continue with the response, not run more experiments. Let me do a very fast version with fewer sweeps to confirm, then final answer.
+
+Let me run a quick Python with 2000 and 8000 sweeps only (much faster).
+
+**Tool: shell**
+
+**Input:**
+```json
+{
+  "command": "cd /tmp/opencode && timeout 300 python3 - <<'EOF'\nimport numpy as np\nfrom rank import parse\n\ndef kacz(cls, nv, sweeps, order):\n    v = np.zeros(nv)\n    for _ in range(sweeps):\n        for ci in order:\n            cl = cls[ci]\n            s = 0.0\n            for l in cl:\n                s += v[abs(l)-1] if l > 0 else -v[abs(l)-1]\n            step = (1.0 - s) / len(cl)\n            for l in cl:\n                v[abs(l)-1] += step if l > 0 else -step\n    return v\n\nnv, cls = parse('cnf/ex/aim/aim-100-2_0-yes1-1.cnf')\nm = len(cls)\nrng = np.random.default_rng(5)\no1 = list(range(m)); o2 = list(rng.permutation(m))\nA = np.zeros((m,nv))\nfor i,cl in enumerate(cls):\n    for l in cl: A[i,abs(l)-1] = 1.0 if l>0 else -1.0\nxls,*_ = np.linalg.lstsq(A, np.ones(m), rcond=None)\nprint(f\"m={m} n={nv}\")\nfor sw in (1000, 4000):\n    v1=kacz(cls,nv,sw,o1); v2=kacz(cls,nv,sw,o2)\n    print(f\"sweeps={sw}: order diff max|dv|={np.max(np.abs(v1-v2)):.3f}, sign flips={np.sum((v1>0)!=(v2>0))}, \"\n          f\"dist(v,xls)={np.linalg.norm(v1-xls):.2f}/{np.linalg.norm(v2-xls):.2f}\")\nEOF",
+  "timeout": 400000
+}
+```
+
+m=198 n=100
+sweeps=1000: order diff max|dv|=1.622, sign flips=49, dist(v,xls)=5.76/4.83
+sweeps=4000: order diff max|dv|=1.622, sign flips=49, dist(v,xls)=5.76/4.83
+
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Interesting! At 1000 and 4000 sweeps, v is identical (converged for each order), and the two orders differ by max|dv|=1.622, 49 sign flips out of 100, dist to LS x* ≈ 5.76/4.83 — far from the least-squares point. So cyclic Kaczmarz converges to an order-dependent limit cycle/point at a distance from the LS solution. Confirms my claim: for an inconsistent system, the iteration does not converge to the unique least-squares solution; it converges to a different attractor that depends on row order.
+
+Wait — max|dv| identical at 1000 and 4000 exactly (1.622), and flips 49 both. Suggests each order reached a fixed point (or limit cycle sampled at the same phase) by 1000 sweeps and stayed there. dist to xls ~5, not shrinking. So yes: order-dependent limit, not LS.
+
+Now I can give a precise final answer. Keep it concise but complete:
+
+1. Confirm user's insight and mechanism: inconsistent system → no unique fixed point → cyclic Kaczmarz converges to order-dependent attractor, not the LS point (evidence: two orders on AIM 100-2_0, 1000 vs 4000 sweeps: same per-order v, but 49/100 signs differ, dist to LS ≈ 5).
+2. At 20000/3.5: reordering the same 69994 equations flips ~33% of decoded signs (6.5k–6.9k of 20000), while init unsat barely moves (869–952).
+3. Outcome is decided by two arbitrary choices:
+   - start only (same formula, same clause order): seed 4 goes 3/8 fail → 5/8 solve, seed 10 1/8 fail.
+   - search order only (same start): seed 4 3/8 fail, seed 10 2/8 fail, seed 1 1/8 fail.
+   - combined: failing seed 4 solves in 8/8 reorders; seed 1 (solved) fails in 4/8 reorders.
+4. Conclusion: not instance hardness (all permutations found SAT for at least some starts), not count/rank; the projection is sign-faithful per clause but globally underdetermined/inconsistent so the real vector it produces is an order-dependent artifact; the sign threshold turns that artifact into a coin flip. The search then amplifies it via order-dependent rogue selection.
+5. Possible cheap fix in one line: ensemble the projection over a few row orders and majority-vote signs (or pick the decode with lowest unsat after repair), which should remove the ±33% instability without touching the search. Ask if wanted.
+
+Also mention: skipped: no fix implemented; risk: the permutation changes variable-free clause set identical (no twins in random), so it's purely order.
+
+Need "Ponytail" ending: one or two lines: what skipped or not checked, and risk. I'll fold that in.
+
+Also note: AIM 2_0 dist to LS ~5, order diff huge. Good.
+
+Let me write final answer concisely with a small table.
+
+Wait, one nuance: "rank=[A|b] n+1" earlier conclusion was retracted by user as irrelevant because scaling b doesn't matter. But inconsistency is what makes Kaczmarz's attractor order-dependent. So I should say: the inconsistency doesn't hurt sign faithfulness per row, but it means the iteration has no unique solution to converge to — that's why order decides the magnitudes. That's a coherent use of the earlier fact, not a retraction contradiction. Good.
+
+Also mention that dist to LS is ~5, so it's not even decoding the LS compromise — it's a limit cycle offset from it. This corrects my earlier "least-squares compromise" framing. The user will appreciate precision.
+
+Let me finalize.
+
+Confirmed — and the new numbers make the mechanism precise.
+
+## Magnitudes don't converge to a unique point
+
+For an inconsistent system, cyclic Kaczmarz has no single fixed point to converge to. On AIM 100-2_0 (m=198, n=100), two row orders of the **same** equations:
+
+| sweeps | max \|v₁−v₂\| | signs differing | dist(v, least-squares x) |
+|---|---|---|---|
+| 1000 | 1.622 | **49/100** | 5.76 / 4.83 |
+| 4000 | 1.622 | **49/100** | 5.76 / 4.83 |
+
+Each order settles (1000 → 4000 sweeps changes nothing), but they settle at **different points**, both ~5 away from the unique least-squares solution. Earlier framing as "the least-squares compromise" was wrong: it's an order-dependent attractor. My earlier rank observation is relevant only for *why* (no exact solution exists), not for the sign mapping itself.
+
+## At the failing size
+
+Same 69,994 equations, 8 random clause orders, seed 4 / seed 10:
+
+- **32.6–33.9% of decoded signs flip** (6,525–6,869 of 20,000 variables).
+- Initial unsat barely moves: 869–952 (vs 923 / 911 in file order).
+- Outcome: seed 4 fails in file order but **solves in 8/8 reorders**; seed 10 solves in 7/8; seed 1 solves in file order but **fails in 4/8 reorders**.
+
+## Which half does the damage — crossed start vs order
+
+| seed | vary start only, fixed formula/order | vary search order only, fixed start |
+|---|---|---|
+| 4 | 5/8 solve (3 fail) | 5/8 solve (3 fail) |
+| 10 | 7/8 solve (1 fail) | 6/8 solve (2 fail) |
+| 1 | 8/8 solve | 7/8 solve (1 fail) |
+
+Both are independent coin flips. Changing only the decoded start flips a failing instance to solved on the *identical* formula and clause order. Changing only the search order breaks a previously working start.
+
+So your read is right: the sign is a function of the arithmetic path, not of the formula. The projection is per-clause sign-faithful, but because the joint system is inconsistent, the Kaczmarz magnitudes encode row order; thresholding them at zero turns that into a ~33% arbitrary bit pattern. The local search then adds its own order-dependent basin. Every one of these instances is satisfiable (SAT found on some orders), so this is solver artifact, not hardness.
+
+Thrown away: I did not implement a fix, and I did not test whether an order-ensemble (project over a few row permutations, majority-vote signs, or keep the decode with lowest post-repair unsat) removes the 33% churn — that is the one cheap experiment that would confirm the diagnosis constructively. Risk: permuting clauses also permutes the search's clause ids; the crossed A/B runs isolate that, but within each half the two effects were never fully removed from the same run.
+
+---
+
+## User
+
+update readme & save harness in ./tools
+
+---
+
+## Assistant
+
+_Thinking:_
+
+The user wants:
+1. Update README with these findings.
+2. Save the harness in ./tools (the probe tool, and maybe the diagnostic scripts).
+
+Need to be lazy: smallest complete change. Work only in ./knowledge/c_3sat per original constraint. Save harness: copy /tmp/opencode/probe.c to tools/probe.c, add a Makefile target to build it (so it's usable), and maybe copy the Python scripts? The user said "save harness in ./tools" — likely the diagnostic harness used for this analysis: probe.c (generation + gob-sign start + crossed runs + start dumps). Also possibly the permutation helper (Python) and analysis scripts. Let me think about what's minimal and complete:
+
+- tools/probe.c — the C harness (replicates bench generator exactly, dumps parsed CNFs, runs gob-sign init/solve, cross start/order, dumps starts).
+- tools/permute_clauses.py — the permutation generator used (small Python helper).
+- Makefile target `build/probe` to build it.
+- README section documenting the projection diagnosis + how to reproduce.
+
+Maybe also save the rank/eqcount/roundtrip scripts? Those were throwaway Python; the user asked "save harness" — I'd interpret as the reusable harness for this diagnosis: probe.c + permute script. But to be complete, maybe include the rank/eq-count scripts too since they produced the counts in README. Hmm. Ponytail: smallest complete change. The README will cite facts; to make them reproducible, need the tools that produced them. Let me include:
+- tools/probe.c (C harness, all the order experiments)
+- tools/permute_clauses.py (permutation generator)
+- tools/projection_diag.py (Python: equations-vs-clauses count + rank + sign float under order) — merge eqcount/rank/float into one small script? That's more code. But README's claims about equations==clauses and rank would need it.
+
+Actually the user's ask is vague ("update readme & save harness in ./tools"). Given the conversation, the "harness" is the diagnostic harness I built in /tmp/opencode. I should save the pieces that matter and keep it minimal. Let me decide: save probe.c + permute_clauses.py + projection_diag.py (which computes eq count, rank, and sign float for a given CNF and n permutations), plus Makefile targets, plus README section with reproduction commands.
+
+But wait — maybe I should ask? Ponytail says take the first option that fully works; don't ask unnecessary questions. I'll implement.
+
+Let me first read the README relevant sections to integrate properly, and check current tools dir.
+
+**Tool: shell**
+
+**Input:**
+```json
+{
+  "command": "cd /home/evg/i_C_u/little.AI/knowledge/c_3sat && ls tools && grep -n \"^#\\|^##\\|gob\\|Gob\" README.md | head -80"
+}
+```
+
+bench_rarest.c
+gen_cnf.py
+1:# c_3sat
+13:## Build / test
+21:## Run
+51:## Design
+86:## Initial assignment (`--init`)
+95:- `--init gob`: deterministic linear-relaxation start (no RNG), clauses as signed
+97:- `--init gob-sign`: the same system, decoded by sign instead of magnitude.
+98:- `--init gob-square`: the same, but only `n` of the `m` equations are solved
+105:- `-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square`: implies `--init likho`;
+112:### Rarest / Glowest / Min-overlapping
+131:### Gob
+133:`--init gob` is a linear relaxation, not a clause walk. Before building the
+137:This filtering is local to Gob/Gob-sign/Gob-square; the solver and the greedy
+151:### Gob-sign
+153:`--init gob-sign` runs the same filter, Kaczmarz sweeps and greedy repair, but
+164:budget; the greedy repair brings gob-sign to 8/10, where gob solved 0/10.
+166:### Gob-square
+168:`--init gob-square` runs the same idea in three phases:
+178:   `GobSquareCheck` reports `selected_bad`, `other_bad` and `other_total`; the
+179:   bench harness prints the averages as `gob-square phase 3`.
+182:exactly like `gob-sign`. This is still a seed, not a solve: the selected rows can be linearly dependent (strided
+189:### Likho
+218:### Measurements
+223:`-pre-cook majority`, "sign" is `--init gob-sign`, "sq" is `--init gob-square`.
+226:| instance | broken after init (maj / old / new / glow / mo / gob / sign / likho / dd / pc / sq) | solved | mean flips over solved (maj / old / new / glow / mo / gob / sign / likho / dd / pc / sq) |
+238:broken, just behind gob-square's 16.4, and solves the same 31 instances as rarest.
+249:`gob` (magnitude decode) is the weakest of the two full-system starts. It leaves
+250:14.2 broken at 1000/2.0 (vs gob-sign's 4.0), 61 at 1000/3.5 (vs 45), 1275 at
+252:0/10 where gob-sign solves 8/10. Its flips are 2-4x higher on the 1000-var rows
+258:`gob-sign` is the best non-Likho start at 1000/2.0 (4.0 broken vs glowest's 4.5;
+262:yes-set it is 16.9 broken, behind gob-square's 16.4 and glowest's 16.7, and
+267:`gob-square` shows what the square subsystem does and does not buy. Its phase-3
+274:magnitude `gob` (13.6 vs 14.2, 60 vs 61, 1240 vs 1275, 392 vs 411 broken) but
+275:clearly behind the sign `gob-sign` on every row (vs 4.0, 45, 922, 309), and at
+276:20000/3.5 it solves 0/10 where gob-sign solves 8/10, for 8x the sweeps.
+311:### Coverage: instances no start can solve
+324:- The AIM union is exactly rarest's 31: `glowest`, `min-overlapping`, `gob`,
+325:  `gob-sign`, `gob-square`, zero-start Likho and deep-dive each solve that identical set, so
+333:min-overlapping row is `--init min-overlapping`, its gob row is `--init gob`, its
+334:gob-sign row is `--init gob-sign`, its gob-square row is `--init gob-square`, its
+337:## Group mode (`--mode groups`)
+410:## Differences from the Rust version
+425:## Layout
+
+
+---
+
+## Assistant
+
+**Tool: read**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md",
+  "offset": 125,
+  "limit": 70
+}
+```
+
+Read file /home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md, lines 125-194
+125: - `min-overlapping` takes `glowest`'s pick first, then at every step the unset
+126:   variable with the smallest **(occurrences in satisfied clauses) / (total
+127:   occurrences)** (ties by id). A variable that occurs nowhere has no ratio and
+128:   goes last. The point is to keep picking variables mostly outside the clauses
+129:   the first pick already satisfied, instead of following the same subsystem.
+130: 
+131: ### Gob
+132: 
+133: `--init gob` is a linear relaxation, not a clause walk. Before building the
+134: relaxation, `no_twins` filters the input equation set: synchronous twins
+135: (identical clauses) and asynchronous twins (the same literals with every sign
+136: inverted) are reduced to their first occurrence. Literal order does not matter.
+137: This filtering is local to Gob/Gob-sign/Gob-square; the solver and the greedy
+138: repair still use the complete original CNF. Each remaining clause becomes the
+139: signed equation `sum(±x) = 1` (a positive literal is `+x`, a negative one `-x`),
+140: and 64 cyclic Kaczmarz sweeps project the all-zero vector onto that filtered
+141: system (one exact projection per remaining clause per sweep). Each value is then
+142: shifted by the smallest non-negative amount, rounded to the nearest integer and
+143: taken mod 2, which decodes the real vector to booleans. The shift is per
+144: variable, not global, because a global shift cannot satisfy mixed-sign units:
+145: `(x)` and `(-x)` always decode to the same parity.
+146: 
+147: The decode is only a starting point, so four greedy passes follow: a variable
+148: whose bit satisfies more rogue clauses than it breaks is flipped, using the same
+149: incremental counts as the search. Deterministic, no RNG.
+150: 
+151: ### Gob-sign
+152: 
+153: `--init gob-sign` runs the same filter, Kaczmarz sweeps and greedy repair, but
+154: decodes the real vector by sign: positive is true, zero or negative is false.
+155: 
+156: Sign, not magnitude, is the signal. The equation asks for **two** true literals
+157: per clause, which a satisfying assignment usually does not give: on 20000/3.5,
+158: 43% of a solution's clauses have exactly one true literal (signed sum `-1`), and
+159: 15% have all three. So 58% of the equations are violated at the true solution,
+160: its RMS residual is 1.52 -- worse than the Kaczmarz point's own 1.19. The
+161: minimum of this system is not near SAT. What survives is the sign: it agrees with
+162: a found solution 63.5% of the time, where the magnitude decode agrees only 52.5%.
+163: Search from the sign decode alone solves 6/10 of the 20000/3.5 seeds at this
+164: budget; the greedy repair brings gob-sign to 8/10, where gob solved 0/10.
+165: 
+166: ### Gob-square
+167: 
+168: `--init gob-square` runs the same idea in three phases:
+169: 
+170: 1. **Filter and pick a square subsystem.** `no_twins` first removes repeated
+171:    synchronous clauses and complementary asynchronous clauses. Of the remaining
+172:    `m` equations, select `n` (one every `m/n` clauses), so the selected block has
+173:    as many equations as variables. Here `m` is the post-filter equation count.
+174: 2. **Solve it.** 512 cyclic Kaczmarz sweeps over the selected rows only (the
+175:    square system converges slower than the full one, hence the larger sweep
+176:    count).
+177: 3. **Check the rest.** Every unselected filtered equation is evaluated on that solution.
+178:    `GobSquareCheck` reports `selected_bad`, `other_bad` and `other_total`; the
+179:    bench harness prints the averages as `gob-square phase 3`.
+180: 
+181: The solution is then decoded and repaired against the complete original CNF,
+182: exactly like `gob-sign`. This is still a seed, not a solve: the selected rows can be linearly dependent (strided
+183: selection makes no rank guarantee, e.g. `aim-50-3_4-yes1-1` is singular at
+184: 49/50), the values are fractional, and on the AIM corpus phase 3 finds almost
+185: every unselected equation violated (`rest_bad` 30/30, 99/100, 200/200 on the
+186: 50-, 100- and 200-var rows checked). Reporting "no solution" is the expected
+187: answer for `m > n`; the decode is what the search gets.
+188: 
+189: ### Likho
+190: 
+191: `--init likho` starts from `-pre-cook` (`zero`, the default: every variable
+192: `false`), then repairs rogue clauses. It only accepts moves that break no
+193: satisfied clause, and each variable is flipped at most once:
+194: 
+[Output truncated. Continue reading with offset: 195]
+
+---
+
+## Assistant
+
+**Tool: read**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md",
+  "offset": 311,
+  "limit": 45
+}
+```
+
+Read file /home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md, lines 311-355
+311: ### Coverage: instances no start can solve
+312: 
+313: The per-start counts above hide whether a failure is shared. Taking the union over
+314: all eleven starts:
+315: 
+316: - **Random 3-SAT: 0 unsolved by all.** Every generated instance in the table was
+317:   solved by at least one start, even where individual starts missed it (e.g. the
+318:   zero-start Likho at 20000/3.5).
+319: - **AIM yes-set: 17 of 48 unsolved by all** (31 covered). Every one is satisfiable,
+320:   so these are budget failures at 100000 steps x 20 restarts, not UNSAT. By size:
+321:   50-var `50-1_6-yes1-{1,2}` (2), 100-var `100-1_6-yes1-{1..4}` and
+322:   `100-2_0-yes1-{1,2,4}` (7), 200-var `200-1_6-yes1-{1..4}` and
+323:   `200-2_0-yes1-{1..4}` (8).
+324: - The AIM union is exactly rarest's 31: `glowest`, `min-overlapping`, `gob`,
+325:   `gob-sign`, `gob-square`, zero-start Likho and deep-dive each solve that identical set, so
+326:   the extra starts add no new instance beyond rarest. Only `majority` and the majority pre-cook miss
+327:   four of them.
+328: 
+329: Reproduce with `make bench-rarest ARGS="1000 3.5 10 200000 9"` (or
+330: `ARGS="file.cnf 100000 20"`); `steps = 0` measures init quality only. The harness
+331: also reimplements the old total-occurrence order as a baseline, so all eleven
+332: starts run the same search code; its glowest row is `--init glowest`, its
+333: min-overlapping row is `--init min-overlapping`, its gob row is `--init gob`, its
+334: gob-sign row is `--init gob-sign`, its gob-square row is `--init gob-square`, its
+335: deep-dive row uses `-deep-dive 32 128` and its pre-cook row uses `-pre-cook majority`.
+336: 
+337: ## Group mode (`--mode groups`)
+338: 
+339: Sequential rogue groups with a neutral-driven merge, layered on the same solver
+340: (`src/groups.c`). Ranking is unchanged: a variable is **neutral** iff flipping it
+341: breaks no solved clause (`break_count == 0`), **prime** iff it is the sole
+342: support of at least one (`break_count >= 1`). Neutrality belongs to the *current*
+343: assignment, so it changes as flips happen. This invariant is pinned by a test.
+344: 
+345: ```sh
+346: build/3sat input.cnf --mode groups                      # defaults: 16 groups, free merge
+347: build/3sat input.cnf --mode groups --max-groups 64 --merge directed --diversify 20
+348: build/3sat input.cnf --mode groups --group-len 10 --max-groups 400   # at most 10 clauses per group
+349: ```
+350: 
+351: **Formation.** Start from the `--init` assignment `B` (majority by default).
+352: 1. `G1` = *all* clauses rogue under `B`. Solve `G1` on its own (a sub-formula that
+353:    sees only its clauses, started from `B`) -> snapshot `X1`. The same variable may
+354:    hold different polarities in different snapshots.
+355: 2. Apply `X1`, inspect the **whole** formula, collect *all* clauses that are rogue
+[Output truncated. Continue reading with offset: 356]
+
+---
+
+## Assistant
+
+**Tool: read**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md",
+  "offset": 425,
+  "limit": 30
+}
+```
+
+Read file /home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md, lines 425-437
+425: ## Layout
+426: 
+427: ```
+428: src/result.h   Result/Error/TRY macros
+429: src/sat.h      public API
+430: src/sat.c      DIMACS parser, strategies, solver
+431: src/groups.h   group formation + merge API (and the algorithm spec)
+432: src/groups.c   sequential rogue groups, dynamic-anchor neutral merge
+433: src/main.c     CLI
+434: tests/         test_sat.c + fixtures
+435: tools/gen_cnf.py     random 3-CNF generator
+436: tools/bench_rarest.c init + search benchmark (make bench-rarest)
+437: ```
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Now plan implementation:
+
+1. Save harness files:
+   - `tools/probe.c` — from /tmp/opencode/probe.c, but clean it up a bit (it says "Throwaway probe"). Change header comment to describe as diagnostic harness. Keep paths for dumps? Currently hardcoded `/tmp/opencode/b%zu.cnf`. Better make output dir configurable via an optional arg or use `./build/diag` default. To stay lazy but usable: add an optional 7th arg `outdir` for `gen`. Or keep /tmp/opencode but that's environment-specific — not good for saving in repo. Let's make outdir default "." with optional last arg. In the README reproduction commands, pass `/tmp/gobdiag`.
+   
+   Also `xstart` and `start` modes take file paths — fine.
+   
+   Note: the C file includes `<stdbool.h>` etc. Fine. The gen mode currently sets nc = parsed count before run, fine.
+
+   - `tools/permute_clauses.py` — small script: read CNF, shuffle clause lines with a seed, write permuted CNF. Usage: `permute_clauses.py IN.cnf OUT.cnf SEED`. Keep header. 15 lines.
+
+   - `tools/projection_diag.py` — maybe merge the rank/eq-count + sign float. Hmm. Do we need it? The README will cite: equations == clauses, rank(A)=n, rank[A|b]=n+1, sign flips ~33%. To reproduce sign flips, need probe `start` + permute script + a compare script. I can add a tiny compare script or use `cmp`/Python one-liner in README. To keep tools lean, maybe add `tools/diag_report.py` that does: (a) eq count + rank for a CNF (needs numpy — optional dependency, Python only for exploration is allowed), (b) sign flip counts from `start` dumps. But that's extra ~80 lines. 
+
+   Ponytail rule: "save harness" — the harness I used. I think probe.c + permute_clauses.py + Makefile target + README reproduction commands (including a one-liner for sign diff) is enough. Rank numbers are from rank.py; should I save that too? The README already contains rank claims? Let me check — currently README doesn't mention rank. I'll add a short section with counts and rank, so I should save the script that produced them. Let me save a compact `tools/projection_counts.py` that does eq count + rank + LS RMS on a CNF file, and also sign-flip counting if given two start dumps? Keep it separate: one script, two modes maybe. Hmm.
+
+   Simplest complete approach: save 3 files:
+   - tools/probe.c (C harness: gen/run/xstart/start)
+   - tools/permute_clauses.py (shuffle)
+   - tools/projection_counts.py (eq count + rank for one or more CNFs; no numpy? rank needs numpy; it's exploration-only, fine)
+   
+   Plus Makefile target `build/probe` and `diag` maybe. Add `build/probe` target only.
+
+   For sign-flip comparison, README can show a Python one-liner or add a small mode to projection_counts.py: `--signs A B` counts differing chars. That's 3 lines. Nice: one script handles counts + sign diffs. Let me write it cleanly.
+
+   Actually, to minimize: `tools/projection_counts.py`:
+   ```python
+   #!/usr/bin/env python3
+   """Diagnose the CNF -> linear-system projection used by gob/gob-sign.
+   usage: projection_counts.py FILE.cnf...        # equations vs clauses, rank, RMS
+          projection_counts.py --signs A B        # differing decoded signs
+   """
+   ```
+   Need numpy for rank. If numpy missing, still do counts? Just import numpy at top; environment has it.
+
+   Parse DIMACS: read header, clause lines. Need to mirror no_twins filtering? The count claims (0 dropped random, ≤2% AIM) came from eqcount.py which mirrored parser/dedup. To keep the script honest, implement no_twins: canonicalize clause by literal set (sign-aware), drop tautologies, drop duplicate sync/async. ~20 lines. Fine.
+
+2. README updates:
+   - In Gob-sign section (after line 164), add a paragraph "Why gob-sign is order-sensitive" with counts and evidence. Or a new subsection after Gob-square: "### Projection diagnostics (gob / gob-sign)" — better placed right after Gob-sign, before Gob-square, since it concerns the projection. Add concise content:
+     - equations == clauses: random 0 dropped, AIM 0–2.08% all exact duplicates, 0 async twins.
+     - rank(A)=n, rank[A|b]=n+1 on all measured; m−n redundant; b not in col(A), residual 12–34 (AIM).
+     - But RHS scale is irrelevant (sign scale-invariant); per clause `sum=1>0` ⇒ ≥1 true literal, so sign mapping is locally exact. The real vector is not the LS point: two orders on AIM 100-2_0 give 49/100 sign flips, stable from 1000 to 4000 sweeps, both ~5 from LS solution.
+     - At 20000/3.5: 8 clause orders → 32.6–33.9% of decoded signs flip; init unsat 869–952. Seed 4 fails in file order, solves 8/8 reorders; seed 1 solves in file order, fails 4/8. Crossed start/order table: start-only 5/8, 7/8, 8/8; order-only 5/8, 6/8, 7/8.
+     - Reproduction commands using tools.
+   - Update Layout list with new tools.
+   - Maybe update "Coverage" or measurements? The existing text says "Search from the sign decode alone solves 6/10 ... greedy repair brings 8/10". That's consistent with bench. But my probe showed 8/10 with repair; fine. Also earlier text says "its RMS residual is 1.52 -- worse than the Kaczmarz point's own 1.19" — keep; it's about true solution. Fine.
+   - Add to reproduce section a pointer to diag harness.
+
+3. Makefile target:
+   ```
+   $(BUILD)/probe: tools/probe.c $(SRC) src/sat.h src/groups.h src/result.h
+   	@mkdir -p $(BUILD)
+   	$(CC) $(CFLAGS) -Isrc -o $@ tools/probe.c $(SRC)
+   ```
+   Add `probe` to .PHONY? Add `.PHONY: build test bench bench-rarest probe` and target `probe: $(BUILD)/probe`.
+
+Let me now implement. First copy probe.c and adapt outdir.
+
+Let me read /tmp/opencode/probe.c to edit precisely.
+
+**Tool: read**
+
+**Input:**
+```json
+{
+  "path": "/tmp/opencode/probe.c"
+}
+```
+
+Read file /tmp/opencode/probe.c, lines 1-174
+1: /* Throwaway probe: replicate the bench's random generation exactly, dump the
+2:  * parsed CNFs, and run only the gob-sign start (init + solve) per seed.
+3:  *
+4:  *   probe gen <n> <ratio> <seeds> <steps> <restarts>
+5:  *   probe run <file.cnf> <steps> <restarts>
+6:  */
+7: #include <stdio.h>
+8: #include <stdlib.h>
+9: #include <string.h>
+10: #include <stdbool.h>
+11: #include <stdint.h>
+12: #include "sat.h"
+13: 
+14: typedef struct { uint64_t s; } R;
+15: static uint64_t nx(R *r) { uint64_t x = r->s; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return r->s = x; }
+16: static size_t idx(R *r, size_t n) { return (size_t)(nx(r) % n); }
+17: 
+18: typedef struct { size_t nv, nc, *off; int *lits; } Gen;
+19: static void gen_free(Gen *g) { free(g->off); free(g->lits); }
+20: 
+21: static Gen gen3(size_t nv, size_t nc, uint64_t seed) {
+22:     Gen g = { nv, nc, malloc((nc + 1) * sizeof *g.off), malloc(nc * 3 * sizeof *g.lits) };
+23:     R r = { seed ? seed : 1 };
+24:     g.off[0] = 0;
+25:     for (size_t c = 0; c < nc; c++) {
+26:         size_t a = idx(&r, nv), b = idx(&r, nv - 1), d = idx(&r, nv - 2);
+27:         if (b >= a) b++;
+28:         if (d >= a) d++;
+29:         if (d >= b) d++;
+30:         int s[3];
+31:         for (int k = 0; k < 3; k++) s[k] = (nx(&r) & 1) ? 1 : -1;
+32:         g.lits[3*c+0] = s[0] * (int)(a + 1);
+33:         g.lits[3*c+1] = s[1] * (int)(b + 1);
+34:         g.lits[3*c+2] = s[2] * (int)(d + 1);
+35:         g.off[c+1] = g.off[c] + 3;
+36:     }
+37:     return g;
+38: }
+39: 
+40: static char *to_dimacs(const Gen *g) {
+41:     size_t cap = g->nc * 32 + 64;
+42:     char *s = malloc(cap), *p = s;
+43:     p += sprintf(p, "p cnf %zu %zu\n", g->nv, g->nc);
+44:     for (size_t c = 0; c < g->nc; c++) {
+45:         for (int k = 0; k < 3; k++) p += sprintf(p, "%d ", g->lits[3*c+k]);
+46:         *p++ = '0'; *p++ = '\n'; *p = '\0';
+47:     }
+48:     return s;
+49: }
+50: 
+51: static void dump(const Cnf *cnf, const char *path) {
+52:     FILE *f = fopen(path, "w");
+53:     fprintf(f, "p cnf %zu %zu\n", cnf->n_vars, cnf->n_clauses);
+54:     for (size_t c = 0; c < cnf->n_clauses; c++) {
+55:         size_t len = cnf_clause_len(cnf, c);
+56:         const Lit *cl = cnf_clause(cnf, c);
+57:         for (size_t k = 0; k < len; k++)
+58:             fprintf(f, "%d ", cl[k].positive ? (int)cl[k].var + 1 : -(int)cl[k].var - 1);
+59:         fprintf(f, "0\n");
+60:     }
+61:     fclose(f);
+62: }
+63: 
+64: /* gob-sign init, report init quality, then solve. */
+65: static void run(const Cnf *cnf, size_t steps, size_t restarts, const char *tag) {
+66:     SolverConfig cfg = solver_config_default();
+67:     cfg.max_steps = steps;
+68:     cfg.restarts = restarts;
+69:     ResultSolver rs = solver_new(cnf, cfg.seed);
+70:     if (!rs.ok) { fprintf(stderr, "solver: %s\n", rs.err.msg); exit(1); }
+71:     Solver *s = rs.val;
+72:     if (!solver_init_gob_sign(s)) { fprintf(stderr, "init: oom\n"); exit(1); }
+73:     size_t init_unsat = solver_unsatisfied_count(s);
+74:     if (steps == 0) {
+75:         printf("%s\tinit_unsat=%zu\t(no search)\n", tag, init_unsat);
+76:         solver_free(s);
+77:         return;
+78:     }
+79:     bool *start = malloc(cnf->n_vars * sizeof *start);
+80:     memcpy(start, solver_assignment(s), cnf->n_vars * sizeof *start);
+81:     SolverConfig c = cfg;
+82:     c.initial = start;
+83:     ResultSolve r = solver_solve(s, &c);
+84:     if (!r.ok) { fprintf(stderr, "solve: %s\n", r.err.msg); exit(1); }
+85:     printf("%s\tinit_unsat=%zu\t%s\tsteps=%zu\n", tag, init_unsat,
+86:            r.val.status == SOLVE_SAT ? "SAT" : "UNKNOWN", r.val.steps);
+87:     solve_result_free(&r.val);
+88:     free(start);
+89:     solver_free(s);
+90: }
+91: 
+92: /* Start from the gob-sign decode of startfile, but solve solvefile (same vars). */
+93: static void cross(const Cnf *startfile, const Cnf *solvefile, size_t steps,
+94:                   size_t restarts, const char *tag) {
+95:     SolverConfig cfg = solver_config_default();
+96:     cfg.max_steps = steps;
+97:     cfg.restarts = restarts;
+98:     ResultSolver rs = solver_new(startfile, cfg.seed);
+99:     if (!rs.ok) { fprintf(stderr, "solver: %s\n", rs.err.msg); exit(1); }
+100:     if (!solver_init_gob_sign(rs.val)) { fprintf(stderr, "init: oom\n"); exit(1); }
+101:     bool *start = malloc(solvefile->n_vars * sizeof *start);
+102:     memcpy(start, solver_assignment(rs.val), solvefile->n_vars * sizeof *start);
+103:     solver_free(rs.val);
+104:     ResultSolver rt = solver_new(solvefile, cfg.seed);
+105:     if (!rt.ok) { fprintf(stderr, "solver: %s\n", rt.err.msg); exit(1); }
+106:     SolverConfig c = cfg;
+107:     c.initial = start;
+108:     ResultSolve r = solver_solve(rt.val, &c);
+109:     if (!r.ok) { fprintf(stderr, "solve: %s\n", r.err.msg); exit(1); }
+110:     printf("%s\t%s\tsteps=%zu\n", tag,
+111:            r.val.status == SOLVE_SAT ? "SAT" : "UNKNOWN", r.val.steps);
+112:     solve_result_free(&r.val);
+113:     solver_free(rt.val);
+114:     free(start);
+115: }
+116: 
+117: int main(int argc, char **argv) {
+118:     if (argc >= 2 && strcmp(argv[1], "start") == 0 && argc >= 4) {
+119:         ResultCnf rc = cnf_from_dimacs_file(argv[2]);
+120:         if (!rc.ok) { fprintf(stderr, "parse: %s\n", rc.err.msg); return 1; }
+121:         SolverConfig cfg = solver_config_default();
+122:         ResultSolver rs = solver_new(&rc.val, cfg.seed);
+123:         if (!rs.ok || !solver_init_gob_sign(rs.val)) { fprintf(stderr, "init failed\n"); return 1; }
+124:         const bool *a = solver_assignment(rs.val);
+125:         FILE *f = fopen(argv[3], "w");
+126:         for (size_t i = 0; i < rc.val.n_vars; i++) fputc(a[i] ? '1' : '0', f);
+127:         fputc('\n', f);
+128:         fclose(f);
+129:         solver_free(rs.val);
+130:         cnf_free(&rc.val);
+131:         return 0;
+132:     }
+133:     if (argc >= 2 && strcmp(argv[1], "xstart") == 0 && argc >= 6) {
+134:         ResultCnf a = cnf_from_dimacs_file(argv[2]);
+135:         ResultCnf b = cnf_from_dimacs_file(argv[3]);
+136:         if (!a.ok || !b.ok) { fprintf(stderr, "parse failed\n"); return 1; }
+137:         cross(&a.val, &b.val, strtoull(argv[4], NULL, 10), strtoull(argv[5], NULL, 10), argv[2]);
+138:         cnf_free(&a.val); cnf_free(&b.val);
+139:         return 0;
+140:     }
+141:     if (argc >= 2 && strcmp(argv[1], "run") == 0 && argc >= 5) {
+142:         ResultCnf rc = cnf_from_dimacs_file(argv[2]);
+143:         if (!rc.ok) { fprintf(stderr, "parse: %s\n", rc.err.msg); return 1; }
+144:         run(&rc.val, strtoull(argv[3], NULL, 10), strtoull(argv[4], NULL, 10), argv[2]);
+145:         cnf_free(&rc.val);
+146:         return 0;
+147:     }
+148:     if (argc >= 7 && strcmp(argv[1], "gen") == 0) {
+149:         size_t nv = strtoull(argv[2], NULL, 10);
+150:         double ratio = atof(argv[3]);
+151:         size_t seeds = strtoull(argv[4], NULL, 10);
+152:         size_t steps = strtoull(argv[5], NULL, 10);
+153:         size_t restarts = strtoull(argv[6], NULL, 10);
+154:         size_t nc = (size_t)((double)nv * ratio + 0.5);
+155:         for (size_t sd = 1; sd <= seeds; sd++) {
+156:             Gen g = gen3(nv, nc, 0x9e3779b97f4a7c15ULL ^ (sd * 0x100000001b3ULL));
+157:             char *d = to_dimacs(&g);
+158:             ResultCnf rc = cnf_from_dimacs_str(d);
+159:             free(d);
+160:             if (!rc.ok) { fprintf(stderr, "parse: %s\n", rc.err.msg); return 1; }
+161:             nc = rc.val.n_clauses;                  /* bench feeds parsed count forward */
+162:             char path[128], tag[64];
+163:             snprintf(path, sizeof path, "/tmp/opencode/b%zu.cnf", sd);
+164:             snprintf(tag, sizeof tag, "seed=%zu clauses=%zu", sd, nc);
+165:             dump(&rc.val, path);
+166:             run(&rc.val, steps, restarts, tag);
+167:             cnf_free(&rc.val);
+168:             gen_free(&g);
+169:         }
+170:         return 0;
+171:     }
+172:     fprintf(stderr, "usage: probe gen n ratio seeds steps restarts | probe run file steps restarts\n");
+173:     return 2;
+174: }
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Now write tools/probe.c with:
+- header comment updated
+- usage full
+- gen outdir optional arg (argv[7]); default "." maybe; snprintf with `%s/b%zu.cnf`. Need path buffer larger: char path[512].
+- cross: ensure startfile and solvefile have same n_vars; if not, error. Small validation (trust boundary? file input). Add check.
+- dump: check fopen result. Small.
+- `start` mode: check fopen.
+
+Keep everything else.
+
+Also tool names: `probe` might be too generic; call it `tools/probe.c`, build `build/probe`. Fine.
+
+Let me write the file completely (overwrite) with adaptations.
+
+**Tool: write**
+
+**Input:**
+```json
+{
+  "content": "/* Diagnostic harness for the gob/gob-sign projection.\n *\n * Mirrors bench_rarest.c's random generator and parser byte-for-byte, dumps\n * each parsed CNF, and runs only the gob-sign start:\n *\n *   probe gen <n> <ratio> <seeds> <steps> <restarts> [outdir]\n *       writes <outdir>/b<seed>.cnf, prints init_unsat and SAT/UNKNOWN per seed\n *   probe run <file.cnf> <steps> <restarts>\n *   probe start <file.cnf> <out.txt>\n *       writes the repaired gob-sign bits, one char per variable\n *   probe xstart <startfile.cnf> <solvefile.cnf> <steps> <restarts>\n *       take the gob-sign start from startfile, solve solvefile (same vars)\n *\n * The last two modes separate the decoded start from the search's clause order.\n */\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include \"sat.h\"\n\ntypedef struct { uint64_t s; } R;\nstatic uint64_t nx(R *r) { uint64_t x = r->s; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return r->s = x; }\nstatic size_t idx(R *r, size_t n) { return (size_t)(nx(r) % n); }\n\ntypedef struct { size_t nv, nc, *off; int *lits; } Gen;\nstatic void gen_free(Gen *g) { free(g->off); free(g->lits); }\n\nstatic Gen gen3(size_t nv, size_t nc, uint64_t seed) {\n    Gen g = { nv, nc, malloc((nc + 1) * sizeof *g.off), malloc(nc * 3 * sizeof *g.lits) };\n    R r = { seed ? seed : 1 };\n    g.off[0] = 0;\n    for (size_t c = 0; c < nc; c++) {\n        size_t a = idx(&r, nv), b = idx(&r, nv - 1), d = idx(&r, nv - 2);\n        if (b >= a) b++;\n        if (d >= a) d++;\n        if (d >= b) d++;\n        int s[3];\n        for (int k = 0; k < 3; k++) s[k] = (nx(&r) & 1) ? 1 : -1;\n        g.lits[3*c+0] = s[0] * (int)(a + 1);\n        g.lits[3*c+1] = s[1] * (int)(b + 1);\n        g.lits[3*c+2] = s[2] * (int)(d + 1);\n        g.off[c+1] = g.off[c] + 3;\n    }\n    return g;\n}\n\nstatic char *to_dimacs(const Gen *g) {\n    size_t cap = g->nc * 32 + 64;\n    char *s = malloc(cap), *p = s;\n    p += sprintf(p, \"p cnf %zu %zu\\n\", g->nv, g->nc);\n    for (size_t c = 0; c < g->nc; c++) {\n        for (int k = 0; k < 3; k++) p += sprintf(p, \"%d \", g->lits[3*c+k]);\n        *p++ = '0'; *p++ = '\\n'; *p = '\\0';\n    }\n    return s;\n}\n\nstatic void dump(const Cnf *cnf, const char *path) {\n    FILE *f = fopen(path, \"w\");\n    if (!f) { perror(path); exit(1); }\n    fprintf(f, \"p cnf %zu %zu\\n\", cnf->n_vars, cnf->n_clauses);\n    for (size_t c = 0; c < cnf->n_clauses; c++) {\n        size_t len = cnf_clause_len(cnf, c);\n        const Lit *cl = cnf_clause(cnf, c);\n        for (size_t k = 0; k < len; k++)\n            fprintf(f, \"%d \", cl[k].positive ? (int)cl[k].var + 1 : -(int)cl[k].var - 1);\n        fprintf(f, \"0\\n\");\n    }\n    fclose(f);\n}\n\n/* gob-sign init, report init quality, then solve. */\nstatic void run(const Cnf *cnf, size_t steps, size_t restarts, const char *tag) {\n    SolverConfig cfg = solver_config_default();\n    cfg.max_steps = steps;\n    cfg.restarts = restarts;\n    ResultSolver rs = solver_new(cnf, cfg.seed);\n    if (!rs.ok) { fprintf(stderr, \"solver: %s\\n\", rs.err.msg); exit(1); }\n    Solver *s = rs.val;\n    if (!solver_init_gob_sign(s)) { fprintf(stderr, \"init: oom\\n\"); exit(1); }\n    size_t init_unsat = solver_unsatisfied_count(s);\n    if (steps == 0) {\n        printf(\"%s\\tinit_unsat=%zu\\t(no search)\\n\", tag, init_unsat);\n        solver_free(s);\n        return;\n    }\n    bool *start = malloc(cnf->n_vars * sizeof *start);\n    memcpy(start, solver_assignment(s), cnf->n_vars * sizeof *start);\n    SolverConfig c = cfg;\n    c.initial = start;\n    ResultSolve r = solver_solve(s, &c);\n    if (!r.ok) { fprintf(stderr, \"solve: %s\\n\", r.err.msg); exit(1); }\n    printf(\"%s\\tinit_unsat=%zu\\t%s\\tsteps=%zu\\n\", tag, init_unsat,\n           r.val.status == SOLVE_SAT ? \"SAT\" : \"UNKNOWN\", r.val.steps);\n    solve_result_free(&r.val);\n    free(start);\n    solver_free(s);\n}\n\n/* Start from the gob-sign decode of startfile, but solve solvefile (same vars). */\nstatic void cross(const Cnf *startfile, const Cnf *solvefile, size_t steps,\n                  size_t restarts, const char *tag) {\n    if (startfile->n_vars != solvefile->n_vars) {\n        fprintf(stderr, \"xstart: variable count differs\\n\");\n        exit(1);\n    }\n    SolverConfig cfg = solver_config_default();\n    cfg.max_steps = steps;\n    cfg.restarts = restarts;\n    ResultSolver rs = solver_new(startfile, cfg.seed);\n    if (!rs.ok) { fprintf(stderr, \"solver: %s\\n\", rs.err.msg); exit(1); }\n    if (!solver_init_gob_sign(rs.val)) { fprintf(stderr, \"init: oom\\n\"); exit(1); }\n    bool *start = malloc(solvefile->n_vars * sizeof *start);\n    memcpy(start, solver_assignment(rs.val), solvefile->n_vars * sizeof *start);\n    solver_free(rs.val);\n    ResultSolver rt = solver_new(solvefile, cfg.seed);\n    if (!rt.ok) { fprintf(stderr, \"solver: %s\\n\", rt.err.msg); exit(1); }\n    SolverConfig c = cfg;\n    c.initial = start;\n    ResultSolve r = solver_solve(rt.val, &c);\n    if (!r.ok) { fprintf(stderr, \"solve: %s\\n\", r.err.msg); exit(1); }\n    printf(\"%s\\t%s\\tsteps=%zu\\n\", tag,\n           r.val.status == SOLVE_SAT ? \"SAT\" : \"UNKNOWN\", r.val.steps);\n    solve_result_free(&r.val);\n    solver_free(rt.val);\n    free(start);\n}\n\nint main(int argc, char **argv) {\n    if (argc >= 2 && strcmp(argv[1], \"start\") == 0 && argc >= 4) {\n        ResultCnf rc = cnf_from_dimacs_file(argv[2]);\n        if (!rc.ok) { fprintf(stderr, \"parse: %s\\n\", rc.err.msg); return 1; }\n        SolverConfig cfg = solver_config_default();\n        ResultSolver rs = solver_new(&rc.val, cfg.seed);\n        if (!rs.ok || !solver_init_gob_sign(rs.val)) { fprintf(stderr, \"init failed\\n\"); return 1; }\n        const bool *a = solver_assignment(rs.val);\n        FILE *f = fopen(argv[3], \"w\");\n        if (!f) { perror(argv[3]); return 1; }\n        for (size_t i = 0; i < rc.val.n_vars; i++) fputc(a[i] ? '1' : '0', f);\n        fputc('\\n', f);\n        fclose(f);\n        solver_free(rs.val);\n        cnf_free(&rc.val);\n        return 0;\n    }\n    if (argc >= 2 && strcmp(argv[1], \"xstart\") == 0 && argc >= 6) {\n        ResultCnf a = cnf_from_dimacs_file(argv[2]);\n        ResultCnf b = cnf_from_dimacs_file(argv[3]);\n        if (!a.ok || !b.ok) { fprintf(stderr, \"parse failed\\n\"); return 1; }\n        cross(&a.val, &b.val, strtoull(argv[4], NULL, 10), strtoull(argv[5], NULL, 10), argv[2]);\n        cnf_free(&a.val); cnf_free(&b.val);\n        return 0;\n    }\n    if (argc >= 2 && strcmp(argv[1], \"run\") == 0 && argc >= 5) {\n        ResultCnf rc = cnf_from_dimacs_file(argv[2]);\n        if (!rc.ok) { fprintf(stderr, \"parse: %s\\n\", rc.err.msg); return 1; }\n        run(&rc.val, strtoull(argv[3], NULL, 10), strtoull(argv[4], NULL, 10), argv[2]);\n        cnf_free(&rc.val);\n        return 0;\n    }\n    if (argc >= 7 && strcmp(argv[1], \"gen\") == 0) {\n        size_t nv = strtoull(argv[2], NULL, 10);\n        double ratio = atof(argv[3]);\n        size_t seeds = strtoull(argv[4], NULL, 10);\n        size_t steps = strtoull(argv[5], NULL, 10);\n        size_t restarts = strtoull(argv[6], NULL, 10);\n        const char *outdir = argc >= 8 ? argv[7] : \".\";\n        size_t nc = (size_t)((double)nv * ratio + 0.5);\n        for (size_t sd = 1; sd <= seeds; sd++) {\n            Gen g = gen3(nv, nc, 0x9e3779b97f4a7c15ULL ^ (sd * 0x100000001b3ULL));\n            char *d = to_dimacs(&g);\n            ResultCnf rc = cnf_from_dimacs_str(d);\n            free(d);\n            if (!rc.ok) { fprintf(stderr, \"parse: %s\\n\", rc.err.msg); return 1; }\n            nc = rc.val.n_clauses;                  /* bench feeds parsed count forward */\n            char path[512], tag[64];\n            snprintf(path, sizeof path, \"%s/b%zu.cnf\", outdir, sd);\n            snprintf(tag, sizeof tag, \"seed=%zu clauses=%zu\", sd, nc);\n            dump(&rc.val, path);\n            run(&rc.val, steps, restarts, tag);\n            cnf_free(&rc.val);\n            gen_free(&g);\n        }\n        return 0;\n    }\n    fprintf(stderr,\n        \"usage: probe gen <n> <ratio> <seeds> <steps> <restarts> [outdir]\\n\"\n        \"       probe run <file.cnf> <steps> <restarts>\\n\"\n        \"       probe start <file.cnf> <out.txt>\\n\"\n        \"       probe xstart <startfile.cnf> <solvefile.cnf> <steps> <restarts>\\n\");\n    return 2;\n}\n",
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/tools/probe.c"
+}
+```
+
+Created file successfully: knowledge/c_3sat/tools/probe.c
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Now the Python permute helper + counts helper. Write compact.
+
+`tools/permute_clauses.py`:
+```python
+#!/usr/bin/env python3
+"""Permute the clause lines of a DIMACS CNF (same clauses, different row order).
+usage: permute_clauses.py IN.cnf OUT.cnf SEED
+"""
+import random, sys
+def main():
+    src, dst, seed = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    with open(src) as f: lines=f.read().splitlines()
+    header=lines[0].split()
+    if len(header)<4 or header[0]!='p' or header[1]!='cnf':
+        sys.exit('expected DIMACS p cnf header')
+    clauses=[l for l in lines[1:] if l.strip()]
+    if any(l.split()[-1]!='0' for l in clauses): sys.exit('bad clause line')
+    random.Random(seed).shuffle(clauses)
+    with open(dst,'w') as f:
+        f.write(f"p cnf {header[2]} {len(clauses)}\n")
+        f.write("\n".join(clauses)+"\n")
+if __name__=='__main__': main()
+```
+
+`tools/projection_counts.py`:
+- mode 1: `--signs A B` count sign differences.
+- mode 2: files: parse DIMACS, apply no_twins-like canonical filter, count clauses vs equations, rank(A), rank([A|b]), redundancy, LS RMS. Need numpy. To keep it small, maybe skip RMS? Include it, it's one line. Let me write:
+
+```python
+#!/usr/bin/env python3
+"""Projection diagnostics for gob/gob-sign.
+  projection_counts.py FILE.cnf...   # clauses vs equations, ranks, LS RMS
+  projection_counts.py --signs A B   # differing decoded signs from probe start
+"""
+import sys
+import numpy as np
+
+def clauses(path):
+    with open(path) as f: lines=f.read().splitlines()
+    out=[]
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith('c') or line.startswith('p'): continue
+        lits=[int(x) for x in line.split()[:-1]]
+        if not lits: continue
+        d={}
+        ok=True
+        for l in lits:
+            v,s=abs(l), l>0
+            if v in d and d[v]!=s: ok=False; break
+            d[v]=s
+        if ok: out.append([v if s else -v for v,s in d.items()])
+    # no_twins: drop identical and all-sign-inverted clauses, keep first
+    keep=[]
+    seen=set()
+    for cl in out:
+        a=tuple(sorted(cl)); b=tuple(sorted(-l for l in cl))
+        if a in seen or b in seen: continue
+        seen.add(a); seen.add(b); keep.append(cl)
+    return keep
+
+def counts(path):
+    cls=clauses(path)
+    nv=max((abs(l) for cl in cls for l in cl), default=0)
+    m=len(cls); A=np.zeros((m,nv))
+    for i,cl in enumerate(cls):
+        for l in cl: A[i,abs(l)-1]=1.0 if l>0 else -1.0
+    b=np.ones(m)
+    ra=np.linalg.matrix_rank(A); rab=np.linalg.matrix_rank(np.column_stack([A,b]))
+    x,*_=np.linalg.lstsq(A,b,rcond=None) if m and nv else (np.zeros(nv),)
+    rms=float(np.sqrt(np.mean((A@x-b)**2))) if m else 0.0
+    print(f"{path}: clauses={m+?} ...")
+```
+
+Hmm, need raw clause count vs filtered: I filter in clauses(); need both. Return raw and kept. Let me restructure: `clauses(path)` returns raw parsed list (with tautologies dropped, dedup within clause) and then filter separately. Print `parsed` and `equations`.
+
+Note: header declares nv; use header nv rather than max literal (better). Let me parse header too. Keep simple: read first `p cnf N M`, use N.
+
+Careful with numpy import at module load for --signs mode (numpy available anyway). Could defer import inside counts() so --signs works without numpy — 1 line. Nice.
+
+Sign mode:
+```python
+a=open(sys.argv[2]).read().strip(); b=open(sys.argv[3]).read().strip()
+d=sum(x!=y for x,y in zip(a,b))
+print(f"{d}/{len(a)} signs differ ({100*d/len(a):.2f}%)")
+```
+
+Let me write both files.
+
+**Tool: write**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/tools/permute_clauses.py",
+  "content": "#!/usr/bin/env python3\n\"\"\"Permute the clause lines of a DIMACS CNF: same clauses, different row order.\n\nusage: permute_clauses.py IN.cnf OUT.cnf SEED\n\"\"\"\nimport random\nimport sys\n\n\ndef main():\n    src, dst, seed = sys.argv[1], sys.argv[2], int(sys.argv[3])\n    with open(src) as f:\n        lines = f.read().splitlines()\n    header = lines[0].split()\n    if len(header) < 4 or header[0] != 'p' or header[1] != 'cnf':\n        sys.exit('expected DIMACS p cnf header')\n    clauses = [line for line in lines[1:] if line.strip()]\n    if any(line.split()[-1] != '0' for line in clauses):\n        sys.exit('bad clause line')\n    random.Random(seed).shuffle(clauses)\n    with open(dst, 'w') as f:\n        f.write(f\"p cnf {header[2]} {len(clauses)}\\n\")\n        f.write(\"\\n\".join(clauses) + \"\\n\")\n\n\nif __name__ == '__main__':\n    main()\n"
+}
+```
+
+Created file successfully: knowledge/c_3sat/tools/permute_clauses.py
+
+---
+
+## Assistant
+
+**Tool: write**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/tools/projection_counts.py",
+  "content": "#!/usr/bin/env python3\n\"\"\"Diagnose the CNF -> linear-system projection used by gob/gob-sign.\n\nusage: projection_counts.py FILE.cnf [FILE.cnf ...]\n         parsed clauses vs equations after no_twins, ranks, least-squares RMS\n       projection_counts.py --signs A.txt B.txt\n         differing signs from two `probe start` dumps\n\"\"\"\nimport sys\n\n\ndef parsed_clauses(path):\n    \"\"\"Mirror cnf_from_dimacs_str: drop tautologies, shorten repeated literals.\"\"\"\n    with open(path) as f:\n        lines = f.read().splitlines()\n    header = next(line for line in lines if line.startswith('p ')).split()\n    nv = int(header[2])\n    out = []\n    for line in lines:\n        if not line.strip() or line[0] in 'pc%':\n            continue\n        seen, cl = {}, []\n        for tok in line.split()[:-1]:\n            lit = int(tok)\n            var, positive = abs(lit), lit > 0\n            if var in seen and seen[var] != positive:\n                cl = []\n                break\n            seen[var] = positive\n            cl.append(var if positive else -var)\n        if cl:\n            out.append(cl)\n    return nv, out\n\n\ndef twin_filter(cls):\n    \"\"\"Mirror no_twins: keep the first of each sync/async twin pair.\"\"\"\n    keep, seen = [], set()\n    for cl in cls:\n        a, b = tuple(sorted(cl)), tuple(sorted(-l for l in cl))\n        if a in seen or b in seen:\n            continue\n        seen.add(a)\n        seen.add(b)\n        keep.append(cl)\n    return keep\n\n\ndef report(path):\n    import numpy as np  # only needed for ranks\n\n    nv, cls = parsed_clauses(path)\n    eqs = twin_filter(cls)\n    m = len(eqs)\n    A = np.zeros((m, nv))\n    for i, cl in enumerate(eqs):\n        for lit in cl:\n            A[i, abs(lit) - 1] = 1.0 if lit > 0 else -1.0\n    b = np.ones(m)\n    x, *_ = np.linalg.lstsq(A, b, rcond=None) if m and nv else (np.zeros(nv),)\n    rms = float(np.sqrt(np.mean((A @ x - b) ** 2))) if m else 0.0\n    print(f\"{path}: clauses={len(cls)} equations={m} n={nv} \"\n          f\"rankA={np.linalg.matrix_rank(A)} rankAb={np.linalg.matrix_rank(np.column_stack([A, b]))} \"\n          f\"redundant={m - np.linalg.matrix_rank(A)} lsRMS={rms:.3f}\")\n\n\ndef sign_diff(a, b):\n    with open(a) as f:\n        x = f.read().strip()\n    with open(b) as f:\n        y = f.read().strip()\n    if len(x) != len(y):\n        sys.exit('sign dumps differ in length')\n    d = sum(p != q for p, q in zip(x, y))\n    print(f\"{a} vs {b}: {d}/{len(x)} signs differ ({100 * d / len(x):.2f}%)\")\n\n\nif __name__ == '__main__':\n    if len(sys.argv) > 1 and sys.argv[1] == '--signs':\n        sign_diff(sys.argv[2], sys.argv[3])\n    else:\n        for path in sys.argv[1:]:\n            report(path)\n"
+}
+```
+
+Created file successfully: knowledge/c_3sat/tools/projection_counts.py
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Check the parser filter: my Python `parsed_clauses` drops a tautology by clearing cl and breaking — but if a tautology occurs after some literals, `cl=[]; break` works. However, if seen dict has entries and no tautology, fine. Condition `line[0] in 'pc%'` — lines starting with 'c' comment, 'p' header, '%' end marker. But a clause line could start with '-' or digit, fine. Good.
+
+Wait, there's a bug: if a tautology is found, I break and cl=[]; but `seen` remains — irrelevant since we discard. Fine.
+
+Also the header line starts with 'p ' and would be skipped by `line[0] in 'pc%'`. Good.
+
+Now Makefile target.
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/Makefile",
+  "oldString": ".PHONY: build test bench bench-rarest clean",
+  "newString": ".PHONY: build test bench bench-rarest probe clean"
+}
+```
+
+Edited knowledge/c_3sat/Makefile (1 replacement)
+
+---
+
+## Assistant
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/Makefile",
+  "oldString": "$(BUILD)/bench_rarest: tools/bench_rarest.c $(SRC) src/sat.h src/groups.h src/result.h\n\t@mkdir -p $(BUILD)\n\t$(CC) $(CFLAGS) -Isrc -o $@ tools/bench_rarest.c $(SRC)\n\n# make bench-rarest ARGS=\"1000 3.5 10 200000 9\"",
+  "newString": "$(BUILD)/bench_rarest: tools/bench_rarest.c $(SRC) src/sat.h src/groups.h src/result.h\n\t@mkdir -p $(BUILD)\n\t$(CC) $(CFLAGS) -Isrc -o $@ tools/bench_rarest.c $(SRC)\n\n# gob/gob-sign projection diagnostics (see README, \"Projection diagnostics\")\nprobe: $(BUILD)/probe\n\n$(BUILD)/probe: tools/probe.c $(SRC) src/sat.h src/groups.h src/result.h\n\t@mkdir -p $(BUILD)\n\t$(CC) $(CFLAGS) -Isrc -o $@ tools/probe.c $(SRC)\n\n# make bench-rarest ARGS=\"1000 3.5 10 200000 9\""
+}
+```
+
+Edited knowledge/c_3sat/Makefile (1 replacement)
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Now README updates. Add a "Projection diagnostics" subsection after Gob-sign (before Gob-square) with the findings and reproduction commands. Keep concise but include the tables/counts.
+
+Draft:
+
+```
+### Projection diagnostics
+
+The projection itself is faithful in count: each parsed clause becomes exactly
+one equation `sum(±x)=1`. `no_twins` drops 0 equations on random instances and
+0–2.08% on AIM (all exact duplicates, 0 asynchronous twins). The RHS scale is
+not the issue: `sign(v)` is invariant under `b -> c·b` for `c>0`, and a row with
+`sum=1>0` always has a true literal. What is lost is elsewhere: the m rows share
+n variables, and on every measured instance `rank(A)=n` while
+`rank([A|b])=n+1`, so no real vector satisfies all rows (AIM residual of `b`
+against `col(A)` = 12–34). The system is inconsistent, hence cyclic Kaczmarz has
+no unique fixed point: each row order converges to its own attractor, ~5 from
+the least-squares solution. Two orders of AIM 100-2_0 give 49/100 different
+signs, stable from 1000 to 4000 sweeps.
+
+At 20000/3.5, reordering the same 69,994 clauses changes 32.6–33.9% of the
+decoded signs (6,525–6,869 of 20,000 variables), while init unsat only moves
+within 869–952. That sign churn flips outcomes: seed 4 fails in file order but
+solves in 8/8 reorders; seed 1 solves in file order but fails in 4/8. Crossing
+the two choices on the same formula shows both are independent coin flips:
+
+| seed | vary start only (same formula/order) | vary search order only (same start) |
+|---|---|---|
+| 4 | 5/8 solve | 5/8 solve |
+| 10 | 7/8 solve | 6/8 solve |
+| 1 | 8/8 solve | 7/8 solve |
+
+All of these instances are satisfiable, so the two misses in the bench row are
+start/order artifacts, not hardness.
+
+Reproduce with ...
+```
+
+Commands:
+```
+make probe
+mkdir -p /tmp/gobdiag
+build/probe gen 20000 3.5 10 200000 9 /tmp/gobdiag
+python3 tools/permute_clauses.py /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4_p0.cnf 1004
+build/probe run /tmp/gobdiag/b4_p0.cnf 200000 9
+build/probe start /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4.txt
+build/probe start /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4_p0.txt
+python3 tools/projection_counts.py --signs /tmp/gobdiag/b4.txt /tmp/gobdiag/b4_p0.txt
+python3 tools/projection_counts.py /tmp/gobdiag/b4.cnf
+build/probe xstart /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4.cnf 200000 9
+```
+
+Note the permute seed used in my experiment was 1000*sd+k = 4004 for sd 4, k 4 etc. But the README example just needs reproducibility, not exact numbers. However if I claim "seed 4 solves in 8/8 reorders", the example with seed 1004 may or may not solve. To be safe, say "one order" in example.
+
+Careful: `build/probe gen` requires outdir to exist (dump uses fopen, no mkdir). Mention mkdir.
+
+Also update Layout section to include new tools.
+
+Let me insert.
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md",
+  "oldString": "Search from the sign decode alone solves 6/10 of the 20000/3.5 seeds at this\nbudget; the greedy repair brings gob-sign to 8/10, where gob solved 0/10.\n\n### Gob-square",
+  "newString": "Search from the sign decode alone solves 6/10 of the 20000/3.5 seeds at this\nbudget; the greedy repair brings gob-sign to 8/10, where gob solved 0/10.\n\n#### Projection diagnostics\n\nThe projection is faithful in **count**: one equation per parsed clause.\n`no_twins` drops 0 equations on random instances and 0–2.08% on AIM (all exact\nduplicates, 0 asynchronous twins). The right-hand side is not the issue either:\n`sign(v)` is invariant under scaling `b` by a positive constant, and a row with\n`sum = 1 > 0` always has a true literal. The loss is joint: `m` rows share `n`\nvariables, and on every measured instance `rank(A) = n` while\n`rank([A|b]) = n+1` (AIM residual of `b` against `col(A)` is 12–34). The system\nis inconsistent, so cyclic Kaczmarz has no unique fixed point — each row order\nsettles at its own attractor, ~5 away from the least-squares solution. Two orders\nof AIM 100-2_0 give 49/100 different signs, unchanged from 1000 to 4000 sweeps.\n\nAt 20000/3.5, permuting the clause order of the same 69,994 clauses flips\n32.6–33.9% of the decoded signs (6,525–6,869 of 20,000 variables), while\n`init_unsat` only moves within 869–952. That sign churn flips outcomes: seed 4\nfails in file order but solves in 8/8 reorders; seed 1 solves in file order but\nfails in 4/8. Crossing the two choices shows they are independent coin flips:\n\n| seed | vary start only (same formula and order) | vary search order only (same start) |\n|---|---|---|\n| 4 | 5/8 solve | 5/8 solve |\n| 10 | 7/8 solve | 6/8 solve |\n| 1 | 8/8 solve | 7/8 solve |\n\nEvery instance above is satisfiable, so these misses are start/order artifacts,\nnot instance hardness.\n\nReproduce (the generator mirrors `bench_rarest.c` exactly, including its parsed\nclause-count drift):\n\n```sh\nmake probe\nmkdir -p /tmp/gobdiag\nbuild/probe gen 20000 3.5 10 200000 9 /tmp/gobdiag\npython3 tools/projection_counts.py /tmp/gobdiag/b4.cnf      # clauses, equations, ranks\npython3 tools/permute_clauses.py /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4_p0.cnf 1004\nbuild/probe run /tmp/gobdiag/b4_p0.cnf 200000 9            # outcome after reordering\nbuild/probe start /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4.txt\nbuild/probe start /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4_p0.txt\npython3 tools/projection_counts.py --signs /tmp/gobdiag/b4.txt /tmp/gobdiag/b4_p0.txt\nbuild/probe xstart /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4.cnf 200000 9   # start only\nbuild/probe xstart /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4_p0.cnf 200000 9   # order only\n```\n\n### Gob-square"
+}
+```
+
+Edited knowledge/c_3sat/README.md (1 replacement)
+
+---
+
+## Assistant
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md",
+  "oldString": "tools/gen_cnf.py     random 3-CNF generator\ntools/bench_rarest.c init + search benchmark (make bench-rarest)\n```",
+  "newString": "tools/gen_cnf.py             random 3-CNF generator\ntools/bench_rarest.c         init + search benchmark (make bench-rarest)\ntools/probe.c                gob-sign projection diagnostics (make probe)\ntools/permute_clauses.py     shuffle clause order of a DIMACS file\ntools/projection_counts.py   equations/ranks and decoded-sign comparison\n```"
+}
+```
+
+Edited knowledge/c_3sat/README.md (1 replacement)
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Now verify: build probe target, run the README repro commands partially to ensure they work, run `make test` (should be unaffected), and check projection_counts.py against a CNF (e.g. b4.cnf) — it may be slow for 70000×20000 rank computation with numpy (SVD of 70000x20000 too big!). Oops: rank on 20000-var instances with numpy is infeasible. In README repro I put `projection_counts.py /tmp/gobdiag/b4.cnf` — that will try SVD on 70000x20000, too big, will hang/OOM. Need to fix: use a small AIM file for the counts example, not b4.cnf.
+
+Change repro to use an AIM file, e.g. `tools/projection_counts.py /tmp/opencode/cnf/ex/aim/aim-100-2_0-yes1-1.cnf` — but that path is environment-specific. Is there an AIM corpus in the repo? Earlier /tmp/opencode/cnf/ex/aim — outside repo. Check tests/fixtures or build dir for cnf files. Let me check.
+
+Options:
+- Use `tools/gen_cnf.py 100 3.5 1` to generate a small random CNF, then count. That's reproducible inside repo. 
+  ```
+  python3 tools/gen_cnf.py 100 3.5 1 > /tmp/gobdiag/small.cnf
+  python3 tools/projection_counts.py /tmp/gobdiag/small.cnf
+  ```
+  But gen_cnf.py generator may differ from bench; fine for counts. However, will rank(A)=n, rank[A|b]=n+1 hold for that instance? Likely yes for 100/3.5. Need to test.
+
+Let me fix README repro and test everything. Also note projection_counts.py's `np.linalg.lstsq` on 70000x20000 would also be huge. So definitely change.
+
+Let me check gen_cnf.py usage and test.
+
+**Tool: shell**
+
+**Input:**
+```json
+{
+  "command": "cd /home/evg/i_C_u/little.AI/knowledge/c_3sat && make probe && python3 tools/gen_cnf.py 100 3.5 1 > /tmp/opencode/small.cnf && python3 tools/projection_counts.py /tmp/opencode/small.cnf",
+  "timeout": 180000
+}
+```
+
+cc -std=gnu11 -O2 -Wall -Wextra -Isrc -o build/probe tools/probe.c src/sat.c src/groups.c
+/tmp/opencode/small.cnf: clauses=350 equations=350 n=100 rankA=100 rankAb=101 redundant=250 lsRMS=0.856
+
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Good. Fix README repro line to generate small.cnf.
+
+Also test `projection_counts.py --signs` and `permute_clauses.py` and `probe run/xstart` with the new tool. Use /tmp/opencode existing files: b4.cnf etc. But the saved probe uses outdir; test with /tmp/opencode dir (has b*.cnf). Run a subset:
+
+- `build/probe start /tmp/opencode/b4.cnf /tmp/opencode/chk4.txt`
+- `build/probe start /tmp/opencode/perm/s4_p0.cnf /tmp/opencode/chkp0.txt`
+- `python3 tools/projection_counts.py --signs ...`
+- `python3 tools/permute_clauses.py /tmp/opencode/b4.cnf /tmp/opencode/chkperm.cnf 4004`
+- `build/probe run /tmp/opencode/chkperm.cnf 200000 9` — takes ~1-2s.
+
+Also `make test` to ensure nothing broke.
+
+First fix README.
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md",
+  "oldString": "build/probe gen 20000 3.5 10 200000 9 /tmp/gobdiag\npython3 tools/projection_counts.py /tmp/gobdiag/b4.cnf      # clauses, equations, ranks",
+  "newString": "build/probe gen 20000 3.5 10 200000 9 /tmp/gobdiag\npython3 tools/gen_cnf.py 100 3.5 1 > /tmp/gobdiag/small.cnf\npython3 tools/projection_counts.py /tmp/gobdiag/small.cnf   # clauses, equations, ranks (small: SVD)"
+}
+```
+
+Edited knowledge/c_3sat/README.md (1 replacement)
+
+---
+
+## Assistant
+
+**Tool: shell**
+
+**Input:**
+```json
+{
+  "command": "cd /home/evg/i_C_u/little.AI/knowledge/c_3sat && ./build/probe start /tmp/opencode/b4.cnf /tmp/opencode/chk4.txt && ./build/probe start /tmp/opencode/perm/s4_p0.cnf /tmp/opencode/chkp0.txt && python3 tools/projection_counts.py --signs /tmp/opencode/chk4.txt /tmp/opencode/chkp0.txt && python3 tools/permute_clauses.py /tmp/opencode/b4.cnf /tmp/opencode/chkperm.cnf 4004 && ./build/probe run /tmp/opencode/chkperm.cnf 200000 9 && ./build/probe xstart /tmp/opencode/perm/s4_p0.cnf /tmp/opencode/b4.cnf 200000 9",
+  "timeout": 600000
+}
+```
+
+/tmp/opencode/chk4.txt vs /tmp/opencode/chkp0.txt: 6585/20000 signs differ (32.92%)
+/tmp/opencode/chkperm.cnf	init_unsat=925	SAT	steps=141818
+/tmp/opencode/perm/s4_p0.cnf	UNKNOWN	steps=2000000
+
+
+---
+
+## Assistant
+
+_Thinking:_
+
+All modes work. Now `make test` to ensure nothing broken (tools only, but cheap-ish ~? 183755 checks with ASan, might take a minute). Also check that `projection_counts.py` handles AIM files from repo if any; not needed. Run test.
+
+**Tool: shell**
+
+**Input:**
+```json
+{
+  "command": "cd /home/evg/i_C_u/little.AI/knowledge/c_3sat && make test 2>&1 | tail -5",
+  "timeout": 600000
+}
+```
+
+./build/test_sat
+183755 checks, 0 failures
+
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Need final check README section renders and no contradictions. Let me read the inserted section once.
+
+**Tool: read**
+
+**Input:**
+```json
+{
+  "path": "/home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md",
+  "offset": 151,
+  "limit": 70
+}
+```
+
+Read file /home/evg/i_C_u/little.AI/knowledge/c_3sat/README.md, lines 151-220
+151: ### Gob-sign
+152: 
+153: `--init gob-sign` runs the same filter, Kaczmarz sweeps and greedy repair, but
+154: decodes the real vector by sign: positive is true, zero or negative is false.
+155: 
+156: Sign, not magnitude, is the signal. The equation asks for **two** true literals
+157: per clause, which a satisfying assignment usually does not give: on 20000/3.5,
+158: 43% of a solution's clauses have exactly one true literal (signed sum `-1`), and
+159: 15% have all three. So 58% of the equations are violated at the true solution,
+160: its RMS residual is 1.52 -- worse than the Kaczmarz point's own 1.19. The
+161: minimum of this system is not near SAT. What survives is the sign: it agrees with
+162: a found solution 63.5% of the time, where the magnitude decode agrees only 52.5%.
+163: Search from the sign decode alone solves 6/10 of the 20000/3.5 seeds at this
+164: budget; the greedy repair brings gob-sign to 8/10, where gob solved 0/10.
+165: 
+166: #### Projection diagnostics
+167: 
+168: The projection is faithful in **count**: one equation per parsed clause.
+169: `no_twins` drops 0 equations on random instances and 0–2.08% on AIM (all exact
+170: duplicates, 0 asynchronous twins). The right-hand side is not the issue either:
+171: `sign(v)` is invariant under scaling `b` by a positive constant, and a row with
+172: `sum = 1 > 0` always has a true literal. The loss is joint: `m` rows share `n`
+173: variables, and on every measured instance `rank(A) = n` while
+174: `rank([A|b]) = n+1` (AIM residual of `b` against `col(A)` is 12–34). The system
+175: is inconsistent, so cyclic Kaczmarz has no unique fixed point — each row order
+176: settles at its own attractor, ~5 away from the least-squares solution. Two orders
+177: of AIM 100-2_0 give 49/100 different signs, unchanged from 1000 to 4000 sweeps.
+178: 
+179: At 20000/3.5, permuting the clause order of the same 69,994 clauses flips
+180: 32.6–33.9% of the decoded signs (6,525–6,869 of 20,000 variables), while
+181: `init_unsat` only moves within 869–952. That sign churn flips outcomes: seed 4
+182: fails in file order but solves in 8/8 reorders; seed 1 solves in file order but
+183: fails in 4/8. Crossing the two choices shows they are independent coin flips:
+184: 
+185: | seed | vary start only (same formula and order) | vary search order only (same start) |
+186: |---|---|---|
+187: | 4 | 5/8 solve | 5/8 solve |
+188: | 10 | 7/8 solve | 6/8 solve |
+189: | 1 | 8/8 solve | 7/8 solve |
+190: 
+191: Every instance above is satisfiable, so these misses are start/order artifacts,
+192: not instance hardness.
+193: 
+194: Reproduce (the generator mirrors `bench_rarest.c` exactly, including its parsed
+195: clause-count drift):
+196: 
+197: ```sh
+198: make probe
+199: mkdir -p /tmp/gobdiag
+200: build/probe gen 20000 3.5 10 200000 9 /tmp/gobdiag
+201: python3 tools/gen_cnf.py 100 3.5 1 > /tmp/gobdiag/small.cnf
+202: python3 tools/projection_counts.py /tmp/gobdiag/small.cnf   # clauses, equations, ranks (small: SVD)
+203: python3 tools/permute_clauses.py /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4_p0.cnf 1004
+204: build/probe run /tmp/gobdiag/b4_p0.cnf 200000 9            # outcome after reordering
+205: build/probe start /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4.txt
+206: build/probe start /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4_p0.txt
+207: python3 tools/projection_counts.py --signs /tmp/gobdiag/b4.txt /tmp/gobdiag/b4_p0.txt
+208: build/probe xstart /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4.cnf 200000 9   # start only
+209: build/probe xstart /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4_p0.cnf 200000 9   # order only
+210: ```
+211: 
+212: ### Gob-square
+213: 
+214: `--init gob-square` runs the same idea in three phases:
+215: 
+216: 1. **Filter and pick a square subsystem.** `no_twins` first removes repeated
+217:    synchronous clauses and complementary asynchronous clauses. Of the remaining
+218:    `m` equations, select `n` (one every `m/n` clauses), so the selected block has
+219:    as many equations as variables. Here `m` is the post-filter equation count.
+220: 2. **Solve it.** 512 cyclic Kaczmarz sweeps over the selected rows only (the
+[Output truncated. Continue reading with offset: 221]
+
+---
+
+## Assistant
+
+_Thinking:_
+
+One issue: the README says "gob-sign's init unsat only moves within 869–952" — from permutations of seeds 1,4,10; correct. "seed 4 fails in file order but solves in 8/8 reorders" — yes with my 8 perms. Good.
+
+Another nuance: "the loss is joint" wording is a bit awkward but fine.
+
+Also "on every measured instance rank(A)=n while rank[A|b]=n+1" — true for our measurements (AIM + random n≤1000; not n=20000). "every measured instance" is accurate since we didn't measure n=20000 rank. Good.
+
+Now final response. Ponytail style: brief summary of changes, verification, and ending with skipped/risk lines. Keep concise.
+
+Files changed:
+- README.md: new "Projection diagnostics" subsection + layout entries.
+- tools/probe.c (new), tools/permute_clauses.py (new), tools/projection_counts.py (new).
+- Makefile: `make probe` target.
+
+Verified: make probe, make test (183755 checks, 0 failures), ran all repro modes; sign diff 6585/20000.
+
+Ending: "Skipped: ... Risk: ..."
+
+Let me write final.
+
+Done. Changes in `./knowledge/c_3sat`:
+
+- **README.md** — new `Gob-sign → Projection diagnostics` section: equations==clauses, rank/augmented-rank result, the 33% sign churn under reordering, the crossed start-vs-order table, plus copy-paste reproduction commands. Layout list updated.
+- **tools/probe.c** — saved harness with four modes: `gen` (exact bench generator, dumps parsed CNFs), `run`, `start` (dump decoded signs), `xstart` (cross start and search order).
+- **tools/permute_clauses.py**, **tools/projection_counts.py** — clause-order shuffler and the equation/rank/sign-diff reporter.
+- **Makefile** — `make probe` target.
+
+Verified: `make probe` builds, `make test` = 183755 checks / 0 failures, and every documented command runs (sign diff reproduced at 6585/20000 = 32.92%).
+
+Skipped: no solver code changed; the rank script deliberately uses small CNFs (`gen_cnf.py 100`) because SVD on the 70000×20000 instance is infeasible. Risk: the repro commands reproduce the *method*, not the exact random permutations from the tables — individual permuted orders will vary.
+
+---
+
+## User
+
+export session ./vibes/3sat.OpenCode.md
+
+---
+
+## Assistant
+
+_Thinking:_
+
+User wants to export the session to ./vibes/3sat.OpenCode.md. There's an OpenCode skill available that covers sessions... Need to check how to export session. The task: write a markdown file summarizing/exporting the conversation? "export session" likely means use OpenCode's session export feature, maybe there's a command or SDK. Let me load the opencode skill to check. Also need to know if there's a tool in Code Mode catalog for session export — the catalog lists: session_move, worktree_*, list_mcp_resources, models, read_mcp_resource, session_rename. No session export tool. Maybe OpenCode CLI has `opencode export` command? Need to check skill.
+
+Let me load skill opencode.
+
+**Tool: skill**
+
+**Input:**
+```json
+{
+  "id": "opencode"
+}
+```
+
+<skill_content name="OpenCode">
+# Skill: OpenCode
+
+# OpenCode
+
+Use this guide as the starting point for work involving OpenCode itself. It
+covers the core concepts needed to configure and customize OpenCode, extend it
+with plugins, and build integrations with the OpenCode SDK, clients, and API.
+
+Full documentation is available at <https://opencode.ai/docs/>. This overview is
+only an index of core concepts. Before answering a question about a topic below,
+fetch the URL named in that section and use the full page as the source of
+truth. Follow links from that page when the question needs more detail. Fetch
+<https://opencode.ai/docs/> first when you need to discover the relevant
+documentation page.
+
+A machine-readable documentation index is available at
+<https://opencode.ai/docs/llms.txt>.
+
+## Version policy
+
+Always answer for OpenCode V2 unless the user explicitly asks about V1,
+legacy OpenCode, or migrating from V1.
+
+Use only <https://opencode.ai/docs/> documentation as the source of truth for V2.
+Do not use <https://opencode.ai/docs/>, which documents V1, and do not use
+general web search to resolve a V2 documentation question when the V2 docs or
+linked pages cover it. The schema served from
+<https://opencode.ai/config.json> accepts both V2 fields and deprecated V1
+fields. Never recommend a field it marks deprecated. If V2 documentation is
+missing or contradictory, state the uncertainty or ask for clarification instead of falling back to V1.
+
+V1 documentation and syntax may be consulted only when the user explicitly
+asks about V1 or when needed as migration input. Outputs and recommendations
+must still use V2 unless the user specifically requests a V1 result.
+
+## [CLI](https://opencode.ai/docs/cli)
+
+For questions about the terminal interface, command-line invocation, `run`,
+`mini`, terminal providers, or other CLI behavior, fetch the
+[CLI guide](https://opencode.ai/docs/cli) and the relevant page linked from
+that section.
+
+CLI and TUI preferences are separate from OpenCode's server and project
+configuration. They live in the global `~/.config/opencode/cli.json`, or
+`$XDG_CONFIG_HOME/opencode/cli.json` when `XDG_CONFIG_HOME` is set. There is no
+project-local CLI configuration. Set `OPENCODE_CLI_CONFIG_CONTENT` to merge
+inline JSON over the global settings. Most preferences can also be changed from
+the TUI by pressing `Ctrl+P` and selecting **Open settings**.
+
+### [Settings](https://opencode.ai/docs/cli/config)
+
+Fetch the full [CLI settings reference](https://opencode.ai/docs/cli/config)
+before editing `cli.json`. It documents every terminal-only setting, accepted
+values, and examples, including themes, input, sessions, tabs, diffs, alerts,
+Mini, keybindings, terminal plugins, and debugging. Do not put these settings
+in `opencode.json(c)`.
+
+### [Keybinds](https://opencode.ai/docs/cli/keybinds)
+
+Configure keybindings under `keybinds` in `cli.json`. The leader key is the
+`keybinds.leader` entry; leader timing is configured separately under
+`leader.timeout`. Bindings can use a string, an array of strings, or an object
+when event behavior such as `preventDefault` is required. Disable a binding
+with `"none"` or `false`.
+
+Never guess a command ID, default binding, or accepted key syntax. Fetch the
+full [keybind reference](https://opencode.ai/docs/cli/keybinds), which lists
+the current IDs and defaults, before answering or editing a binding.
+
+## [OpenCode configuration](https://opencode.ai/docs/config)
+
+OpenCode's server and project configuration uses JSON or JSONC. Include the
+published schema so the user's editor can validate fields and provide
+autocomplete:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+}
+```
+
+Global configuration lives at `~/.config/opencode/opencode.json(c)` and applies
+to every project for that user. Project configuration can live in any directory
+as `opencode.json(c)` or `.opencode/opencode.json(c)`, including nested packages
+in a monorepo.
+
+During ordinary project discovery, OpenCode searches the current Location
+directory and every ancestor through the filesystem root, including directories
+above the detected project or repository root. It merges direct
+`opencode.json(c)` files from the farthest ancestor to the current directory,
+then does the same for `.opencode/opencode.json(c)` files. This means every
+discovered `.opencode` config overrides every discovered direct config. Global
+filesystem configuration has lower precedence than these discovered documents.
+
+Common configuration fields include `model`, `default_agent`, `permissions`,
+`agents`, `commands`, `plugins`, `providers`, `mcp`, `skills`, `instructions`,
+`references`, `formatter`, and `lsp`.
+
+This configuration is distinct from `cli.json`. Use the
+[CLI settings reference](https://opencode.ai/docs/cli/config) for terminal
+preferences, especially themes and keybindings.
+
+Config changes apply without a restart. OpenCode watches config files and
+reloads agents, commands, skills, MCP servers, and plugins after a save. The TUI
+does the same for `cli.json`. To force a full reload, use `/reload`. Don't tell
+the user to restart OpenCode after editing config.
+
+Do not guess field names or shapes. Fetch the V2 configuration guide and its
+linked topic guide as the source of truth, and preserve unrelated settings when
+editing an existing file. Keep the published `$schema` URL in configuration
+examples, but do not fetch it to determine the V2 configuration shape.
+
+See the [full configuration guide](https://opencode.ai/docs/config) for
+every field, examples, config locations, and links to dedicated feature guides.
+
+## [MCP servers](https://opencode.ai/docs/mcp-servers)
+
+Configure MCP servers under `mcp.servers`. Prefer the CLI because it preserves
+unrelated configuration. Use `--global` when the user asks to set up a service
+for themselves without limiting it to the current project; omit it when they
+explicitly want project-local configuration.
+
+```sh
+opencode mcp add <name> --global --url <remote-url>
+opencode mcp list
+```
+
+Remote servers use OAuth by default. If `mcp list` reports that a server needs
+authentication, tell the user to run `/mcps`, select the server, and sign in.
+Do not run `opencode mcp auth` through the shell tool: it starts an interactive
+flow whose authorization link can be hidden in background process output.
+Use the user-facing MCP interface instead.
+
+Report the server as configured but awaiting sign-in until its connection
+status confirms it is connected.
+
+OAuth credentials are stored outside the OpenCode configuration. Do not ask for or
+store an API key when the server supports OAuth. Use header-based credentials
+only when OAuth is unavailable or the user explicitly requires them, and use an
+environment substitution such as `{env:MCP_API_KEY}` instead of writing a
+secret into configuration.
+
+## [V1 to V2 migration](https://opencode.ai/docs/migrate-v1)
+
+For any request to migrate OpenCode configuration, agents, commands, skills,
+plugins, integrations, or other behavior from V1 to V2, read the full
+[migration guide](https://opencode.ai/docs/migrate-v1) before acting. In
+the repository, its source is `services/site/src/docs/content/migrate-v1.mdx`.
+
+V1 config files and `.opencode/` definitions are intended to remain compatible.
+The only intentional breaking changes are the server API and plugin API. Native
+V2 config uses more ergonomic shapes, but conversion is optional. When the user
+requests conversion, inspect the complete configuration, preserve behavior and
+unrelated settings, and apply only the relevant migrations from the guide. For
+plugin migrations, fetch and follow both the migration guide and the full
+[plugins guide](https://opencode.ai/docs/build/plugins). If non-API V1
+functionality fails in V2, use the `report` skill to file it as a compatibility
+bug.
+
+## [Plugins](https://opencode.ai/docs/build/plugins)
+
+For questions about creating, configuring, loading, publishing, or migrating
+plugins, fetch the full [plugins guide](https://opencode.ai/docs/build/plugins)
+before answering. Refer to this guide when the user wants to build a plugin. It
+covers hooks, transforms, tools, plugin context capabilities, and package
+entrypoints. Plugins can also extend the TUI; for those, fetch the
+[CLI plugin guide](https://opencode.ai/docs/build/plugins/cli).
+For custom methods and events shared with other plugins or clients, fetch the
+[RPC guide](https://opencode.ai/docs/build/plugins/rpc).
+
+## [Service](https://opencode.ai/docs/troubleshooting#check-the-background-service)
+
+OpenCode uses a client-server architecture. Interfaces such as the TUI connect
+to a background OpenCode service, which owns sessions, configuration, plugins,
+permissions, and tool execution.
+
+OpenCode normally discovers or starts the shared background service
+automatically. Restart it only if it is stuck or unhealthy, not to apply
+configuration changes:
+
+```sh
+opencode service restart
+```
+
+Check its status after restarting:
+
+```sh
+opencode service status
+```
+
+## [API](https://opencode.ai/docs/api)
+
+OpenCode exposes an HTTP API from its server. The API is described by an
+OpenAPI document available from the running server at `/openapi.json`.
+
+In Code Mode, use the built-in `opencode` tool namespace first, called inside
+`execute` as `tools.opencode.*`. These tools skip the shell round-trip and
+handle discovery and authentication; find its tools with Code Mode's `search`,
+for example `search({ namespace: "opencode" })`. For anything they do not cover,
+use the `opencode api` command. It uses the same discovery and authentication
+flow as the TUI and may start the background service when no compatible healthy
+service is available. It accepts either an HTTP method and path or an OpenAPI
+operation ID.
+
+Call an endpoint with an HTTP method and path:
+
+```sh
+opencode api get /api/info
+```
+
+Pass a request body with `--data` or `-d`, and additional headers with
+`--header` or `-H`:
+
+```sh
+opencode api post /api/example --data '{"key":"value"}'
+opencode api get /api/example --header 'X-Example:value'
+```
+
+Request bodies default to `Content-Type: application/json`. When OpenCode is
+connected to an explicit server instead of its managed background service, use
+the same configured server and authentication context rather than constructing
+an unauthenticated request separately.
+
+See the [full API reference](https://opencode.ai/docs/api) for available
+endpoints, parameters, request bodies, and response schemas. The
+raw [OpenAPI specification](https://opencode.ai/docs/openapi.json) is also
+available for code generation and other tooling.
+
+## [Client](https://opencode.ai/docs/build/client)
+
+For questions about connecting an application to OpenCode over the network,
+fetch the full [client guide](https://opencode.ai/docs/build/client) before
+answering.
+
+`@opencode/client` is the generated TypeScript client for the OpenCode HTTP
+API. Its methods and types come from the same contract as the API reference.
+The default entrypoint exposes Promise-based resource clients and async
+iterables for streaming endpoints. The `@opencode/client/effect` entrypoint
+exposes typed Effects, Streams, and decoded OpenCode schema values. Its
+`Service` API can discover, start, stop, and authenticate with the local
+background service from a Node application.
+
+## [SDK](https://opencode.ai/docs/build/sdk)
+
+For questions about embedding OpenCode directly in an application, fetch the
+full [SDK guide](https://opencode.ai/docs/build/sdk) before answering. The SDK
+hosts OpenCode in the application without opening an HTTP listener.
+
+Use the [Effect SDK guide](https://opencode.ai/docs/build/sdk/effect) for
+Effect applications. For Cloudflare Durable Objects, use the
+[Cloudflare SDK guide](https://opencode.ai/docs/build/sdk/cloudflare).
+
+## [Troubleshooting](https://opencode.ai/docs/troubleshooting)
+
+OpenCode runs a client and a background server. Start by determining whether a
+problem belongs to the client, the shared server, or one project.
+
+- Check the service with `opencode service status` and verify the API with
+  `opencode api get /api/info`.
+- Compare with `opencode --standalone`, which runs the TUI with a private
+  server, to isolate shared-service issues.
+- Inspect `~/.local/share/opencode/log/opencode.log`. Filter `role=cli` for
+  client startup and `role=server` for sessions, providers, plugins,
+  permissions, and tools.
+- Run one reproduction with `OPENCODE_LOG_LEVEL=DEBUG` when normal logs are not
+  sufficient.
+- Do not delete or edit the database, service registration, or service config
+  while diagnosing a problem. Back up persistent data before inspecting it
+  with external tools.
+- Redact API keys, authorization headers, prompts, file contents, and other
+  sensitive data before sharing diagnostics.
+
+See the [full troubleshooting guide](https://opencode.ai/docs/troubleshooting)
+for service lifecycle commands, API inspection, log locations, explicit server
+connections, issue-reporting details, and local development paths.
+
+Base directory for this skill: skill://opencode
+Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.
+Note: file list is sampled.
+
+<skill_files>
+</skill_files>
+</skill_content>
+
+---
+
+## Assistant
+
+_Thinking:_
+
+The user wants to export session to ./vibes/3sat.OpenCode.md. There's no dedicated export tool in the Code Mode catalog. Need to find a way: OpenCode CLI has `opencode export <sessionID>`? Let me check CLI help. Also maybe sessions are stored in ~/.local/share/opencode/storage/message/... and can be assembled into markdown manually. But simpler: check `opencode --help` / `opencode export --help`.
+
+Let me run shell commands to discover. Also need current session ID: env OPENCODE_SESSION_ID.
+
+**Tool: shell**
+
+**Input:**
+```json
+{
+  "command": "echo \"$OPENCODE_SESSION_ID\" && opencode --help 2>&1 | head -60"
+}
+```
+
+ses_e2ade9666ffe7ylVHrKuP3nWfB
+DESCRIPTION
+  OpenCode command line interface
+
+USAGE
+  opencode <subcommand> [flags] [<directory>]
+
+ARGUMENTS
+  directory string    Directory to start OpenCode in (optional)
+
+FLAGS
+  --standalone            Run with a private server instead of the background service
+  --server string         Connect to a server URL instead of the background service
+  --auto                  Auto-approve permissions that are not explicitly denied
+  --continue, -c          Continue the last session
+  --session, -s string    Session ID to continue, or to create if it does not exist
+  --prompt string         Prompt to use
+
+GLOBAL FLAGS
+  --help, -h                                                          Show help information
+  --version, -v                                                       Show version information
+  --wizard                                                            Start wizard mode for a command
+  --completions <bash|zsh|fish|powershell|sh|pwsh>                    Print shell completion script (choices: bash, zsh, fish, powershell, sh, pwsh)
+  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)
+  --print-logs                                                        Print logs to stderr (server logs require --standalone)
+
+SUBCOMMANDS
+  upgrade, update    Upgrade OpenCode to the latest or a specific version
+  uninstall          Uninstall OpenCode, keeping session data, configuration, and state
+  acp                Start an Agent Client Protocol server
+  api                Make a request to the running server
+  debug              Debugging and troubleshooting tools
+  auth               manage integrations and credentials
+  mcp                Manage MCP (Model Context Protocol) servers
+  plugin             Manage plugins
+  models             List all available models
+  stats              Show shareable usage statistics
+  mini               Start the minimal interactive interface
+  run                Run OpenCode with a message
+  session            Manage sessions
+  service            Manage the background server
+  reload             Reload configuration
+  pair               Print one-time links to connect a browser or app
+  serve              Start the v2 API and web server
+
+
+**Tool: shell**
+
+**Input:**
+```json
+{
+  "command": "opencode export --help 2>&1 | head -40"
+}
+```
+
+DESCRIPTION
+  OpenCode command line interface
+
+USAGE
+  opencode <subcommand> [flags] [<directory>]
+
+ARGUMENTS
+  directory string    Directory to start OpenCode in (optional)
+
+FLAGS
+  --standalone            Run with a private server instead of the background service
+  --server string         Connect to a server URL instead of the background service
+  --auto                  Auto-approve permissions that are not explicitly denied
+  --continue, -c          Continue the last session
+  --session, -s string    Session ID to continue, or to create if it does not exist
+  --prompt string         Prompt to use
+
+GLOBAL FLAGS
+  --help, -h                                                          Show help information
+  --version, -v                                                       Show version information
+  --wizard                                                            Start wizard mode for a command
+  --completions <bash|zsh|fish|powershell|sh|pwsh>                    Print shell completion script (choices: bash, zsh, fish, powershell, sh, pwsh)
+  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)
+  --print-logs                                                        Print logs to stderr (server logs require --standalone)
+
+SUBCOMMANDS
+  upgrade, update    Upgrade OpenCode to the latest or a specific version
+  uninstall          Uninstall OpenCode, keeping session data, configuration, and state
+  acp                Start an Agent Client Protocol server
+  api                Make a request to the running server
+  debug              Debugging and troubleshooting tools
+  auth               manage integrations and credentials
+  mcp                Manage MCP (Model Context Protocol) servers
+  plugin             Manage plugins
+  models             List all available models
+  stats              Show shareable usage statistics
+  mini               Start the minimal interactive interface
+  run                Run OpenCode with a message
+  session            Manage sessions
+  service            Manage the background server
+
+
+---
+
+## Assistant
+
+_Thinking:_
+
+Need `opencode session --help`.
+
+**Tool: shell**
+
+**Input:**
+```json
+{
+  "command": "opencode session --help 2>&1 | head -80"
+}
+```
+
+DESCRIPTION
+  Manage sessions
+
+USAGE
+  opencode session <subcommand> [flags]
+
+GLOBAL FLAGS
+  --help, -h                                                          Show help information
+  --version, -v                                                       Show version information
+  --wizard                                                            Start wizard mode for a command
+  --completions <bash|zsh|fish|powershell|sh|pwsh>                    Print shell completion script (choices: bash, zsh, fish, powershell, sh, pwsh)
+  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)
+  --print-logs                                                        Print logs to stderr (server logs require --standalone)
+  --standalone                                                        Run with a private server instead of the background service
+  --server string                                                     Connect to a server URL instead of the background service
+
+SUBCOMMANDS
+  list      List top-level sessions in the current project, newest first
+  delete    Delete a session and its child sessions
+  export    Export session data as JSON
+  import    Import session data from a JSON file or URL
+
+
+---
+
+## Assistant
+
+_Thinking:_
+
+`opencode session export <sessionID>` exports JSON. User wants markdown at ./vibes/3sat.OpenCode.md. So likely: export session JSON, then convert to markdown. Maybe `opencode session export --help` shows options (maybe output format). Let's check.
+
+**Tool: shell**
+
+**Input:**
+```json
+{
+  "command": "opencode session export --help 2>&1 | head -60"
+}
+```
+
+DESCRIPTION
+  Export session data as JSON
+
+USAGE
+  opencode session export [flags] [<session>]
+
+ARGUMENTS
+  session string    Session ID to export (optional)
+
+FLAGS
+  --sanitize    Redact sensitive transcript and file data
+
+GLOBAL FLAGS
+  --help, -h                                                          Show help information
+  --version, -v                                                       Show version information
+  --wizard                                                            Start wizard mode for a command
+  --completions <bash|zsh|fish|powershell|sh|pwsh>                    Print shell completion script (choices: bash, zsh, fish, powershell, sh, pwsh)
+  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)
+  --print-logs                                                        Print logs to stderr (server logs require --standalone)
+  --standalone                                                        Run with a private server instead of the background service
+  --server string                                                     Connect to a server URL instead of the background service
+
+
+---
+

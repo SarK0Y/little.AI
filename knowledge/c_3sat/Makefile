@@ -3,7 +3,7 @@ CFLAGS  ?= -std=gnu11 -O2 -Wall -Wextra
 BUILD   := build
 SRC     := src/sat.c src/groups.c
 
-.PHONY: build test bench bench-rarest clean
+.PHONY: build test bench bench-rarest probe clean
 
 build: $(BUILD)/3sat
 
@@ -29,6 +29,13 @@ bench: build
 $(BUILD)/bench_rarest: tools/bench_rarest.c $(SRC) src/sat.h src/groups.h src/result.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ tools/bench_rarest.c $(SRC)
+
+# gob/gob-sign projection diagnostics (see README, "Projection diagnostics")
+probe: $(BUILD)/probe
+
+$(BUILD)/probe: tools/probe.c $(SRC) src/sat.h src/groups.h src/result.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/probe.c $(SRC)
 
 # make bench-rarest ARGS="1000 3.5 10 200000 9"
 # make bench-rarest ARGS="tests/fixtures/small_sat.cnf 100000 20"

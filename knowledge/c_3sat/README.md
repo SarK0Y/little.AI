@@ -163,6 +163,52 @@ a found solution 63.5% of the time, where the magnitude decode agrees only 52.5%
 Search from the sign decode alone solves 6/10 of the 20000/3.5 seeds at this
 budget; the greedy repair brings gob-sign to 8/10, where gob solved 0/10.
 
+#### Projection diagnostics
+
+The projection is faithful in **count**: one equation per parsed clause.
+`no_twins` drops 0 equations on random instances and 0–2.08% on AIM (all exact
+duplicates, 0 asynchronous twins). The right-hand side is not the issue either:
+`sign(v)` is invariant under scaling `b` by a positive constant, and a row with
+`sum = 1 > 0` always has a true literal. The loss is joint: `m` rows share `n`
+variables, and on every measured instance `rank(A) = n` while
+`rank([A|b]) = n+1` (AIM residual of `b` against `col(A)` is 12–34). The system
+is inconsistent, so cyclic Kaczmarz has no unique fixed point — each row order
+settles at its own attractor, ~5 away from the least-squares solution. Two orders
+of AIM 100-2_0 give 49/100 different signs, unchanged from 1000 to 4000 sweeps.
+
+At 20000/3.5, permuting the clause order of the same 69,994 clauses flips
+32.6–33.9% of the decoded signs (6,525–6,869 of 20,000 variables), while
+`init_unsat` only moves within 869–952. That sign churn flips outcomes: seed 4
+fails in file order but solves in 8/8 reorders; seed 1 solves in file order but
+fails in 4/8. Crossing the two choices shows they are independent coin flips:
+
+| seed | vary start only (same formula and order) | vary search order only (same start) |
+|---|---|---|
+| 4 | 5/8 solve | 5/8 solve |
+| 10 | 7/8 solve | 6/8 solve |
+| 1 | 8/8 solve | 7/8 solve |
+
+Every instance above is satisfiable, so these misses are start/order artifacts,
+not instance hardness.
+
+Reproduce (the generator mirrors `bench_rarest.c` exactly, including its parsed
+clause-count drift):
+
+```sh
+make probe
+mkdir -p /tmp/gobdiag
+build/probe gen 20000 3.5 10 200000 9 /tmp/gobdiag
+python3 tools/gen_cnf.py 100 3.5 1 > /tmp/gobdiag/small.cnf
+python3 tools/projection_counts.py /tmp/gobdiag/small.cnf   # clauses, equations, ranks (small: SVD)
+python3 tools/permute_clauses.py /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4_p0.cnf 1004
+build/probe run /tmp/gobdiag/b4_p0.cnf 200000 9            # outcome after reordering
+build/probe start /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4.txt
+build/probe start /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4_p0.txt
+python3 tools/projection_counts.py --signs /tmp/gobdiag/b4.txt /tmp/gobdiag/b4_p0.txt
+build/probe xstart /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4.cnf 200000 9   # start only
+build/probe xstart /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4_p0.cnf 200000 9   # order only
+```
+
 ### Gob-square
 
 `--init gob-square` runs the same idea in three phases:
@@ -432,6 +478,9 @@ src/groups.h   group formation + merge API (and the algorithm spec)
 src/groups.c   sequential rogue groups, dynamic-anchor neutral merge
 src/main.c     CLI
 tests/         test_sat.c + fixtures
-tools/gen_cnf.py     random 3-CNF generator
-tools/bench_rarest.c init + search benchmark (make bench-rarest)
+tools/gen_cnf.py             random 3-CNF generator
+tools/bench_rarest.c         init + search benchmark (make bench-rarest)
+tools/probe.c                gob-sign projection diagnostics (make probe)
+tools/permute_clauses.py     shuffle clause order of a DIMACS file
+tools/projection_counts.py   equations/ranks and decoded-sign comparison
 ```
