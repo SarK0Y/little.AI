@@ -85,7 +85,7 @@ Adding a heuristic = write a `PickFn`, add one row to `STRATEGIES`.
 
 ## Initial assignment (`--init`)
 
-Restart 0 starts from one of eight starts (later restarts are always random):
+Restart 0 starts from a chosen init (later restarts are always random):
 
 - `--init majority` (default): every variable takes its majority polarity.
 - `--init rarest`: deterministic constructive start (no RNG), rarest variables first.
@@ -98,16 +98,28 @@ Restart 0 starts from one of eight starts (later restarts are always random):
 - `--init gob-square`: the same, but only `n` of the `m` equations are solved
   (a square subsystem); it reports how many of the remaining equations the
   solution misses.
-- `--init likho`: all false, then a neutral/switch-domain repair pass.
+- `--init gob-recult`: the clause system augmented with tail variables `Y` on the
+  right-hand side (recultivation), solved by Kaczmarz; `x` is decoded by sign and
+  repaired and `Y` is dropped.
+- `--init reverse-rarest|reverse-glowest|reverse-min-overlapping`: negate every
+  clause, run the named constructive start on the reversed system, negate the
+  assignment back (“vice versa”).
+- `--init terminator`: majority start, then improvement rounds of strictly
+  gainful flips (`make_count > break_count`), re-evaluated per variable.
+  `--terminator-rounds N` (default 16) caps passes; `--terminator-order
+  forward|reverse|random` sets the per-round visit order (random uses the solver
+  RNG and reshuffles each round).
+- `--init likho`: pre-cooked start (all-false by default), then a
+  neutral/switch-domain repair pass.
 - `-deep-dive VARS NODES`: implies `--init likho`, caps switch domains at VARS
   variables, gives each prime at most NODES search nodes, and fires domains
   before neutral repairs.
-- `-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square`: implies `--init likho`;
-  phase 1 is that assignment instead of the default all-false one (a partially
-  solved input).
+- `-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping`:
+  implies `--init likho`; phase 1 is that assignment instead of the default
+  all-false one (a partially solved input).
 
-The eight starts work in both `plain` and `groups` mode; `-deep-dive` is a variant
-of `likho`.
+All inits work in both `plain` and `groups` mode; `-deep-dive` is a variant of
+`likho`.
 
 ### Rarest / Glowest / Min-overlapping
 
@@ -134,7 +146,7 @@ They differ only in which unset variable is picked next:
 relaxation, `no_twins` filters the input equation set: synchronous twins
 (identical clauses) and asynchronous twins (the same literals with every sign
 inverted) are reduced to their first occurrence. Literal order does not matter.
-This filtering is local to Gob/Gob-sign/Gob-square; the solver and the greedy
+This filtering is local to Gob/Gob-sign/Gob-square/Gob-recult; the solver and the greedy
 repair still use the complete original CNF. Each remaining clause becomes the
 signed equation `sum(±x) = 1` (a positive literal is `+x`, a negative one `-x`),
 and 64 cyclic Kaczmarz sweeps project the all-zero vector onto that filtered
@@ -261,6 +273,38 @@ selection makes no rank guarantee, e.g. `aim-50-3_4-yes1-1` is singular at
 every unselected equation violated (`rest_bad` 30/30, 99/100, 200/200 on the
 50-, 100- and 200-var rows checked). Reporting "no solution" is the expected
 answer for `m > n`; the decode is what the search gets.
+
+### Gob-recult
+
+`--init gob-recult` (“recultivation”) augments each filtered clause equation
+`L_i(x) = Σ(±x_v) = 1` with tail variables `Y_0..Y_{n-1}` on the right-hand
+side:
+
+`L_i(x) = 1 + Y_i + (-1)^(i+k) * Y_{(i+k) mod n} + Y_{(i + h) mod n}`,
+
+where `n` is the number of filtered equations, `k` is chosen once per init from
+the solver RNG and rounded to an even value, and `h = k/2` (indices modulo `n`).
+`x` and `Y` (all init 0) are solved together by cyclic Kaczmarz projections
+(`GOB_SWEEPS` passes) plus, each sweep, a coupling projection enforcing
+`Σ_i Y_i = 0`. Only `x` is kept: decoded by sign and repaired by `gob_repair`,
+like `gob-sign`.
+
+### Vice versa (`reverse-*`)
+
+`--init reverse-rarest|reverse-glowest|reverse-min-overlapping` builds the
+reversed CNF by negating every literal in every clause, runs the named
+constructive start on that system, and maps the result back by negating the
+assignment (`x = !x'`). The same bases are available as Likho pre-cooks.
+
+### Terminator
+
+`--init terminator` starts from majority and runs up to `--terminator-rounds`
+(default 16) full-variable improvement passes. In each pass, in the chosen
+`--terminator-order` (`forward`, `reverse`, or `random` — a fresh RNG
+permutation each round), a variable is flipped if `make_count > break_count`
+(strictly improving, counts re-evaluated per var). It stops early on a no-flip
+pass or when solved. As an init it runs at restart 0, after which normal search
+continues; gains typically saturate in a few rounds.
 
 ### Likho
 
@@ -496,7 +540,8 @@ reporting tool, not a faster solver. The plain solver stays the default.
 - `make_count` equals `rogue_occurrences` (a rogue clause has no true literal),
   so both come from the same pass.
 - Extra options: `--strategy`, `--progress`, `--mode`, `--max-groups`, `--merge`, `--diversify`,
-  `--group-len` (also accepted as `-group-len`), `--init`.
+  `--group-len` (also accepted as `-group-len`), `--init`, `--terminator-rounds`,
+  `--terminator-order`, `-deep-dive`, `-pre-cook`.
 
 ## Layout
 
@@ -514,4 +559,7 @@ tools/probe.c                gob-sign projection diagnostics (make probe)
 tools/permute_clauses.py     shuffle clause order of a DIMACS file
 tools/projection_counts.py   equations/ranks and decoded-sign comparison
 tools/exact_gob.py           exact rational projection (Kaczmarz-free) diagnostics
+tools/run_satlib.py          run 3sat over a CNF corpus and summarize by subdir
+tools/cmp_aim17_hard.py      compare inits (and optional DPLL) on the 17 hard AIM-yes cases
+tools/dpll_solve.c           naive DPLL (UP + backtracking) reference solver, DIMACS in/out
 ```

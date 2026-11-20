@@ -900,6 +900,63 @@ bool solver_init_gob_square(Solver *s, GobSquareCheck *check) {
     return true;
 }
 
+
+bool solver_init_gob_recult(Solver *s) {
+    Cnf filtered = {0};
+    if (!no_twins(s->cnf, &filtered)) return false;
+    size_t nv = s->cnf->n_vars, nc = filtered.n_clauses;
+    size_t nx = nv ? nv : 1, ny = nc ? nc : 1;
+    double *x = calloc(nx, sizeof *x);
+    double *y = calloc(ny, sizeof *y);
+    bool *a = malloc(nx * sizeof *a);
+    if (!x || !y || !a) { free(x); free(y); free(a); cnf_free(&filtered); return false; }
+
+    size_t k = 2;
+    if (nc > 0) {
+        k = (size_t)(rng_next_u64(&s->rng) % nc);
+        if (k == 0) k = 1 % nc;
+        if (k == 0) k = 1;
+        if (k % 2 == 1) k = (k + 1 <= nc ? k + 1 : k - 1); /* round odd k */
+        if (k == 0) k = 2;
+    }
+    size_t h = k / 2; /* (i + h) mod nc tail index */
+
+    for (size_t sweep = 0; sweep < GOB_SWEEPS; sweep++) {
+        for (size_t ci = 0; ci < nc; ci++) {
+            const Lit *cl = cnf_clause(&filtered, ci);
+            size_t len = cnf_clause_len(&filtered, ci);
+            size_t j1 = nc ? (ci + k) % nc : 0;
+            size_t j2 = nc ? (ci + h) % nc : 0;
+            double s1 = ((ci + k) % 2 == 0) ? 1.0 : -1.0; /* (-1)^(i+k) */
+            double sum = 0;
+            for (size_t t = 0; t < len; t++)
+                sum += cl[t].positive ? x[cl[t].var] : -x[cl[t].var];
+            double rhs = 1.0 + y[ci] + s1 * y[j1] + y[j2];
+            double dot = sum - rhs; /* a·z - b */
+            double anorm = (double)len + 3.0;
+            double step = dot / anorm;
+            if (step == 0.0) continue;
+            for (size_t t = 0; t < len; t++)
+                x[cl[t].var] -= step * (cl[t].positive ? 1.0 : -1.0);
+            y[ci] -= step * (-1.0);
+            y[j1] -= step * (-s1);
+            y[j2] -= step * (-1.0);
+        }
+        if (nc > 0) { /* coupling: sum Y_i = 0 */
+            double sumy = 0;
+            for (size_t i = 0; i < nc; i++) sumy += y[i];
+            double step = sumy / (double)nc;
+            if (step != 0.0)
+                for (size_t i = 0; i < nc; i++) y[i] -= step;
+        }
+    }
+    gob_decode_sign(x, a, nv);
+    solver_set_assignment(s, a);
+    gob_repair(s);
+    free(x); free(y); free(a); cnf_free(&filtered);
+    return true;
+}
+
 /* ---- Likho: zero start + switch-domain repair pass --------------------- */
 
 /* A switch domain of a prime is the set of unflipped variables that must flip
@@ -1048,6 +1105,7 @@ bool solver_likho(Solver *s, const SolverConfig *cfg) {
     else if (pre == INIT_GOB) { if (!solver_init_gob(s)) return false; }
     else if (pre == INIT_GOB_SIGN) { if (!solver_init_gob_sign(s)) return false; }
     else if (pre == INIT_GOB_SQUARE) { if (!solver_init_gob_square(s, NULL)) return false; }
+    else if (pre == INIT_GOB_RECULT) { if (!solver_init_gob_recult(s)) return false; }
     else if (pre == INIT_REVERSE_RAREST) { if (!solver_init_reverse(s, INIT_RAREST)) return false; }
     else if (pre == INIT_REVERSE_GLOWEST) { if (!solver_init_reverse(s, INIT_GLOWEST)) return false; }
     else if (pre == INIT_REVERSE_MIN_OVERLAP) { if (!solver_init_reverse(s, INIT_MIN_OVERLAP)) return false; }
@@ -1160,6 +1218,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_gob_sign(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GOB_SQUARE) {
             if (!solver_init_gob_square(s, NULL)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_GOB_RECULT) {
+            if (!solver_init_gob_recult(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_REVERSE_RAREST) {
             if (!solver_init_reverse(s, INIT_RAREST)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_REVERSE_GLOWEST) {

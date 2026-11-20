@@ -108,6 +108,7 @@ typedef enum {
     INIT_GOB,       /* linear relaxation of the clause system, see solver_init_gob() */
     INIT_GOB_SIGN,  /* the same system decoded by sign, see solver_init_gob_sign() */
     INIT_GOB_SQUARE, /* square subsystem of that system, see solver_init_gob_square() */
+    INIT_GOB_RECULT, /* gob with tail-variable recultivation, see solver_init_gob_recult() */
     INIT_REVERSE_RAREST, /* negate CNF, run rarest, negate result */
     INIT_REVERSE_GLOWEST, /* negate CNF, run glowest, negate result */
     INIT_REVERSE_MIN_OVERLAP, /* negate CNF, run min-overlapping, negate result */
@@ -130,7 +131,7 @@ typedef struct {
     size_t likho_domain_max;    /* Likho: variables per switch domain, prime included */
     size_t likho_search_nodes;  /* Likho: backtracking budget per prime */
     bool likho_domains_first;   /* Likho: fire switch domains before neutral repairs */
-    InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY, INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP, INIT_GOB or INIT_GOB_SQUARE */
+    InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY, INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP, INIT_GOB, INIT_GOB_SIGN, INIT_GOB_SQUARE or INIT_GOB_RECULT */
     size_t terminator_rounds;   /* Terminator: max improvement passes (each flip makes > breaks) */
     TerminatorOrder terminator_order; /* Terminator: variable visit order per round */
     ProgressFn on_progress;
@@ -217,6 +218,9 @@ typedef struct {
  * be dependent and the values are fractional, so this is a seed, not a solve.
  * `check` may be NULL. Deterministic, no RNG. false only on allocation failure. */
 bool solver_init_gob_square(Solver *s, GobSquareCheck *check);
+/* Gob recultivation: augment clause equations with tail variables Y on the
+ * right, solve by Kaczmarz (random k), decode x by sign and repair (drop Y). */
+bool solver_init_gob_recult(Solver *s);
 /* Vice versa: negate every clause, run init on the reversed system, negate the
  * assignment back. Supported inits: INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP. */
 bool solver_init_reverse(Solver *s, InitMode init);
