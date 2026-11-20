@@ -206,7 +206,11 @@ ResultGroup group_solve(const Cnf *cnf, const SolverConfig *cfg, const GroupConf
     else if (cfg->init == INIT_GOB) { if (!solver_init_gob(full)) NOMEM(); }
     else if (cfg->init == INIT_GOB_SIGN) { if (!solver_init_gob_sign(full)) NOMEM(); }
     else if (cfg->init == INIT_GOB_SQUARE) { if (!solver_init_gob_square(full, NULL)) NOMEM(); }
+    else if (cfg->init == INIT_REVERSE_RAREST) { if (!solver_init_reverse(full, INIT_RAREST)) NOMEM(); }
+    else if (cfg->init == INIT_REVERSE_GLOWEST) { if (!solver_init_reverse(full, INIT_GLOWEST)) NOMEM(); }
+    else if (cfg->init == INIT_REVERSE_MIN_OVERLAP) { if (!solver_init_reverse(full, INIT_MIN_OVERLAP)) NOMEM(); }
     else if (cfg->init == INIT_LIKHO) { if (!solver_likho(full, cfg)) NOMEM(); }
+    else if (cfg->init == INIT_TERMINATOR) solver_init_terminator(full, cfg->terminator_rounds);
     else solver_init_majority(full);
     bool converged = false;
     size_t repeats = 0;

@@ -103,8 +103,12 @@ static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "gob") == 0) cli->cfg.init = INIT_GOB;
     else if (strcmp(value, "gob-sign") == 0) cli->cfg.init = INIT_GOB_SIGN;
     else if (strcmp(value, "gob-square") == 0) cli->cfg.init = INIT_GOB_SQUARE;
+    else if (strcmp(value, "reverse-rarest") == 0) cli->cfg.init = INIT_REVERSE_RAREST;
+    else if (strcmp(value, "reverse-glowest") == 0) cli->cfg.init = INIT_REVERSE_GLOWEST;
+    else if (strcmp(value, "reverse-min-overlapping") == 0) cli->cfg.init = INIT_REVERSE_MIN_OVERLAP;
     else if (strcmp(value, "likho") == 0) cli->cfg.init = INIT_LIKHO;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|likho)", flag, value);
+    else if (strcmp(value, "terminator") == 0) cli->cfg.init = INIT_TERMINATOR;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator)", flag, value);
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
@@ -116,12 +120,18 @@ static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "gob") == 0) cli->cfg.likho_pre_cook = INIT_GOB;
     else if (strcmp(value, "gob-sign") == 0) cli->cfg.likho_pre_cook = INIT_GOB_SIGN;
     else if (strcmp(value, "gob-square") == 0) cli->cfg.likho_pre_cook = INIT_GOB_SQUARE;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square)", flag, value);
+    else if (strcmp(value, "reverse-rarest") == 0) cli->cfg.likho_pre_cook = INIT_REVERSE_RAREST;
+    else if (strcmp(value, "reverse-glowest") == 0) cli->cfg.likho_pre_cook = INIT_REVERSE_GLOWEST;
+    else if (strcmp(value, "reverse-min-overlapping") == 0) cli->cfg.likho_pre_cook = INIT_REVERSE_MIN_OVERLAP;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|reverse-rarest|reverse-glowest|reverse-min-overlapping)", flag, value);
     cli->cfg.init = INIT_LIKHO;   /* pre-cook is a Likho mode */
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_group_len(Cli *cli, const char *flag, const char *value) {
     return parse_size(flag, value, &cli->gcfg.group_len);
+}
+static ResultUnit opt_terminator_rounds(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->cfg.terminator_rounds);
 }
 /* -deep-dive VARS NODES: cap switch domains, and fire them before neutrals. */
 static ResultUnit opt_deep_dive(Cli *cli, const char *flag, const char *vars, const char *nodes) {
@@ -160,7 +170,7 @@ static const OptSpec OPTS[] = {
     { "--merge", opt_merge },     { "--diversify", opt_diversify },
     { "--group-len", opt_group_len }, { "-group-len", opt_group_len },
     { "--init", opt_init },           { "-pre-cook", opt_pre_cook },
-    { "--pre-cook", opt_pre_cook },
+    { "--pre-cook", opt_pre_cook },   { "--terminator-rounds", opt_terminator_rounds },
 };
 
 static void usage(void) {
@@ -169,9 +179,10 @@ static void usage(void) {
         "                      [--strategy ranked|greedy|random] [--progress N] [--out FILE]\n"
         "                      [--mode plain|groups] [--max-groups 1..1024] [--merge free|directed]\n"
         "                      [--diversify N] [--group-len N]\n"
-        "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|likho]\n"
+        "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator]\n"
+        "                      [--terminator-rounds N]\n"
         "                      [-deep-dive VARS NODES]\n"
-        "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square]\n");
+        "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|reverse-rarest|reverse-glowest|reverse-min-overlapping]\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {

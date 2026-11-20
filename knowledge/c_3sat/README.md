@@ -191,6 +191,31 @@ fails in 4/8. Crossing the two choices shows they are independent coin flips:
 Every instance above is satisfiable, so these misses are start/order artifacts,
 not instance hardness.
 
+Replacing Kaczmarz with exact rational arithmetic does not stabilize the signs.
+`tools/exact_gob.py` solves `A x = 1` by Gauss-Jordan over `Q`, computes the unique
+exact least-squares point `(A^T A)^-1 A^T 1`, and solves an exact full-rank
+`n`-of-`m` subsystem for each row order. On AIM 100-3_4 and 100-6_0:
+
+- the full system is **inconsistent** exactly (rank 100 vs augmented 101), so
+  there is no symbolic solution to decode;
+- the exact LS point is order-free, yet its sign agrees with a found SAT
+  assignment only 48–51/100 times, with `|x|` median 0.08–0.17 — the magnitudes
+  are compressed near zero;
+- the exact square subsystem drifts 39–53/100 signs across row orders, and
+  Kaczmarz drifts 43–58/100. Kaczmarz's signs differ from the exact LS point by
+  38–58/100.
+
+So the drift is not arithmetic error: exact arithmetic with a different set of
+equations drifts just as much. Inconsistency leaves no canonical vector whose
+sign could be stable.
+
+Control (`--consistent`): with `b = A t` for a known SAT assignment `t ∈ {±1}`,
+the system is consistent and has the unique solution `t` (`rank(A) = n`), so
+**every** full-rank square subsystem must return `t`. It does: 100/100 sign
+agreement, all `|x| = 1`, and **0** sign drift across the same row orders for
+both Kaczmarz and the exact square solves. The drift is the inconsistency of
+`b = 1`, not the arithmetic.
+
 Reproduce (the generator mirrors `bench_rarest.c` exactly, including its parsed
 clause-count drift):
 
@@ -207,6 +232,11 @@ build/probe start /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4_p0.txt
 python3 tools/projection_counts.py --signs /tmp/gobdiag/b4.txt /tmp/gobdiag/b4_p0.txt
 build/probe xstart /tmp/gobdiag/b4_p0.cnf /tmp/gobdiag/b4.cnf 200000 9   # start only
 build/probe xstart /tmp/gobdiag/b4.cnf /tmp/gobdiag/b4_p0.cnf 200000 9   # order only
+
+# exact/symbolic projection on a small AIM instance (needs a known SAT assignment)
+build/3sat <aim-100-3_4-yes1-1.cnf> --init glowest --steps 200000 --restarts 20 --out /tmp/gobdiag/truth.json
+python3 tools/exact_gob.py <aim-100-3_4-yes1-1.cnf> /tmp/gobdiag/truth.json
+python3 tools/exact_gob.py --consistent <aim-100-3_4-yes1-1.cnf> /tmp/gobdiag/truth.json
 ```
 
 ### Gob-square
@@ -483,4 +513,5 @@ tools/bench_rarest.c         init + search benchmark (make bench-rarest)
 tools/probe.c                gob-sign projection diagnostics (make probe)
 tools/permute_clauses.py     shuffle clause order of a DIMACS file
 tools/projection_counts.py   equations/ranks and decoded-sign comparison
+tools/exact_gob.py           exact rational projection (Kaczmarz-free) diagnostics
 ```

@@ -180,6 +180,23 @@ bool no_twins(const Cnf *src, Cnf *out) {
     return true;
 }
 
+bool cnf_negate(const Cnf *src, Cnf *out) {
+    if (!src || !out || !src->off) return false;
+    *out = (Cnf){0};
+    size_t max_lits = src->off[src->n_clauses];
+    out->off = malloc((src->n_clauses + 1) * sizeof *out->off);
+    out->lits = malloc((max_lits ? max_lits : 1) * sizeof *out->lits);
+    if (!out->off || !out->lits) { cnf_free(out); return false; }
+    out->n_vars = src->n_vars;
+    out->n_clauses = src->n_clauses;
+    memcpy(out->off, src->off, (src->n_clauses + 1) * sizeof *out->off);
+    for (size_t i = 0; i < max_lits; i++) {
+        out->lits[i].var = src->lits[i].var;
+        out->lits[i].positive = !src->lits[i].positive;
+    }
+    return true;
+}
+
 ResultCnf cnf_from_dimacs_str(const char *input) {
     Error err = {0};
     int64_t *tok = NULL; size_t ntok = 0, captok = 0;
@@ -368,6 +385,7 @@ SolverConfig solver_config_default(void) {
         .seed = 0x9e3779b97f4a7c15ULL, .pick = pick_ranked,
         .likho_domain_max = LIKHO_DOMAIN_MAX, .likho_search_nodes = LIKHO_SEARCH_NODES,
         .likho_domains_first = false, .likho_pre_cook = INIT_ZERO,
+        .terminator_rounds = 16,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -736,6 +754,32 @@ bool solver_init_rarest(Solver *s) { return init_order(s, ORDER_RAREST); }
 bool solver_init_glowest(Solver *s) { return init_order(s, ORDER_GLOWEST); }
 bool solver_init_min_overlap(Solver *s) { return init_order(s, ORDER_MIN_OVERLAP); }
 
+bool solver_init_reverse(Solver *s, InitMode init) {
+    Cnf neg = {0};
+    if (!cnf_negate(s->cnf, &neg)) return false;
+    ResultSolver rs = solver_new(&neg, 0x9e3779b97f4a7c15ULL);
+    if (!rs.ok) { cnf_free(&neg); return false; }
+    Solver *t = rs.val;
+    bool ok = false;
+    if (init == INIT_RAREST) ok = solver_init_rarest(t);
+    else if (init == INIT_GLOWEST) ok = solver_init_glowest(t);
+    else if (init == INIT_MIN_OVERLAP) ok = solver_init_min_overlap(t);
+    else { solver_free(t); cnf_free(&neg); return false; }
+    if (ok) {
+        size_t nv = s->cnf->n_vars;
+        bool *a = malloc((nv ? nv : 1) * sizeof *a);
+        if (!a) ok = false;
+        else {
+            for (size_t i = 0; i < nv; i++) a[i] = !t->assignment[i];
+            solver_set_assignment(s, a);
+            free(a);
+        }
+    }
+    solver_free(t);
+    cnf_free(&neg);
+    return ok;
+}
+
 /* ---- Gob: linear relaxation of the clause system (full or square) ------ */
 
 /* Every clause becomes the signed equation sum(+-x) = 1: a positive literal is
@@ -1004,6 +1048,9 @@ bool solver_likho(Solver *s, const SolverConfig *cfg) {
     else if (pre == INIT_GOB) { if (!solver_init_gob(s)) return false; }
     else if (pre == INIT_GOB_SIGN) { if (!solver_init_gob_sign(s)) return false; }
     else if (pre == INIT_GOB_SQUARE) { if (!solver_init_gob_square(s, NULL)) return false; }
+    else if (pre == INIT_REVERSE_RAREST) { if (!solver_init_reverse(s, INIT_RAREST)) return false; }
+    else if (pre == INIT_REVERSE_GLOWEST) { if (!solver_init_reverse(s, INIT_GLOWEST)) return false; }
+    else if (pre == INIT_REVERSE_MIN_OVERLAP) { if (!solver_init_reverse(s, INIT_MIN_OVERLAP)) return false; }
     else {
         memset(s->assignment, 0, nv * sizeof *s->assignment);
         rebuild_counts(s);
@@ -1113,6 +1160,14 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_gob_sign(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GOB_SQUARE) {
             if (!solver_init_gob_square(s, NULL)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_REVERSE_RAREST) {
+            if (!solver_init_reverse(s, INIT_RAREST)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_REVERSE_GLOWEST) {
+            if (!solver_init_reverse(s, INIT_GLOWEST)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_REVERSE_MIN_OVERLAP) {
+            if (!solver_init_reverse(s, INIT_MIN_OVERLAP)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_TERMINATOR) {
+            solver_init_terminator(s, cfg->terminator_rounds);
         } else if (restart == 0 && cfg->init == INIT_LIKHO) {
             if (!solver_likho(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else {
@@ -1152,6 +1207,24 @@ size_t solver_clause_support(const Solver *s, size_t c) { return s->sat[c]; }
 const VarStats *solver_var_stats(Solver *s) {
     if (s->stats_dirty) refresh_all(s);
     return s->stats;
+}
+
+void solver_terminator(Solver *s, size_t rounds) {
+    size_t nv = s->cnf->n_vars;
+    for (size_t r = 0; r < rounds && s->n_rogue > 0; r++) {
+        size_t flips = 0;
+        for (size_t i = 0; i < nv; i++) {
+            refresh_var(s, i);
+            const VarStats *st = &s->stats[i];
+            if (st->make_count > st->break_count) { solver_flip(s, i); flips++; }
+        }
+        if (flips == 0) break;
+    }
+}
+
+void solver_init_terminator(Solver *s, size_t rounds) {
+    solver_init_majority(s);
+    solver_terminator(s, rounds);
 }
 
 void solver_init_majority(Solver *s) { random_assignment(s, true); }

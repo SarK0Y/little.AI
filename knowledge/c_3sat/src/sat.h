@@ -34,6 +34,8 @@ void cnf_free(Cnf *cnf);
 /* Build a clause-system copy with synchronous and asynchronous twin clauses removed.
  * Clause literal order is ignored; async twins invert every literal. Keeps the first. */
 bool no_twins(const Cnf *src, Cnf *out);
+/* Copy src with every literal negated (the "vice versa" reversed system). */
+bool cnf_negate(const Cnf *src, Cnf *out);
 bool cnf_is_3sat(const Cnf *cnf);
 static inline size_t cnf_clause_len(const Cnf *c, size_t i) { return c->off[i + 1] - c->off[i]; }
 static inline const Lit *cnf_clause(const Cnf *c, size_t i) { return c->lits + c->off[i]; }
@@ -106,7 +108,11 @@ typedef enum {
     INIT_GOB,       /* linear relaxation of the clause system, see solver_init_gob() */
     INIT_GOB_SIGN,  /* the same system decoded by sign, see solver_init_gob_sign() */
     INIT_GOB_SQUARE, /* square subsystem of that system, see solver_init_gob_square() */
+    INIT_REVERSE_RAREST, /* negate CNF, run rarest, negate result */
+    INIT_REVERSE_GLOWEST, /* negate CNF, run glowest, negate result */
+    INIT_REVERSE_MIN_OVERLAP, /* negate CNF, run min-overlapping, negate result */
     INIT_LIKHO,     /* pre-cooked start (all false by default), then a one-flip-per-variable repair pass */
+    INIT_TERMINATOR, /* majority start, then rounds of flips where make > break */
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
 
@@ -122,6 +128,7 @@ typedef struct {
     size_t likho_search_nodes;  /* Likho: backtracking budget per prime */
     bool likho_domains_first;   /* Likho: fire switch domains before neutral repairs */
     InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY, INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP, INIT_GOB or INIT_GOB_SQUARE */
+    size_t terminator_rounds;   /* Terminator: max improvement passes (each flip makes > breaks) */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -206,6 +213,14 @@ typedef struct {
  * be dependent and the values are fractional, so this is a seed, not a solve.
  * `check` may be NULL. Deterministic, no RNG. false only on allocation failure. */
 bool solver_init_gob_square(Solver *s, GobSquareCheck *check);
+/* Vice versa: negate every clause, run init on the reversed system, negate the
+ * assignment back. Supported inits: INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP. */
+bool solver_init_reverse(Solver *s, InitMode init);
+/* Terminator: run up to `rounds` passes; in each pass flip every variable whose
+ * make_count > break_count (strictly improving). Starts from current assignment. */
+void solver_terminator(Solver *s, size_t rounds);
+/* Majority start followed by Terminator rounds. */
+void solver_init_terminator(Solver *s, size_t rounds);
 void solver_init_majority(Solver *s);                  /* majority-polarity start (ties use the solver RNG) */
 /* Likho: phase 1 is cfg->likho_pre_cook (all-false by default), then a repair
  * pass that flips an unflipped neutral variable in a rogue clause (always
