@@ -385,7 +385,7 @@ SolverConfig solver_config_default(void) {
         .seed = 0x9e3779b97f4a7c15ULL, .pick = pick_ranked,
         .likho_domain_max = LIKHO_DOMAIN_MAX, .likho_search_nodes = LIKHO_SEARCH_NODES,
         .likho_domains_first = false, .likho_pre_cook = INIT_ZERO,
-        .terminator_rounds = 16,
+        .terminator_rounds = 16, .terminator_order = TERM_FORWARD,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -1167,7 +1167,7 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
         } else if (restart == 0 && cfg->init == INIT_REVERSE_MIN_OVERLAP) {
             if (!solver_init_reverse(s, INIT_MIN_OVERLAP)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_TERMINATOR) {
-            solver_init_terminator(s, cfg->terminator_rounds);
+            solver_init_terminator(s, cfg->terminator_rounds, cfg->terminator_order);
         } else if (restart == 0 && cfg->init == INIT_LIKHO) {
             if (!solver_likho(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else {
@@ -1209,22 +1209,37 @@ const VarStats *solver_var_stats(Solver *s) {
     return s->stats;
 }
 
-void solver_terminator(Solver *s, size_t rounds) {
+void solver_terminator(Solver *s, size_t rounds, TerminatorOrder order) {
     size_t nv = s->cnf->n_vars;
+    size_t *perm = NULL;
+    if (order == TERM_RANDOM && nv > 0) {
+        perm = malloc(nv * sizeof *perm);
+        if (perm) for (size_t i = 0; i < nv; i++) perm[i] = i;
+        else order = TERM_FORWARD;   /* shortcut: alloc failure falls back to forward */
+    }
     for (size_t r = 0; r < rounds && s->n_rogue > 0; r++) {
+        if (order == TERM_RANDOM) {
+            for (size_t i = nv; i > 1; i--) {
+                size_t j = rng_index(&s->rng, i);
+                size_t t = perm[i - 1]; perm[i - 1] = perm[j]; perm[j] = t;
+            }
+        }
         size_t flips = 0;
-        for (size_t i = 0; i < nv; i++) {
+        for (size_t k = 0; k < nv; k++) {
+            size_t i = (order == TERM_REVERSE) ? (nv - 1 - k)
+                     : (order == TERM_RANDOM) ? perm[k] : k;
             refresh_var(s, i);
             const VarStats *st = &s->stats[i];
             if (st->make_count > st->break_count) { solver_flip(s, i); flips++; }
         }
         if (flips == 0) break;
     }
+    free(perm);
 }
 
-void solver_init_terminator(Solver *s, size_t rounds) {
+void solver_init_terminator(Solver *s, size_t rounds, TerminatorOrder order) {
     solver_init_majority(s);
-    solver_terminator(s, rounds);
+    solver_terminator(s, rounds, order);
 }
 
 void solver_init_majority(Solver *s) { random_assignment(s, true); }

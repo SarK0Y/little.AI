@@ -116,6 +116,9 @@ typedef enum {
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
 
+/* Variable visit order for Terminator rounds. */
+typedef enum { TERM_FORWARD, TERM_REVERSE, TERM_RANDOM } TerminatorOrder;
+
 typedef struct {
     size_t max_steps;
     size_t restarts;
@@ -129,6 +132,7 @@ typedef struct {
     bool likho_domains_first;   /* Likho: fire switch domains before neutral repairs */
     InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY, INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP, INIT_GOB or INIT_GOB_SQUARE */
     size_t terminator_rounds;   /* Terminator: max improvement passes (each flip makes > breaks) */
+    TerminatorOrder terminator_order; /* Terminator: variable visit order per round */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -216,11 +220,11 @@ bool solver_init_gob_square(Solver *s, GobSquareCheck *check);
 /* Vice versa: negate every clause, run init on the reversed system, negate the
  * assignment back. Supported inits: INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP. */
 bool solver_init_reverse(Solver *s, InitMode init);
-/* Terminator: run up to `rounds` passes; in each pass flip every variable whose
- * make_count > break_count (strictly improving). Starts from current assignment. */
-void solver_terminator(Solver *s, size_t rounds);
+/* Terminator: run up to `rounds` passes; in each pass visit variables in
+ * `order` and flip when make_count > break_count (strictly improving). */
+void solver_terminator(Solver *s, size_t rounds, TerminatorOrder order);
 /* Majority start followed by Terminator rounds. */
-void solver_init_terminator(Solver *s, size_t rounds);
+void solver_init_terminator(Solver *s, size_t rounds, TerminatorOrder order);
 void solver_init_majority(Solver *s);                  /* majority-polarity start (ties use the solver RNG) */
 /* Likho: phase 1 is cfg->likho_pre_cook (all-false by default), then a repair
  * pass that flips an unflipped neutral variable in a rogue clause (always

@@ -143,12 +143,13 @@ int main(int argc, char **argv) {
     cfg.max_steps = steps;
     cfg.restarts = restarts;
 
-    Row rows[11] = {
+    Row rows[14] = {
         { .name = "majority" }, { .name = "rarest-old" },
         { .name = "rarest-new" }, { .name = "glowest" },
         { .name = "min-overlap" }, { .name = "gob" }, { .name = "gob-sign" },
         { .name = "likho" }, { .name = "likho-dd" }, { .name = "likho-pc" },
-        { .name = "gob-square" },
+        { .name = "gob-square" }, { .name = "term-fwd" },
+        { .name = "term-rev" }, { .name = "term-rand" },
     };
     for (size_t sd = 1; sd <= seeds; sd++) {
         Gen g = { 0 };
@@ -166,7 +167,7 @@ int main(int argc, char **argv) {
         Cnf cnf = rc.val;
         nv = cnf.n_vars; nc = cnf.n_clauses;
 
-        for (int i = 0; i < 11; i++) {
+        for (int i = 0; i < 14; i++) {
             ResultSolver rs = solver_new(&cnf, cfg.seed);
             if (!rs.ok) { fprintf(stderr, "solver: %s\n", rs.err.msg); return 1; }
             Solver *s = rs.val;
@@ -211,6 +212,12 @@ int main(int argc, char **argv) {
                 rows[i].sq_sel_bad += chk.selected_bad;
                 rows[i].sq_rest_bad += chk.other_bad;
                 rows[i].sq_rest_total += chk.other_total;
+            } else if (i == 11) {
+                solver_init_terminator(s, cfg.terminator_rounds, TERM_FORWARD);
+            } else if (i == 12) {
+                solver_init_terminator(s, cfg.terminator_rounds, TERM_REVERSE);
+            } else if (i == 13) {
+                solver_init_terminator(s, cfg.terminator_rounds, TERM_RANDOM);
             } else {
                 SolverConfig lc = cfg;
                 lc.likho_domains_first = i == 8;   /* likho-dd fires domains first */
@@ -255,7 +262,7 @@ int main(int argc, char **argv) {
     else printf("n=%zu ratio=%.1f clauses=%zu seeds=%zu\n", nv, ratio, nc, seeds);
     printf("budget=%zu steps x %zu attempts\n", steps, restarts + 1);
     printf("%-12s %12s %8s %12s %8s\n", "init", "init_unsat", "solved", "mean_steps", "sec");
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < 14; i++) {
         double init = (double)rows[i].init_unsat / (double)seeds;
         double mean = rows[i].solved ? (double)rows[i].sum_steps / (double)rows[i].solved : 0.0;
         printf("%-12s %12.1f %5zu/%-2zu %12.0f %8.1f\n",

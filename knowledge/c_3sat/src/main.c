@@ -133,6 +133,13 @@ static ResultUnit opt_group_len(Cli *cli, const char *flag, const char *value) {
 static ResultUnit opt_terminator_rounds(Cli *cli, const char *flag, const char *value) {
     return parse_size(flag, value, &cli->cfg.terminator_rounds);
 }
+static ResultUnit opt_terminator_order(Cli *cli, const char *flag, const char *value) {
+    if (strcmp(value, "forward") == 0) cli->cfg.terminator_order = TERM_FORWARD;
+    else if (strcmp(value, "reverse") == 0) cli->cfg.terminator_order = TERM_REVERSE;
+    else if (strcmp(value, "random") == 0) cli->cfg.terminator_order = TERM_RANDOM;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected forward|reverse|random)", flag, value);
+    return OK_UNIT(ResultUnit);
+}
 /* -deep-dive VARS NODES: cap switch domains, and fire them before neutrals. */
 static ResultUnit opt_deep_dive(Cli *cli, const char *flag, const char *vars, const char *nodes) {
     TRY0(ResultUnit, parse_size(flag, vars, &cli->cfg.likho_domain_max));
@@ -171,6 +178,7 @@ static const OptSpec OPTS[] = {
     { "--group-len", opt_group_len }, { "-group-len", opt_group_len },
     { "--init", opt_init },           { "-pre-cook", opt_pre_cook },
     { "--pre-cook", opt_pre_cook },   { "--terminator-rounds", opt_terminator_rounds },
+    { "--terminator-order", opt_terminator_order },
 };
 
 static void usage(void) {
@@ -180,7 +188,7 @@ static void usage(void) {
         "                      [--mode plain|groups] [--max-groups 1..1024] [--merge free|directed]\n"
         "                      [--diversify N] [--group-len N]\n"
         "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator]\n"
-        "                      [--terminator-rounds N]\n"
+        "                      [--terminator-rounds N] [--terminator-order forward|reverse|random]\n"
         "                      [-deep-dive VARS NODES]\n"
         "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|reverse-rarest|reverse-glowest|reverse-min-overlapping]\n");
 }
