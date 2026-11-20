@@ -386,6 +386,7 @@ SolverConfig solver_config_default(void) {
         .likho_domain_max = LIKHO_DOMAIN_MAX, .likho_search_nodes = LIKHO_SEARCH_NODES,
         .likho_domains_first = false, .likho_pre_cook = INIT_ZERO,
         .terminator_rounds = 16, .terminator_order = TERM_FORWARD,
+        .gob_recult_play = 0, .gob_recult_set = 0.0, .gob_recult_has_set = false,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -901,7 +902,7 @@ bool solver_init_gob_square(Solver *s, GobSquareCheck *check) {
 }
 
 
-bool solver_init_gob_recult(Solver *s) {
+bool solver_init_gob_recult(Solver *s, const SolverConfig *cfg) {
     Cnf filtered = {0};
     if (!no_twins(s->cnf, &filtered)) return false;
     size_t nv = s->cnf->n_vars, nc = filtered.n_clauses;
@@ -910,6 +911,13 @@ bool solver_init_gob_recult(Solver *s) {
     double *y = calloc(ny, sizeof *y);
     bool *a = malloc(nx * sizeof *a);
     if (!x || !y || !a) { free(x); free(y); free(a); cnf_free(&filtered); return false; }
+
+    double baseline = 0.0; /* target sum of tail variables Y_i */
+    if (cfg) {
+        if (cfg->gob_recult_has_set) baseline = cfg->gob_recult_set;
+        else if (cfg->gob_recult_play > 0)
+            baseline = (double)(rng_next_u64(&s->rng) % cfg->gob_recult_play);
+    }
 
     size_t k = 2;
     if (nc > 0) {
@@ -942,10 +950,10 @@ bool solver_init_gob_recult(Solver *s) {
             y[j1] -= step * (-s1);
             y[j2] -= step * (-1.0);
         }
-        if (nc > 0) { /* coupling: sum Y_i = 0 */
+        if (nc > 0) { /* coupling: sum Y_i = baseline */
             double sumy = 0;
             for (size_t i = 0; i < nc; i++) sumy += y[i];
-            double step = sumy / (double)nc;
+            double step = (sumy - baseline) / (double)nc;
             if (step != 0.0)
                 for (size_t i = 0; i < nc; i++) y[i] -= step;
         }
@@ -1105,7 +1113,7 @@ bool solver_likho(Solver *s, const SolverConfig *cfg) {
     else if (pre == INIT_GOB) { if (!solver_init_gob(s)) return false; }
     else if (pre == INIT_GOB_SIGN) { if (!solver_init_gob_sign(s)) return false; }
     else if (pre == INIT_GOB_SQUARE) { if (!solver_init_gob_square(s, NULL)) return false; }
-    else if (pre == INIT_GOB_RECULT) { if (!solver_init_gob_recult(s)) return false; }
+    else if (pre == INIT_GOB_RECULT) { if (!solver_init_gob_recult(s, cfg)) return false; }
     else if (pre == INIT_REVERSE_RAREST) { if (!solver_init_reverse(s, INIT_RAREST)) return false; }
     else if (pre == INIT_REVERSE_GLOWEST) { if (!solver_init_reverse(s, INIT_GLOWEST)) return false; }
     else if (pre == INIT_REVERSE_MIN_OVERLAP) { if (!solver_init_reverse(s, INIT_MIN_OVERLAP)) return false; }
@@ -1219,7 +1227,7 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
         } else if (restart == 0 && cfg->init == INIT_GOB_SQUARE) {
             if (!solver_init_gob_square(s, NULL)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GOB_RECULT) {
-            if (!solver_init_gob_recult(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+            if (!solver_init_gob_recult(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_REVERSE_RAREST) {
             if (!solver_init_reverse(s, INIT_RAREST)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_REVERSE_GLOWEST) {

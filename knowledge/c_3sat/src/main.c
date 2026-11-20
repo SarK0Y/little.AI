@@ -159,6 +159,24 @@ static ResultUnit opt_diversify(Cli *cli, const char *flag, const char *value) {
     return parse_size(flag, value, &cli->gcfg.diversify);
 }
 
+static ResultUnit opt_play_baseline(Cli *cli, const char *flag, const char *value) {
+    size_t v;
+    TRY0(ResultUnit, parse_size(flag, value, &v));
+    if (v < 1) return ERRF(ResultUnit, ERR_USAGE, "%s must be >= 1", flag);
+    cli->cfg.gob_recult_play = v;
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_set_baseline(Cli *cli, const char *flag, const char *value) {
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(value, &end);
+    if (!*value || errno || *end)
+        return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s`", flag, value);
+    cli->cfg.gob_recult_set = v;
+    cli->cfg.gob_recult_has_set = true;
+    return OK_UNIT(ResultUnit);
+}
+
 static void print_progress(void *ctx, size_t steps, size_t unsat) {
     (void)ctx;
     fprintf(stderr, "[%zu steps] %zu unsatisfied\n", steps, unsat);
@@ -181,6 +199,8 @@ static const OptSpec OPTS[] = {
     { "--init", opt_init },           { "-pre-cook", opt_pre_cook },
     { "--pre-cook", opt_pre_cook },   { "--terminator-rounds", opt_terminator_rounds },
     { "--terminator-order", opt_terminator_order },
+    { "-play-baseline", opt_play_baseline }, { "--play-baseline", opt_play_baseline },
+    { "-set-baseline", opt_set_baseline },   { "--set-baseline", opt_set_baseline },
 };
 
 static void usage(void) {
@@ -192,7 +212,8 @@ static void usage(void) {
         "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator]\n"
         "                      [--terminator-rounds N] [--terminator-order forward|reverse|random]\n"
         "                      [-deep-dive VARS NODES]\n"
-        "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping]\n");
+        "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping]\n"
+        "                      [-play-baseline P] [-set-baseline N]\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {

@@ -134,6 +134,10 @@ typedef struct {
     InitMode likho_pre_cook;    /* Likho phase 1: INIT_ZERO, INIT_MAJORITY, INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP, INIT_GOB, INIT_GOB_SIGN, INIT_GOB_SQUARE or INIT_GOB_RECULT */
     size_t terminator_rounds;   /* Terminator: max improvement passes (each flip makes > breaks) */
     TerminatorOrder terminator_order; /* Terminator: variable visit order per round */
+    /* Gob-recult baseline: sum(Y_i) target. play > 0 => rng mod play; set wins if both given. */
+    size_t gob_recult_play;     /* -play-baseline P: baseline = rng mod P (0 = off) */
+    double gob_recult_set;      /* -set-baseline N: baseline = N */
+    bool gob_recult_has_set;    /* true when -set-baseline was given */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -219,8 +223,9 @@ typedef struct {
  * `check` may be NULL. Deterministic, no RNG. false only on allocation failure. */
 bool solver_init_gob_square(Solver *s, GobSquareCheck *check);
 /* Gob recultivation: augment clause equations with tail variables Y on the
- * right, solve by Kaczmarz (random k), decode x by sign and repair (drop Y). */
-bool solver_init_gob_recult(Solver *s);
+ * right, solve by Kaczmarz (random k), decode x by sign and repair (drop Y).
+ * cfg controls the tail-sum baseline (sum Y_i); NULL => 0. */
+bool solver_init_gob_recult(Solver *s, const SolverConfig *cfg);
 /* Vice versa: negate every clause, run init on the reversed system, negate the
  * assignment back. Supported inits: INIT_RAREST, INIT_GLOWEST, INIT_MIN_OVERLAP. */
 bool solver_init_reverse(Solver *s, InitMode init);
