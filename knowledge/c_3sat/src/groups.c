@@ -212,6 +212,7 @@ ResultGroup group_solve(const Cnf *cnf, const SolverConfig *cfg, const GroupConf
     else if (cfg->init == INIT_REVERSE_MIN_OVERLAP) { if (!solver_init_reverse(full, INIT_MIN_OVERLAP)) NOMEM(); }
     else if (cfg->init == INIT_LIKHO) { if (!solver_likho(full, cfg)) NOMEM(); }
     else if (cfg->init == INIT_TERMINATOR) { if (!solver_init_terminator_pre(full, cfg)) NOMEM(); }
+    else if (cfg->init == INIT_BADDYMOVE) { if (!solver_init_baddymove(full, cfg)) NOMEM(); }
     else if (cfg->init == INIT_NEIGHBORHOOD) { if (!solver_init_neighborhood(full, cfg)) NOMEM(); }
     else if (cfg->init == INIT_NEIGHBORHOOD0) { if (!solver_init_neighborhood0(full, cfg)) NOMEM(); }
     else solver_init_majority(full);

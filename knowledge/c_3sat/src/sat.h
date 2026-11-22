@@ -114,6 +114,7 @@ typedef enum {
     INIT_REVERSE_MIN_OVERLAP, /* negate CNF, run min-overlapping, negate result */
     INIT_LIKHO,     /* pre-cooked start (all false by default), then a one-flip-per-variable repair pass */
     INIT_TERMINATOR, /* majority start, then rounds of flips where make > break */
+    INIT_BADDYMOVE, /* like terminator, but randomly allows bad flips with -allow prob */
     INIT_NEIGHBORHOOD, /* light popularity/backtracking neighborhood search */
     INIT_NEIGHBORHOOD0, /* full neighborhood search per spec */
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
@@ -140,6 +141,7 @@ typedef struct {
     TerminatorOrder terminator_order; /* Terminator: variable visit order per round */
     size_t neighborhood_timeout_ms; /* Neighborhood: backtracking time budget (0 = no limit) */
     NeighborhoodStart neighborhood_start; /* Neighborhood0: where to pick first var from */
+    double baddymove_allow;     /* BaddyMove: probability [0..1] of taking a bad (break>make) flip */
     /* Gob-recult baseline: sum(Y_i) target. play > 0 => rng mod play; set wins if both given. */
     size_t gob_recult_play;     /* -play-baseline P: baseline = rng mod P (0 = off) */
     double gob_recult_set;      /* -set-baseline N: baseline = N */
@@ -242,6 +244,9 @@ void solver_terminator(Solver *s, size_t rounds, TerminatorOrder order);
 void solver_init_terminator(Solver *s, size_t rounds, TerminatorOrder order);
 /* Pre-cook then Terminator rounds (uses cfg->likho_pre_cook/terminator_*). */
 bool solver_init_terminator_pre(Solver *s, const SolverConfig *cfg);
+/* BaddyMove: terminator-like rounds, but bad moves (break>make) allowed with cfg->baddymove_allow. */
+void solver_baddymove(Solver *s, size_t rounds, TerminatorOrder order, double allow);
+bool solver_init_baddymove(Solver *s, const SolverConfig *cfg);
 /* Neighborhood: popularity-ordered var growth with neighborhood completion and
  * timed backtracking. Returns false only on allocation failure. */
 bool solver_init_neighborhood(Solver *s, const SolverConfig *cfg);

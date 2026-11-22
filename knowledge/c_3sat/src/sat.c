@@ -389,6 +389,7 @@ SolverConfig solver_config_default(void) {
         .terminator_rounds = 16, .terminator_order = TERM_FORWARD,
         .neighborhood_timeout_ms = 1000,
         .neighborhood_start = NB_MOST,
+        .baddymove_allow = 0.0,
         .gob_recult_play = 0, .gob_recult_set = 0.0, .gob_recult_has_set = false,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
@@ -1496,7 +1497,6 @@ got_var:
 
     for (size_t i = 0; i < nv; i++) s->assignment[i] = (val[i] < 0) ? false : (val[i] == 1);
     rebuild_counts(s);
-    fprintf(stderr, "neighborhood0: neighborhoods_solved=%zu unsat=%zu nv=%zu nc=%zu\n", nb_solved, s->n_rogue, nv, nc);
     for (size_t i=0;i<sp;i++) free(stack[i].affected.v);
     free(val); free(sat); free(stack); free(ord.ids);
     return true;
@@ -1590,6 +1590,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_reverse(s, INIT_MIN_OVERLAP)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_TERMINATOR) {
             if (!solver_init_terminator_pre(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_BADDYMOVE) {
+            if (!solver_init_baddymove(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_NEIGHBORHOOD) {
             if (!solver_init_neighborhood(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_NEIGHBORHOOD0) {
@@ -1663,6 +1665,39 @@ void solver_terminator(Solver *s, size_t rounds, TerminatorOrder order) {
     free(perm);
 }
 
+void solver_baddymove(Solver *s, size_t rounds, TerminatorOrder order, double allow) {
+    size_t nv = s->cnf->n_vars;
+    size_t *perm = NULL;
+    if (allow < 0.0) allow = 0.0;
+    if (allow > 1.0) allow = 1.0;
+    if (order == TERM_RANDOM && nv > 0) {
+        perm = malloc(nv * sizeof *perm);
+        if (perm) for (size_t i = 0; i < nv; i++) perm[i] = i;
+        else order = TERM_FORWARD;
+    }
+    for (size_t r = 0; r < rounds && s->n_rogue > 0; r++) {
+        if (order == TERM_RANDOM) {
+            for (size_t i = nv; i > 1; i--) {
+                size_t j = rng_index(&s->rng, i);
+                size_t t = perm[i - 1]; perm[i - 1] = perm[j]; perm[j] = t;
+            }
+        }
+        size_t flips = 0;
+        for (size_t k = 0; k < nv; k++) {
+            size_t i = (order == TERM_REVERSE) ? (nv - 1 - k)
+                     : (order == TERM_RANDOM) ? perm[k] : k;
+            refresh_var(s, i);
+            const VarStats *st = &s->stats[i];
+            bool good = st->make_count > st->break_count;
+            bool bad = st->break_count > st->make_count;
+            bool take = good || (bad && allow > 0.0 && rng_f64(&s->rng) < allow);
+            if (take) { solver_flip(s, i); flips++; }
+        }
+        if (flips == 0) break;
+    }
+    free(perm);
+}
+
 static bool solver_apply_pre_cook(Solver *s, const SolverConfig *cfg, InitMode pre) {
     if (pre == INIT_MAJORITY) solver_init_majority(s);
     else if (pre == INIT_RAREST) { if (!solver_init_rarest(s)) return false; }
@@ -1693,6 +1728,14 @@ bool solver_init_terminator_pre(Solver *s, const SolverConfig *cfg) {
     InitMode pre = cfg ? cfg->likho_pre_cook : INIT_MAJORITY;
     if (!solver_apply_pre_cook(s, cfg, pre)) return false;
     solver_terminator(s, cfg ? cfg->terminator_rounds : 16, cfg ? cfg->terminator_order : TERM_FORWARD);
+    return true;
+}
+
+bool solver_init_baddymove(Solver *s, const SolverConfig *cfg) {
+    InitMode pre = cfg ? cfg->likho_pre_cook : INIT_MAJORITY;
+    if (!solver_apply_pre_cook(s, cfg, pre)) return false;
+    solver_baddymove(s, cfg ? cfg->terminator_rounds : 16, cfg ? cfg->terminator_order : TERM_FORWARD,
+                     cfg ? cfg->baddymove_allow : 0.0);
     return true;
 }
 
