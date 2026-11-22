@@ -109,7 +109,9 @@ static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "reverse-min-overlapping") == 0) cli->cfg.init = INIT_REVERSE_MIN_OVERLAP;
     else if (strcmp(value, "likho") == 0) cli->cfg.init = INIT_LIKHO;
     else if (strcmp(value, "terminator") == 0) cli->cfg.init = INIT_TERMINATOR;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator)", flag, value);
+    else if (strcmp(value, "neighborhood") == 0) cli->cfg.init = INIT_NEIGHBORHOOD;
+    else if (strcmp(value, "neighborhood0") == 0) cli->cfg.init = INIT_NEIGHBORHOOD0;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|neighborhood|neighborhood0)", flag, value);
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
@@ -122,11 +124,13 @@ static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "gob-sign") == 0) cli->cfg.likho_pre_cook = INIT_GOB_SIGN;
     else if (strcmp(value, "gob-square") == 0) cli->cfg.likho_pre_cook = INIT_GOB_SQUARE;
     else if (strcmp(value, "gob-recult") == 0) cli->cfg.likho_pre_cook = INIT_GOB_RECULT;
+    else if (strcmp(value, "neighborhood") == 0) cli->cfg.likho_pre_cook = INIT_NEIGHBORHOOD;
+    else if (strcmp(value, "neighborhood0") == 0) cli->cfg.likho_pre_cook = INIT_NEIGHBORHOOD0;
     else if (strcmp(value, "reverse-rarest") == 0) cli->cfg.likho_pre_cook = INIT_REVERSE_RAREST;
     else if (strcmp(value, "reverse-glowest") == 0) cli->cfg.likho_pre_cook = INIT_REVERSE_GLOWEST;
     else if (strcmp(value, "reverse-min-overlapping") == 0) cli->cfg.likho_pre_cook = INIT_REVERSE_MIN_OVERLAP;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping)", flag, value);
-    cli->cfg.init = INIT_LIKHO;   /* pre-cook is a Likho mode */
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|neighborhood|neighborhood0|reverse-rarest|reverse-glowest|reverse-min-overlapping)", flag, value);
+    if (cli->cfg.init != INIT_TERMINATOR) cli->cfg.init = INIT_LIKHO;   /* pre-cook is Likho mode unless terminator */
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_group_len(Cli *cli, const char *flag, const char *value) {
@@ -140,6 +144,16 @@ static ResultUnit opt_terminator_order(Cli *cli, const char *flag, const char *v
     else if (strcmp(value, "reverse") == 0) cli->cfg.terminator_order = TERM_REVERSE;
     else if (strcmp(value, "random") == 0) cli->cfg.terminator_order = TERM_RANDOM;
     else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected forward|reverse|random)", flag, value);
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_neighborhood_timeout(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->cfg.neighborhood_timeout_ms);
+}
+static ResultUnit opt_neighborhood_start(Cli *cli, const char *flag, const char *value) {
+    if (strcmp(value, "most") == 0) cli->cfg.neighborhood_start = NB_MOST;
+    else if (strcmp(value, "least") == 0) cli->cfg.neighborhood_start = NB_LEAST;
+    else if (strcmp(value, "random") == 0) cli->cfg.neighborhood_start = NB_RANDOM;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected most|least|random)", flag, value);
     return OK_UNIT(ResultUnit);
 }
 /* -deep-dive VARS NODES: cap switch domains, and fire them before neutrals. */
@@ -199,6 +213,8 @@ static const OptSpec OPTS[] = {
     { "--init", opt_init },           { "-pre-cook", opt_pre_cook },
     { "--pre-cook", opt_pre_cook },   { "--terminator-rounds", opt_terminator_rounds },
     { "--terminator-order", opt_terminator_order },
+    { "--neighborhood-timeout", opt_neighborhood_timeout },
+    { "--neighborhood-start", opt_neighborhood_start },
     { "-play-baseline", opt_play_baseline }, { "--play-baseline", opt_play_baseline },
     { "-set-baseline", opt_set_baseline },   { "--set-baseline", opt_set_baseline },
 };
@@ -209,8 +225,9 @@ static void usage(void) {
         "                      [--strategy ranked|greedy|random] [--progress N] [--out FILE]\n"
         "                      [--mode plain|groups] [--max-groups 1..1024] [--merge free|directed]\n"
         "                      [--diversify N] [--group-len N]\n"
-        "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator]\n"
+        "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|neighborhood|neighborhood0]\n"
         "                      [--terminator-rounds N] [--terminator-order forward|reverse|random]\n"
+        "                      [--neighborhood-timeout MS] [--neighborhood-start most|least|random]\n"
         "                      [-deep-dive VARS NODES]\n"
         "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping]\n"
         "                      [-play-baseline P] [-set-baseline N]\n");

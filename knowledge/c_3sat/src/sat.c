@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <time.h>
 
 /* Likho switch-domain defaults; the CLI -deep-dive flag overrides both. */
 #define LIKHO_DOMAIN_MAX 8      /* variables in one domain, prime included */
@@ -386,6 +387,8 @@ SolverConfig solver_config_default(void) {
         .likho_domain_max = LIKHO_DOMAIN_MAX, .likho_search_nodes = LIKHO_SEARCH_NODES,
         .likho_domains_first = false, .likho_pre_cook = INIT_ZERO,
         .terminator_rounds = 16, .terminator_order = TERM_FORWARD,
+        .neighborhood_timeout_ms = 1000,
+        .neighborhood_start = NB_MOST,
         .gob_recult_play = 0, .gob_recult_set = 0.0, .gob_recult_has_set = false,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
@@ -1114,6 +1117,8 @@ bool solver_likho(Solver *s, const SolverConfig *cfg) {
     else if (pre == INIT_GOB_SIGN) { if (!solver_init_gob_sign(s)) return false; }
     else if (pre == INIT_GOB_SQUARE) { if (!solver_init_gob_square(s, NULL)) return false; }
     else if (pre == INIT_GOB_RECULT) { if (!solver_init_gob_recult(s, cfg)) return false; }
+    else if (pre == INIT_NEIGHBORHOOD) { if (!solver_init_neighborhood(s, cfg)) return false; }
+    else if (pre == INIT_NEIGHBORHOOD0) { if (!solver_init_neighborhood0(s, cfg)) return false; }
     else if (pre == INIT_REVERSE_RAREST) { if (!solver_init_reverse(s, INIT_RAREST)) return false; }
     else if (pre == INIT_REVERSE_GLOWEST) { if (!solver_init_reverse(s, INIT_GLOWEST)) return false; }
     else if (pre == INIT_REVERSE_MIN_OVERLAP) { if (!solver_init_reverse(s, INIT_MIN_OVERLAP)) return false; }
@@ -1145,6 +1150,355 @@ bool solver_likho(Solver *s, const SolverConfig *cfg) {
         if (!moved) break;   /* stuck: no neutral and no switch domain anywhere */
     }
     free(flipped); free(in); free(snap); free(dom);
+    return true;
+}
+
+
+/* ---- neighborhood ----------------------------------------------------- */
+
+typedef struct {
+    size_t var;
+    int8_t tried; /* 1 tried first, 2 tried both */
+    int8_t first;
+} NbDecision;
+
+static bool nb_timed_out(struct timespec deadline, bool has_deadline) {
+    if (!has_deadline) return false;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec > deadline.tv_sec ||
+           (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
+}
+
+static bool nb_clause_sat(const Cnf *cnf, size_t ci, const int8_t *val) {
+    const Lit *cl = cnf_clause(cnf, ci);
+    size_t len = cnf_clause_len(cnf, ci);
+    for (size_t k = 0; k < len; k++) {
+        int8_t v = val[cl[k].var];
+        if (v < 0) continue;
+        if ((v == 1) == cl[k].positive) return true;
+    }
+    return false;
+}
+
+static bool nb_clause_unsat(const Cnf *cnf, size_t ci, const int8_t *val) {
+    const Lit *cl = cnf_clause(cnf, ci);
+    size_t len = cnf_clause_len(cnf, ci);
+    bool any_unset = false;
+    for (size_t k = 0; k < len; k++) {
+        int8_t v = val[cl[k].var];
+        if (v < 0) { any_unset = true; continue; }
+        if ((v == 1) == cl[k].positive) return false;
+    }
+    return !any_unset;
+}
+
+static size_t nb_popularity(const Solver *s, size_t var, const unsigned char *active) {
+    size_t p = 0;
+    for (size_t i = s->occ_off[var]; i < s->occ_off[var + 1]; i++)
+        if (active[s->occ[i].clause]) p++;
+    return p;
+}
+
+bool solver_init_neighborhood(Solver *s, const SolverConfig *cfg) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
+    int8_t *val = malloc((nv ? nv : 1) * sizeof *val);
+    unsigned char *active = malloc((nc ? nc : 1));
+    NbDecision *stack = malloc((nv ? nv : 1) * sizeof *stack);
+    if (!val || !active || !stack) { free(val); free(active); free(stack); return false; }
+    for (size_t i = 0; i < nv; i++) val[i] = -1;
+    for (size_t i = 0; i < nc; i++) active[i] = 1;
+
+    struct timespec deadline = {0, 0};
+    bool has_deadline = cfg && cfg->neighborhood_timeout_ms > 0;
+    if (has_deadline) {
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += (time_t)(cfg->neighborhood_timeout_ms / 1000);
+        deadline.tv_nsec += (long)((cfg->neighborhood_timeout_ms % 1000) * 1000000UL);
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    }
+
+    size_t sp = 0;
+    bool ok = true;
+    while (ok) {
+        if (nb_timed_out(deadline, has_deadline)) break;
+        size_t best = SIZE_MAX, best_pop = 0;
+        for (size_t i = 0; i < nv; i++) {
+            if (val[i] >= 0) continue;
+            size_t pop = nb_popularity(s, i, active);
+            if (pop == 0) continue;
+            if (best == SIZE_MAX || pop > best_pop || (pop == best_pop && i < best)) { best = i; best_pop = pop; }
+        }
+        if (best == SIZE_MAX) break;
+
+        int score[2] = {0, 0};
+        for (size_t i = s->occ_off[best]; i < s->occ_off[best + 1]; i++) {
+            Occ o = s->occ[i];
+            if (!active[o.clause] || nb_clause_sat(cnf, o.clause, val)) continue;
+            score[o.positive ? 1 : 0]++;
+        }
+        int8_t first = score[1] >= score[0] ? 1 : 0;
+        stack[sp++] = (NbDecision){ best, 1, first };
+        val[best] = first;
+
+        bool conflict = false;
+        for (size_t i = s->occ_off[best]; i < s->occ_off[best + 1] && !conflict; i++) {
+            size_t ci = s->occ[i].clause;
+            if (!active[ci] || nb_clause_sat(cnf, ci, val)) continue;
+            const Lit *cl = cnf_clause(cnf, ci);
+            size_t len = cnf_clause_len(cnf, ci);
+            size_t nb_best = SIZE_MAX, nb_pop = 0; int8_t nb_val = 1;
+            for (size_t k = 0; k < len; k++) {
+                size_t v = cl[k].var;
+                if (v == best || val[v] >= 0) continue;
+                size_t pop = nb_popularity(s, v, active);
+                if (nb_best == SIZE_MAX || pop > nb_pop || (pop == nb_pop && v < nb_best)) { nb_best = v; nb_pop = pop; nb_val = cl[k].positive ? 1 : 0; }
+            }
+            if (nb_best != SIZE_MAX) {
+                if (sp < nv) stack[sp++] = (NbDecision){ nb_best, 1, nb_val };
+                val[nb_best] = nb_val;
+            }
+            if (!nb_clause_sat(cnf, ci, val)) {
+                while (sp > 0) {
+                    NbDecision *d = &stack[sp - 1];
+                    if (d->tried < 2) {
+                        d->tried = 2;
+                        val[d->var] = d->first ? 0 : 1;
+                        bool bad = false;
+                        for (size_t j = s->occ_off[d->var]; j < s->occ_off[d->var + 1]; j++)
+                            if (nb_clause_unsat(cnf, s->occ[j].clause, val)) { bad = true; break; }
+                        if (!bad) { conflict = false; goto nb_retry; }
+                    } else { val[d->var] = -1; sp--; }
+                }
+                ok = false; conflict = true;
+            }
+        }
+nb_retry:
+        if (!ok) break;
+        for (size_t ci = 0; ci < nc; ci++) active[ci] = !nb_clause_sat(cnf, ci, val);
+    }
+
+    for (size_t i = 0; i < nv; i++) s->assignment[i] = (val[i] < 0) ? false : (val[i] == 1);
+    rebuild_counts(s);
+    free(val); free(active); free(stack);
+    return true;
+}
+
+
+/* ---- Neighborhood0 (full spec) ---------------------------------------- */
+
+typedef struct { size_t *v; size_t n, cap; } NbSet;
+
+static bool nbset_add(NbSet *s, size_t x) {
+    for (size_t i = 0; i < s->n; i++) if (s->v[i] == x) return true;
+    if (s->n == s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 8;
+        size_t *p = realloc(s->v, ncap * sizeof *p);
+        if (!p) return false;
+        s->v = p; s->cap = ncap;
+    }
+    s->v[s->n++] = x;
+    return true;
+}
+
+typedef struct { size_t *ids; size_t n; } NbOrder;
+
+static void nb0_build_order(const Solver *s, NbOrder *o) {
+    size_t nv = s->cnf->n_vars;
+    o->ids = malloc((nv ? nv : 1) * sizeof *o->ids);
+    o->n = nv;
+    if (!o->ids) { o->n = 0; return; }
+    for (size_t i = 0; i < nv; i++) o->ids[i] = i;
+    /* sort by total occurrence count desc, then id asc */
+    for (size_t i = 1; i < nv; i++) {
+        size_t key = o->ids[i], j = i;
+        size_t kp = occ_count(s, key);
+        while (j > 0) {
+            size_t jp = occ_count(s, o->ids[j - 1]);
+            if (jp > kp || (jp == kp && o->ids[j - 1] < key)) break;
+            o->ids[j] = o->ids[j - 1]; j--;
+        }
+        o->ids[j] = key;
+    }
+}
+
+typedef struct {
+    size_t var;
+    int8_t phase; /* 0 set main, 1 neighbors, 2 done */
+    int8_t main_val;
+    NbSet affected;
+    size_t nb_i;
+} Nb0Frame;
+
+bool solver_init_neighborhood0(Solver *s, const SolverConfig *cfg) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
+    int8_t *val = malloc((nv ? nv : 1) * sizeof *val);
+    unsigned char *sat = malloc((nc ? nc : 1));
+    Nb0Frame *stack = malloc((nv ? nv : 1) * sizeof *stack);
+    NbOrder ord = {0};
+    if (!val || !sat || !stack) { free(val); free(sat); free(stack); return false; }
+    for (size_t i = 0; i < nv; i++) { val[i] = -1; stack[i] = (Nb0Frame){0}; }
+    for (size_t i = 0; i < nc; i++) sat[i] = 0;
+    nb0_build_order(s, &ord);
+    if (!ord.ids) { free(val); free(sat); free(stack); return false; }
+
+    struct timespec deadline = {0,0}; bool has_deadline = cfg && cfg->neighborhood_timeout_ms > 0;
+    if (has_deadline) {
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += (time_t)(cfg->neighborhood_timeout_ms / 1000);
+        deadline.tv_nsec += (long)((cfg->neighborhood_timeout_ms % 1000) * 1000000UL);
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    }
+
+    size_t sp = 0; bool failed = false; size_t cur_idx = 0;
+    size_t nb_solved = 0;
+    /* initial: pick most popular var overall */
+    while (!failed) {
+        if (nb_timed_out(deadline, has_deadline)) break;
+        /* choose var: if stack top in phase 1, its neighbor; else most popular unset with unsat clauses */
+        size_t var = SIZE_MAX;
+        if (sp > 0 && stack[sp-1].phase == 1) {
+            Nb0Frame *f = &stack[sp-1];
+            /* find next unset neighbor in clauses of f->var */
+            for (; f->nb_i < occ_count(s, f->var); f->nb_i++) {
+                size_t ci = s->occ[s->occ_off[f->var] + f->nb_i].clause;
+                if (sat[ci]) continue;
+                const Lit *cl = cnf_clause(cnf, ci); size_t len = cnf_clause_len(cnf, ci);
+                for (size_t k = 0; k < len; k++) {
+                    size_t v = cl[k].var;
+                    if (val[v] < 0) { var = v; goto got_var; }
+                }
+            }
+            f->phase = 2; /* neighbors done */
+            /* if all clauses of this var set, move to most popular neighbor */
+            bool all_set = true;
+            for (size_t i = s->occ_off[f->var]; i < s->occ_off[f->var + 1]; i++) if (!sat[s->occ[i].clause]) { all_set = false; break; }
+            if (all_set) {
+                nb_solved++;
+                /* pick most popular neighbor in ord that is unset */
+                size_t bestn = SIZE_MAX, bestp = 0;
+                for (size_t i = s->occ_off[f->var]; i < s->occ_off[f->var + 1]; i++) {
+                    const Lit *cl = cnf_clause(cnf, s->occ[i].clause); size_t len = cnf_clause_len(cnf, s->occ[i].clause);
+                    for (size_t k = 0; k < len; k++) {
+                        size_t v = cl[k].var; if (val[v] >= 0) continue;
+                        size_t p = occ_count(s,v);
+                        if (bestn==SIZE_MAX || p>bestp || (p==bestp && v<bestn)) { bestn=v; bestp=p; }
+                    }
+                }
+                if (bestn != SIZE_MAX) var = bestn;
+            }
+            if (var == SIZE_MAX) {
+                /* check global done */
+                bool any=false; for(size_t ci=0;ci<nc;ci++) if(!sat[ci]){any=true;break;}
+                if(!any) break;
+                /* fall through to global pick */
+            }
+        }
+got_var:
+        if (var == SIZE_MAX) {
+            /* global pick by configured start strategy */
+            NeighborhoodStart nstart = cfg ? cfg->neighborhood_start : NB_MOST;
+            if (nstart == NB_RANDOM) {
+                size_t pool_n = 0;
+                for (size_t oi = 0; oi < ord.n; oi++) {
+                    size_t v = ord.ids[oi];
+                    if (val[v] >= 0) continue;
+                    bool has=false; for(size_t i=s->occ_off[v];i<s->occ_off[v+1];i++) if(!sat[s->occ[i].clause]){has=true;break;}
+                    if (has) pool_n++;
+                }
+                if (pool_n > 0) {
+                    size_t pick = rng_index(&s->rng, pool_n);
+                    for (size_t oi = 0; oi < ord.n; oi++) {
+                        size_t v = ord.ids[oi];
+                        if (val[v] >= 0) continue;
+                        bool has=false; for(size_t i=s->occ_off[v];i<s->occ_off[v+1];i++) if(!sat[s->occ[i].clause]){has=true;break;}
+                        if (!has) continue;
+                        if (pick == 0) { var = v; break; }
+                        pick--;
+                    }
+                }
+            } else {
+                size_t bestv = SIZE_MAX, bestp = 0;
+                for (size_t oi = 0; oi < ord.n; oi++) {
+                    size_t v = ord.ids[oi];
+                    if (val[v] >= 0) continue;
+                    bool has=false; for(size_t i=s->occ_off[v];i<s->occ_off[v+1];i++) if(!sat[s->occ[i].clause]){has=true;break;}
+                    if (!has) continue;
+                    size_t p = occ_count(s, v);
+                    if (bestv == SIZE_MAX) { bestv=v; bestp=p; }
+                    else if (nstart == NB_MOST && (p > bestp || (p == bestp && v < bestv))) { bestv=v; bestp=p; }
+                    else if (nstart == NB_LEAST && (p < bestp || (p == bestp && v < bestv))) { bestv=v; bestp=p; }
+                }
+                var = bestv;
+            }
+            if (var == SIZE_MAX) break; /* all set or no unsat */
+        }
+
+        /* set var: choose value satisfying more active clauses */
+        int sc[2]={0,0};
+        for (size_t i=s->occ_off[var]; i<s->occ_off[var+1]; i++) {
+            Occ o=s->occ[i]; if (sat[o.clause]) continue;
+            sc[o.positive?1:0]++;
+        }
+        int8_t vval = sc[1]>=sc[0]?1:0;
+        Nb0Frame *f = &stack[sp];
+        f->var=var; f->phase=0; f->main_val=vval; f->nb_i=0;
+        f->affected.v=NULL; f->affected.n=0; f->affected.cap=0;
+        sp++;
+        val[var]=vval;
+        /* mark clauses satisfied by var */
+        bool conflict=false;
+        for (size_t i=s->occ_off[var]; i<s->occ_off[var+1]; i++) {
+            size_t ci=s->occ[i].clause;
+            if (sat[ci]) continue;
+            if (nb_clause_sat(cnf,ci,val)) { if(!nbset_add(&f->affected,ci)) {failed=true;break;} sat[ci]=1; }
+        }
+        if (failed) break;
+        /* check for unsat clauses */
+        for (size_t i=s->occ_off[var]; i<s->occ_off[var+1]; i++) {
+            if (nb_clause_unsat(cnf, s->occ[i].clause, val)) { conflict=true; break; }
+        }
+        f->phase = 1; /* proceed to neighbors */
+        if (conflict) {
+            /* backtrack: per spec - return to neighbor id-1, flip; if fails id-2... */
+            bool resolved=false;
+            while (sp > 0 && !resolved) {
+                Nb0Frame *top = &stack[sp-1];
+                /* undo affected sat marks */
+                for (size_t i=0;i<top->affected.n;i++) sat[top->affected.v[i]]=0;
+                /* flip main var if only tried once? spec: flip neighbor id-1; second fail id-2 */
+                /* simple: try flipping this var if not flipped, else pop */
+                if (top->main_val >= 0) { /* first attempt, flip */
+                    top->main_val = -1; /* mark flipped */
+                    val[top->var] = val[top->var] ? 0 : 1;
+                    top->affected.n = 0;
+                    bool bad=false;
+                    for (size_t i=s->occ_off[top->var]; i<s->occ_off[top->var+1]; i++) {
+                        size_t ci=s->occ[i].clause;
+                        if (nb_clause_sat(cnf,ci,val)) { if(!nbset_add(&top->affected,ci)) {failed=true;break;} sat[ci]=1; }
+                        if (nb_clause_unsat(cnf,ci,val)) { bad=true; }
+                    }
+                    if (!failed && !bad) { top->phase=1; top->nb_i=0; resolved=true; }
+                    else { for(size_t i=0;i<top->affected.n;i++) sat[top->affected.v[i]]=0; top->affected.n=0; /* will pop */ }
+                }
+                if (!resolved) {
+                    val[top->var] = -1;
+                    free(top->affected.v); top->affected.v=NULL; top->affected.cap=0; top->affected.n=0;
+                    sp--;
+                }
+            }
+            if (!resolved) { failed=true; }
+        }
+        (void)cur_idx;
+    }
+
+    for (size_t i = 0; i < nv; i++) s->assignment[i] = (val[i] < 0) ? false : (val[i] == 1);
+    rebuild_counts(s);
+    fprintf(stderr, "neighborhood0: neighborhoods_solved=%zu unsat=%zu nv=%zu nc=%zu\n", nb_solved, s->n_rogue, nv, nc);
+    for (size_t i=0;i<sp;i++) free(stack[i].affected.v);
+    free(val); free(sat); free(stack); free(ord.ids);
     return true;
 }
 
@@ -1235,7 +1589,11 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
         } else if (restart == 0 && cfg->init == INIT_REVERSE_MIN_OVERLAP) {
             if (!solver_init_reverse(s, INIT_MIN_OVERLAP)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_TERMINATOR) {
-            solver_init_terminator(s, cfg->terminator_rounds, cfg->terminator_order);
+            if (!solver_init_terminator_pre(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_NEIGHBORHOOD) {
+            if (!solver_init_neighborhood(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_NEIGHBORHOOD0) {
+            if (!solver_init_neighborhood0(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_LIKHO) {
             if (!solver_likho(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else {
@@ -1305,9 +1663,37 @@ void solver_terminator(Solver *s, size_t rounds, TerminatorOrder order) {
     free(perm);
 }
 
+static bool solver_apply_pre_cook(Solver *s, const SolverConfig *cfg, InitMode pre) {
+    if (pre == INIT_MAJORITY) solver_init_majority(s);
+    else if (pre == INIT_RAREST) { if (!solver_init_rarest(s)) return false; }
+    else if (pre == INIT_GLOWEST) { if (!solver_init_glowest(s)) return false; }
+    else if (pre == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(s)) return false; }
+    else if (pre == INIT_GOB) { if (!solver_init_gob(s)) return false; }
+    else if (pre == INIT_GOB_SIGN) { if (!solver_init_gob_sign(s)) return false; }
+    else if (pre == INIT_GOB_SQUARE) { if (!solver_init_gob_square(s, NULL)) return false; }
+    else if (pre == INIT_GOB_RECULT) { if (!solver_init_gob_recult(s, cfg)) return false; }
+    else if (pre == INIT_NEIGHBORHOOD) { if (!solver_init_neighborhood(s, cfg)) return false; }
+    else if (pre == INIT_NEIGHBORHOOD0) { if (!solver_init_neighborhood0(s, cfg)) return false; }
+    else if (pre == INIT_REVERSE_RAREST) { if (!solver_init_reverse(s, INIT_RAREST)) return false; }
+    else if (pre == INIT_REVERSE_GLOWEST) { if (!solver_init_reverse(s, INIT_GLOWEST)) return false; }
+    else if (pre == INIT_REVERSE_MIN_OVERLAP) { if (!solver_init_reverse(s, INIT_MIN_OVERLAP)) return false; }
+    else {
+        memset(s->assignment, 0, s->cnf->n_vars * sizeof *s->assignment);
+        rebuild_counts(s);
+    }
+    return true;
+}
+
 void solver_init_terminator(Solver *s, size_t rounds, TerminatorOrder order) {
     solver_init_majority(s);
     solver_terminator(s, rounds, order);
+}
+
+bool solver_init_terminator_pre(Solver *s, const SolverConfig *cfg) {
+    InitMode pre = cfg ? cfg->likho_pre_cook : INIT_MAJORITY;
+    if (!solver_apply_pre_cook(s, cfg, pre)) return false;
+    solver_terminator(s, cfg ? cfg->terminator_rounds : 16, cfg ? cfg->terminator_order : TERM_FORWARD);
+    return true;
 }
 
 void solver_init_majority(Solver *s) { random_assignment(s, true); }

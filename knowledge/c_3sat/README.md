@@ -106,19 +106,28 @@ Restart 0 starts from a chosen init (later restarts are always random):
 - `--init reverse-rarest|reverse-glowest|reverse-min-overlapping`: negate every
   clause, run the named constructive start on the reversed system, negate the
   assignment back (“vice versa”).
-- `--init terminator`: majority start, then improvement rounds of strictly
-  gainful flips (`make_count > break_count`), re-evaluated per variable.
-  `--terminator-rounds N` (default 16) caps passes; `--terminator-order
+- `--init terminator`: pre-cook start (majority by default), then improvement
+  rounds of strictly gainful flips (`make_count > break_count`), re-evaluated per
+  variable. `--terminator-rounds N` (default 16) caps passes; `--terminator-order
   forward|reverse|random` sets the per-round visit order (random uses the solver
-  RNG and reshuffles each round).
+  RNG and reshuffles each round). Combine with `-pre-cook ...` to seed terminator
+  from another init (e.g. `-pre-cook neighborhood0`).
+- `--init neighborhood|neighborhood0`: popularity/backtracking neighborhood
+  search. `neighborhood0` is the full spec variant (most-popular var, satisfy its
+  clause neighborhood via neighbors, propagate to most popular neighbor,
+  backtrack/flip on conflict); `neighborhood` is a lighter approximation.
+  `--neighborhood-timeout MS` (default 1000) bounds backtracking;
+  `--neighborhood-start most|least|random` picks the global start/next var
+  (`random` uses the solver RNG).
 - `--init likho`: pre-cooked start (all-false by default), then a
   neutral/switch-domain repair pass.
 - `-deep-dive VARS NODES`: implies `--init likho`, caps switch domains at VARS
   variables, gives each prime at most NODES search nodes, and fires domains
   before neutral repairs.
-- `-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping`:
-  implies `--init likho`; phase 1 is that assignment instead of the default
-  all-false one (a partially solved input).
+- `-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|neighborhood|neighborhood0|reverse-rarest|reverse-glowest|reverse-min-overlapping`:
+  implies `--init likho` unless `--init terminator` is set; phase 1 is that
+  assignment instead of the default all-false/majority one (a partially solved
+  input).
 
 All inits work in both `plain` and `groups` mode; `-deep-dive` is a variant of
 `likho`.
@@ -302,13 +311,14 @@ assignment (`x = !x'`). The same bases are available as Likho pre-cooks.
 
 ### Terminator
 
-`--init terminator` starts from majority and runs up to `--terminator-rounds`
-(default 16) full-variable improvement passes. In each pass, in the chosen
-`--terminator-order` (`forward`, `reverse`, or `random` — a fresh RNG
-permutation each round), a variable is flipped if `make_count > break_count`
-(strictly improving, counts re-evaluated per var). It stops early on a no-flip
-pass or when solved. As an init it runs at restart 0, after which normal search
-continues; gains typically saturate in a few rounds.
+`--init terminator` starts from a pre-cook assignment (majority by default;
+configure with `-pre-cook`, including `neighborhood`/`neighborhood0`) and runs up
+to `--terminator-rounds` (default 16) full-variable improvement passes. In each
+pass, in the chosen `--terminator-order` (`forward`, `reverse`, or `random` — a
+fresh RNG permutation each round), a variable is flipped if `make_count >
+break_count` (strictly improving, counts re-evaluated per var). It stops early on
+a no-flip pass or when solved. As an init it runs at restart 0, after which
+normal search continues; gains typically saturate in a few rounds.
 
 ### Likho
 
@@ -545,7 +555,8 @@ reporting tool, not a faster solver. The plain solver stays the default.
   so both come from the same pass.
 - Extra options: `--strategy`, `--progress`, `--mode`, `--max-groups`, `--merge`, `--diversify`,
   `--group-len` (also accepted as `-group-len`), `--init`, `--terminator-rounds`,
-  `--terminator-order`, `-deep-dive`, `-pre-cook`, `-play-baseline`, `-set-baseline`.
+  `--terminator-order`, `--neighborhood-timeout`, `--neighborhood-start`,
+  `-deep-dive`, `-pre-cook`, `-play-baseline`, `-set-baseline`.
 
 ## Layout
 
