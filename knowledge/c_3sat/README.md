@@ -310,6 +310,34 @@ precedence over `-play-baseline` if both are given); either explicit flag skips 
 brute-force. Only `x` is kept: decoded by sign and repaired by `gob_repair`, like
 `gob-sign`.
 
+#### What the linear system can and cannot recover
+
+The clause linearization is exact in 0/1 variables: `x ∨ y` is `x + y = b_i`,
+`x ∨ ¬y` is `x − y + 1 = b_i`, where `b_i` is the number of true literals in the
+clause (`1..3` for a satisfiable 3-CNF). In the ±1 code used here the RHS is
+`2·b_i − 3 ∈ {−1, 1, 3}`; the constant `1` above corresponds to `b_i = 2`.
+
+With the true `b` from a satisfying model, `A z = 2b − 3` recovers that model
+**exactly** on all 17 hard AIM instances (`A` has full column rank `nv`, so the
+solution is unique). So the information is entirely in the per-clause `b` vector.
+
+A Kaczmarz state `x` is just `A⁺ r` for the current RHS `r`. Unless `r` is very
+close to the true `2b−3`, that `x` is dominated by the CNF's own polarity
+statistics: on AIM instances `corr(x_i, pos_i − neg_i) ≈ 0.76..0.82`, while
+`corr(x_i, model_i) ≈ 0`, and `|x_i|` is *anti*-correlated with sign correctness.
+The sign decode slips in the first ~12 sweeps and freezes at ~44–53% model
+agreement; the magnitude/parity decodes are no better. Setting `B` to the exact
+ideal `ΣY` (reconstructed from `M·Y = b−1`, values −6..19 here) still gives
+UNKNOWN with 3–7 rogue clauses.
+
+The brute-force range overshoots: `ΣY*` is small (`|B*| ≤ 19`) while `Σb` is
+240–600, so even `K=1` covers the target and results are identical for `K=1,2,3`.
+Tried without gain: RHS `−1` (the "one true literal" encoding), magnitude-parity
+decode, decoding from the full per-row corrected RHS (identical to decoding `x`),
+200 Terminator rounds after each decode, iterative RHS projection, and local
+search over RHS with the exact solve. Estimating `b_i` per clause is the SAT
+problem itself; calibration of `B` and the decoder are not the bottleneck.
+
 ### Vice versa (`reverse-*`)
 
 `--init reverse-rarest|reverse-glowest|reverse-min-overlapping` builds the
