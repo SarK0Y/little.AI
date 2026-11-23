@@ -920,17 +920,18 @@ static void gob_recult_kh(size_t nc, Rng *rng, size_t *k_out, size_t *h_out) {
     *k_out = k; *h_out = k / 2;
 }
 
-static size_t gob_recult_crude_baseline(const Cnf *filtered, const bool *a) {
-    size_t crude = 0;
+/* M Y = b - 1 and 1ᵀ M⁻¹ = ((-1)^i), so the coupling sum implied by b is
+ * B = Σ_i (-1)^i (b_i - 1). b_i is the number of true literals in clause i. */
+static double gob_recult_b_center(const Cnf *filtered, const bool *a) {
+    double center = 0.0;
     for (size_t ci = 0; ci < filtered->n_clauses; ci++) {
         const Lit *cl = cnf_clause(filtered, ci);
-        size_t len = cnf_clause_len(filtered, ci);
-        for (size_t t = 0; t < len; t++) {
-            bool literal_true = cl[t].positive ? a[cl[t].var] : !a[cl[t].var];
-            crude += literal_true ? 1 : 0;
-        }
+        size_t b = 0;
+        for (size_t t = 0; t < cnf_clause_len(filtered, ci); t++)
+            if (cl[t].positive ? a[cl[t].var] : !a[cl[t].var]) b++;
+        center += (ci % 2 == 0 ? 1.0 : -1.0) * ((double)b - 1.0);
     }
-    return crude;
+    return center;
 }
 
 static void gob_recult_run(const Cnf *filtered, size_t nv, size_t nc, size_t k, size_t h,
@@ -987,29 +988,30 @@ bool solver_init_gob_recult(Solver *s, const SolverConfig *cfg) {
         free(x); free(y); free(a); free(best_a); cnf_free(&filtered); return true;
     }
 
-    /* Crude baseline: sum of b_i over the linearized clauses, where each literal
-     * is 1 when true under BaddyMove's partial assignment, else 0. */
+    /* Center the baseline search on the value implied by BaddyMove's b vector. */
     SolverConfig bcfg = cfg ? *cfg : solver_config_default();
     bcfg.init = INIT_BADDYMOVE; bcfg.likho_pre_cook = INIT_NEIGHBORHOOD0;
     bcfg.max_steps = 0; bcfg.restarts = 0; bcfg.terminator_rounds = 32;
     bcfg.terminator_order = TERM_RANDOM; bcfg.baddymove_allow = 0.1;
     bcfg.neighborhood_timeout_ms = 1000;
-    size_t crude_baseline = 0;
+    double b_center = 0.0;
     ResultSolver brs = solver_new(cnf, cfg && cfg->seed ? cfg->seed : 0x9e3779b97f4a7c15ULL);
     if (brs.ok) {
         if (solver_init_baddymove(brs.val, &bcfg))
-            crude_baseline = gob_recult_crude_baseline(&filtered, solver_assignment(brs.val));
+            b_center = gob_recult_b_center(&filtered, solver_assignment(brs.val));
         solver_free(brs.val);
     }
+    long long center = (long long)(b_center >= 0 ? b_center + 0.5 : b_center - 0.5);
 
     size_t coef_k = cfg ? cfg->gob_recult_coef_k : solver_config_default().gob_recult_coef_k;
-    uint64_t radius_u = (uint64_t)coef_k * (uint64_t)crude_baseline;
+    size_t span = nc ? nc / 4 + 1 : 1;
+    uint64_t radius_u = (uint64_t)coef_k * (uint64_t)span;
     if (radius_u > (uint64_t)LLONG_MAX) radius_u = (uint64_t)LLONG_MAX;
     long long radius = (long long)radius_u;
 
     size_t best_unsat = SIZE_MAX; bool found = false;
     for (long long d = 0; d <= radius && best_unsat > 0; d++) {
-        long long cands[3] = { 0, -d, d };
+        long long cands[3] = { center, center - d, center + d };
         int ntry = (d == 0) ? 1 : 3;
         for (int t = 0; t < ntry; t++) {
             gob_recult_run(&filtered, nv, nc, k, h, (double)cands[t], x, y);
@@ -1024,7 +1026,7 @@ bool solver_init_gob_recult(Solver *s, const SolverConfig *cfg) {
         }
     }
     if (found) { solver_set_assignment(s, best_a); gob_repair(s); }
-    else { gob_recult_run(&filtered, nv, nc, k, h, 0.0, x, y); gob_decode_sign(x, a, nv); solver_set_assignment(s, a); gob_repair(s); }
+    else { gob_recult_run(&filtered, nv, nc, k, h, (double)center, x, y); gob_decode_sign(x, a, nv); solver_set_assignment(s, a); gob_repair(s); }
     free(x); free(y); free(a); free(best_a); cnf_free(&filtered);
     return true;
 }

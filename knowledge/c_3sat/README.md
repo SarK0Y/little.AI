@@ -101,9 +101,10 @@ Restart 0 starts from a chosen init (later restarts are always random):
 - `--init gob-recult`: the clause system augmented with tail variables `Y` on the
   right-hand side (recultivation), solved by Kaczmarz; `x` is decoded by sign and
   repaired and `Y` is dropped. By default a BaddyMove partial assignment gives a
-  crude baseline `Σ b_i` (each literal 1 if true, else 0); the tail-sum baseline `B`
-  is then brute-forced over `[-k·|crude|, k·|crude|]` (`-coef-k K`, default 2),
-  keeping the decoded assignment with the fewest rogue clauses. `-play-baseline P`
+  center `B(b) = Σ_i (−1)^i (b_i − 1)` (`b_i` = number of true literals in clause
+  `i`); the tail-sum baseline `B` is then brute-forced in
+  `[B(b) − k·(n/4+1), B(b) + k·(n/4+1)]` (`-coef-k K`, default 2), keeping the
+  decoded assignment with the fewest rogue clauses. `-play-baseline P`
   sets `B = rng mod P` (`P >= 1`), `-set-baseline N` fixes `B = N` (if both given,
   `-set-baseline` wins); either explicit flag skips the brute-force.
 - `--init reverse-rarest|reverse-glowest|reverse-min-overlapping`: negate every
@@ -300,11 +301,11 @@ where `n` is the number of filtered equations, `k` is chosen once per init from
 the solver RNG and rounded to an even value, and `h = k/2` (indices modulo `n`).
 `x` and `Y` (all init 0) are solved together by cyclic Kaczmarz projections
 (`GOB_SWEEPS` passes) plus, each sweep, a coupling projection enforcing
-`Σ_i Y_i = B`. By default `B` is found by brute-force: a BaddyMove partial
-assignment supplies a crude baseline `Σ_i b_i`, where each literal of clause `i`
-becomes 1 if true under that assignment and 0 otherwise; every integer `B` in
-`[-k·|crude|, k·|crude|]` is tried (`-coef-k K`, default 2) and the decode with the
-fewest rogue clauses is kept. `-play-baseline P` instead sets `B = rng mod P`
+`Σ_i Y_i = B`. By default `B` is found by brute-force around a center derived
+from a BaddyMove partial assignment: with `b_i` the number of true literals in
+clause `i`, the coupling identity gives `B(b) = Σ_i (−1)^i (b_i − 1)`. Every
+integer `B` in `[B(b) − k·(n/4+1), B(b) + k·(n/4+1)]` is tried (`-coef-k K`,
+default 2) and the decode with the fewest rogue clauses is kept. `-play-baseline P` instead sets `B = rng mod P`
 (`P >= 1`, drawn from the solver RNG), and `-set-baseline N` fixes `B = N` (takes
 precedence over `-play-baseline` if both are given); either explicit flag skips the
 brute-force. Only `x` is kept: decoded by sign and repaired by `gob_repair`, like
@@ -330,13 +331,28 @@ agreement; the magnitude/parity decodes are no better. Setting `B` to the exact
 ideal `ΣY` (reconstructed from `M·Y = b−1`, values −6..19 here) still gives
 UNKNOWN with 3–7 rogue clauses.
 
-The brute-force range overshoots: `ΣY*` is small (`|B*| ≤ 19`) while `Σb` is
-240–600, so even `K=1` covers the target and results are identical for `K=1,2,3`.
+Since `M·Y = b − 1`, the baseline is a linear functional of the whole `b` vector:
+`B = 1ᵀ M⁻¹ (b − 1)`. For this coupling matrix `1ᵀ M⁻¹ = ((−1)^i)` exactly (any
+`k`, `n`), so `B(b) = Σ_i (−1)^i (b_i − 1)` — an O(n) closed form, verified against
+a dense solve on all 17 AIM instances. Under BaddyMove's `b` it lands within
+0–26 of the ideal `B*`, far tighter than `Σb` (240–600).
+
+`B*` is the value that makes the *linear system* consistent, not the value that
+decodes best: the best decode can sit 14–47 away from `B(b)` (e.g.
+`100-1_6-yes1-1`: `B(b)=0`, unsat 3 at `B=0` versus 2 at `B=34`), because the
+Kaczmarz → sign → repair pipeline is not monotone in `|B − B*|`. So `B(b)` is a
+**search center**, not a substitute for the search. Centering on it with radius
+`k·(n/4+1)` reproduces the old `[-k·Σb, k·Σb]` brute-force exactly on all 17 AIM
+instances at default `k=2` (11/17 at `k=1`), in ~2.4× less time (24.7s vs 58.2s).
+The old range centered at zero needed radii up to 1200; `B(b)` puts the useful
+window near the optimum.
+
 Tried without gain: RHS `−1` (the "one true literal" encoding), magnitude-parity
 decode, decoding from the full per-row corrected RHS (identical to decoding `x`),
-200 Terminator rounds after each decode, iterative RHS projection, and local
-search over RHS with the exact solve. Estimating `b_i` per clause is the SAT
-problem itself; calibration of `B` and the decoder are not the bottleneck.
+200 Terminator rounds after each decode, iterative RHS projection, local search
+over RHS with the exact solve, and using `B(b)` alone without a surrounding
+search. Estimating `b_i` per clause is the SAT problem itself; calibration of `B`
+and the decoder are not the bottleneck.
 
 ### Vice versa (`reverse-*`)
 
