@@ -573,6 +573,37 @@ static void test_init_glowest_hand_checked(void) {
     solver_free(s); cnf_free(&e);
 }
 
+static void test_init_yanus(void) {
+    Cnf c = must_parse("p cnf 4 4\n1 2 3 0\n-1 4 0\n-2 4 0\n-3 -4 0\n");
+    SolverConfig cfg = solver_config_default();
+    cfg.init = INIT_YANUS;
+    cfg.yanus_attempts = 4;
+
+    Solver *a = must_solver(&c, 12345), *b = must_solver(&c, 12345);
+    CHECK(solver_init_yanus(a, &cfg));
+    CHECK(solver_init_yanus(b, &cfg));
+    CHECK(memcmp(solver_assignment(a), solver_assignment(b), c.n_vars) == 0);
+    solver_free(a); solver_free(b);
+
+    cfg.yanus_attempts = 0;   /* no attempts: plain glowest */
+    Solver *y = must_solver(&c, 999), *g = must_solver(&c, 999);
+    CHECK(solver_init_yanus(y, &cfg));
+    CHECK(solver_init_glowest(g));
+    CHECK(memcmp(solver_assignment(y), solver_assignment(g), c.n_vars) == 0);
+    solver_free(y); solver_free(g);
+
+    cfg.yanus_attempts = 2;   /* solver_solve dispatch */
+    cfg.max_steps = 0;
+    cfg.restarts = 0;
+    Solver *d = must_solver(&c, 7);
+    ResultSolve r = solver_solve(d, &cfg);
+    CHECK(r.ok && r.val.status != SOLVE_UNSAT);
+    if (r.ok && r.val.status == SOLVE_SAT) CHECK(verify(&c, r.val.assignment, c.n_vars));
+    if (r.ok) solve_result_free(&r.val);
+    solver_free(d);
+    cnf_free(&c);
+}
+
 static void test_terminator_hand_checked(void) {
     /* Majority start leaves 1 unsat; terminator hill-climbs but may not solve. */
     Cnf c = must_parse("p cnf 3 3\n1 2 0\n-1 2 0\n-2 3 0\n");
@@ -1492,6 +1523,7 @@ int main(void) {
     test_more_than_64_groups();
     test_init_rarest_hand_checked();
     test_init_glowest_hand_checked();
+    test_init_yanus();
     test_init_min_overlap_hand_checked();
     test_init_gob_hand_checked();
     test_init_gob_sign_hand_checked();

@@ -118,6 +118,7 @@ typedef enum {
     INIT_CASCADE,   /* ratio M/m vs _M/_m assignment by clause/alternative counts */
     INIT_NEIGHBORHOOD, /* light popularity/backtracking neighborhood search */
     INIT_NEIGHBORHOOD0, /* full neighborhood search per spec */
+    INIT_YANUS,     /* random x = y_a OR y_b expansions, glowest, map back */
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
 
@@ -148,6 +149,7 @@ typedef struct {
     double gob_recult_set;      /* -set-baseline N: baseline = N */
     bool gob_recult_has_set;    /* true when -set-baseline was given */
     size_t gob_recult_coef_k;   /* -coef-k K: auto baseline range [-K*|crude|, K*|crude|] */
+    size_t yanus_attempts;      /* -timeout N: random expansion attempts (0 = glowest only) */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -205,6 +207,11 @@ bool solver_init_rarest(Solver *s);
  * counts, satisfied clauses excluded, ties by id). Deterministic, no RNG.
  * false only on allocation failure. */
 bool solver_init_glowest(Solver *s);
+/* Yanus: each attempt adds D fresh variables and R random replacements x = y_a | y_b
+ * (defining clauses), runs glowest on the expanded CNF and maps the original
+ * variables back. Keeps the mapped assignment with the fewest rogue clauses;
+ * stops early on SAT. cfg->yanus_attempts = 0 falls back to glowest. */
+bool solver_init_yanus(Solver *s, const SolverConfig *cfg);
 /* Same constructive value rule, but the order is: first the most frequent
  * variable (glowest's pick, ties by id), then at every step the unset variable
  * with the smallest share of its occurrences already in satisfied clauses

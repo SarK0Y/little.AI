@@ -90,6 +90,12 @@ Restart 0 starts from a chosen init (later restarts are always random):
 - `--init majority` (default): every variable takes its majority polarity.
 - `--init rarest`: deterministic constructive start (no RNG), rarest variables first.
 - `--init glowest`: deterministic constructive start, most frequent variables first.
+- `--init yanus`: random variable-expansion restarts of glowest; each attempt
+  adds `D` fresh variables and `R` random definitions `x = y_a ∨ y_b`, runs
+  glowest on the expanded CNF, and maps the original variables back. `D` and `R`
+  are drawn from the RNG each attempt; `-timeout N` (default 8) caps attempts
+  (`0` = plain glowest). Early-exits on SAT, otherwise keeps the mapped start
+  with the fewest rogue clauses.
 - `--init min-overlapping`: deterministic constructive start, first the most
   frequent variable, then the one overlapping the solved part least.
 - `--init gob`: deterministic linear-relaxation start (no RNG), clauses as signed
@@ -103,7 +109,7 @@ Restart 0 starts from a chosen init (later restarts are always random):
   repaired and `Y` is dropped. By default a BaddyMove partial assignment gives a
   center `B(b) = Σ_i (−1)^i (b_i − 1)` (`b_i` = number of true literals in clause
   `i`); the tail-sum baseline `B` is then brute-forced in
-  `[B(b) − k·(n/4+1), B(b) + k·(n/4+1)]` (`-coef-k K`, default 2), keeping the
+  `[B(b) − k·s, B(b) + k·s]`, `s = min(n/4+1, 128)` (`-coef-k K`, default 2), keeping the
   decoded assignment with the fewest rogue clauses. `-play-baseline P`
   sets `B = rng mod P` (`P >= 1`), `-set-baseline N` fixes `B = N` (if both given,
   `-set-baseline` wins); either explicit flag skips the brute-force.
@@ -154,6 +160,18 @@ They differ only in which unset variable is picked next:
   occurrences)** (ties by id). A variable that occurs nowhere has no ratio and
   goes last. The point is to keep picking variables mostly outside the clauses
   the first pick already satisfied, instead of following the same subsystem.
+
+### Yanus
+
+`--init yanus` changes the formula instead of the walk. Each attempt draws a
+fresh `D ∈ [1,n]` and `R ∈ [1,n]` from the solver RNG, appends `D` variables,
+and picks `R` random definitions `x = y_a ∨ y_b` (`x` an original variable,
+`y_a,y_b` fresh). A definition is three clauses: `(¬y_a ∨ x)`, `(¬y_b ∨ x)` and
+`(y_a ∨ y_b ∨ ¬x)`. Glowest runs on that expanded CNF; its values for the
+original `n` variables are copied back and scored on the original formula.
+The best start wins, and a zero-rogue mapped assignment ends the loop early.
+`-timeout N` sets the attempt budget (default 8; `0` falls back to glowest).
+Both `plain` and `groups` mode dispatch to it.
 
 ### Gob
 
@@ -304,8 +322,10 @@ the solver RNG and rounded to an even value, and `h = k/2` (indices modulo `n`).
 `Σ_i Y_i = B`. By default `B` is found by brute-force around a center derived
 from a BaddyMove partial assignment: with `b_i` the number of true literals in
 clause `i`, the coupling identity gives `B(b) = Σ_i (−1)^i (b_i − 1)`. Every
-integer `B` in `[B(b) − k·(n/4+1), B(b) + k·(n/4+1)]` is tried (`-coef-k K`,
-default 2) and the decode with the fewest rogue clauses is kept. `-play-baseline P` instead sets `B = rng mod P`
+integer `B` in `[B(b) − k·s, B(b) + k·s]`, `s = min(n/4+1, 128)`, is tried
+(`-coef-k K`, default 2) and the decode with the fewest rogue clauses is kept.
+The cap keeps init bounded on large instances (a 34k-clause ssa file took 37+ min
+before it, 68s after). `-play-baseline P` instead sets `B = rng mod P`
 (`P >= 1`, drawn from the solver RNG), and `-set-baseline N` fixes `B = N` (takes
 precedence over `-play-baseline` if both are given); either explicit flag skips the
 brute-force. Only `x` is kept: decoded by sign and repaired by `gob_repair`, like
@@ -342,8 +362,9 @@ decodes best: the best decode can sit 14–47 away from `B(b)` (e.g.
 `100-1_6-yes1-1`: `B(b)=0`, unsat 3 at `B=0` versus 2 at `B=34`), because the
 Kaczmarz → sign → repair pipeline is not monotone in `|B − B*|`. So `B(b)` is a
 **search center**, not a substitute for the search. Centering on it with radius
-`k·(n/4+1)` reproduces the old `[-k·Σb, k·Σb]` brute-force exactly on all 17 AIM
-instances at default `k=2` (11/17 at `k=1`), in ~2.4× less time (24.7s vs 58.2s).
+`k·s` with `s = min(n/4+1, 128)` reproduces the old `[-k·Σb, k·Σb]` brute-force
+exactly on all 17 AIM instances at default `k=2` (12/17 at `k=1`), in ~2.4× less
+time (24.7s vs 58.2s).
 The old range centered at zero needed radii up to 1200; `B(b)` puts the useful
 window near the optimum.
 
@@ -608,7 +629,8 @@ reporting tool, not a faster solver. The plain solver stays the default.
 - Extra options: `--strategy`, `--progress`, `--mode`, `--max-groups`, `--merge`, `--diversify`,
   `--group-len` (also accepted as `-group-len`), `--init`, `--terminator-rounds`,
   `--terminator-order`, `--neighborhood-timeout`, `--neighborhood-start`,
-  `-deep-dive`, `-pre-cook`, `-play-baseline`, `-set-baseline`, `-coef-k`.
+  `-deep-dive`, `-pre-cook`, `-play-baseline`, `-set-baseline`, `-coef-k`,
+  `-timeout`.
 
 ## Layout
 

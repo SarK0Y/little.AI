@@ -113,7 +113,8 @@ static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "cascade") == 0) cli->cfg.init = INIT_CASCADE;
     else if (strcmp(value, "neighborhood") == 0) cli->cfg.init = INIT_NEIGHBORHOOD;
     else if (strcmp(value, "neighborhood0") == 0) cli->cfg.init = INIT_NEIGHBORHOOD0;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|cascade|neighborhood|neighborhood0)", flag, value);
+    else if (strcmp(value, "yanus") == 0) cli->cfg.init = INIT_YANUS;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|cascade|neighborhood|neighborhood0|yanus)", flag, value);
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
@@ -208,6 +209,9 @@ static ResultUnit opt_coef_k(Cli *cli, const char *flag, const char *value) {
     cli->cfg.gob_recult_coef_k = v;
     return OK_UNIT(ResultUnit);
 }
+static ResultUnit opt_yanus_timeout(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->cfg.yanus_attempts);
+}
 
 static void print_progress(void *ctx, size_t steps, size_t unsat) {
     (void)ctx;
@@ -237,6 +241,7 @@ static const OptSpec OPTS[] = {
     { "-play-baseline", opt_play_baseline }, { "--play-baseline", opt_play_baseline },
     { "-set-baseline", opt_set_baseline },   { "--set-baseline", opt_set_baseline },
     { "-coef-k", opt_coef_k },               { "--coef-k", opt_coef_k },
+    { "-timeout", opt_yanus_timeout },       { "--timeout", opt_yanus_timeout },
 };
 
 static void usage(void) {
@@ -245,13 +250,14 @@ static void usage(void) {
         "                      [--strategy ranked|greedy|random] [--progress N] [--out FILE]\n"
         "                      [--mode plain|groups] [--max-groups 1..1024] [--merge free|directed]\n"
         "                      [--diversify N] [--group-len N]\n"
-        "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|cascade|neighborhood|neighborhood0]\n"
+        "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|cascade|neighborhood|neighborhood0|yanus]\n"
         "                      [--terminator-rounds N] [--terminator-order forward|reverse|random]\n"
         "                      [--neighborhood-timeout MS] [--neighborhood-start most|least|random]\n"
         "                      [-allow P]\n"
         "                      [-deep-dive VARS NODES]\n"
         "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping]\n"
-        "                      [-play-baseline P] [-set-baseline N] [-coef-k K]\n");
+        "                      [-play-baseline P] [-set-baseline N] [-coef-k K]\n"
+        "                      [-timeout N]  (Yanus random-expansion attempts, 0 = glowest only)\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {

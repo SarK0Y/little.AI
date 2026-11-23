@@ -202,6 +202,7 @@ ResultGroup group_solve(const Cnf *cnf, const SolverConfig *cfg, const GroupConf
     /* ---- formation: each new group = ALL clauses rogue after applying the previous ones ---- */
     if (cfg->init == INIT_RAREST) { if (!solver_init_rarest(full)) NOMEM(); }
     else if (cfg->init == INIT_GLOWEST) { if (!solver_init_glowest(full)) NOMEM(); }
+    else if (cfg->init == INIT_YANUS) { if (!solver_init_yanus(full, cfg)) NOMEM(); }
     else if (cfg->init == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(full)) NOMEM(); }
     else if (cfg->init == INIT_GOB) { if (!solver_init_gob(full)) NOMEM(); }
     else if (cfg->init == INIT_GOB_SIGN) { if (!solver_init_gob_sign(full)) NOMEM(); }

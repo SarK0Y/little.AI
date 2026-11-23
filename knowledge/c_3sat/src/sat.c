@@ -393,6 +393,7 @@ SolverConfig solver_config_default(void) {
         .baddymove_allow = 0.0,
         .gob_recult_play = 0, .gob_recult_set = 0.0, .gob_recult_has_set = false,
         .gob_recult_coef_k = 2,
+        .yanus_attempts = 8,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -761,6 +762,69 @@ bool solver_init_rarest(Solver *s) { return init_order(s, ORDER_RAREST); }
 bool solver_init_glowest(Solver *s) { return init_order(s, ORDER_GLOWEST); }
 bool solver_init_min_overlap(Solver *s) { return init_order(s, ORDER_MIN_OVERLAP); }
 
+bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars, nc = cnf->n_clauses;
+    size_t attempts = cfg ? cfg->yanus_attempts : solver_config_default().yanus_attempts;
+    if (!nv || attempts == 0) return solver_init_glowest(s);
+
+    bool *best = malloc(nv * sizeof *best);
+    if (!best) return false;
+    size_t best_rogue = SIZE_MAX;
+    bool found = false, fail = false;
+
+    for (size_t attempt = 0; attempt < attempts && !fail && best_rogue > 0; attempt++) {
+        size_t d = 1 + rng_index(&s->rng, nv);
+        size_t r = 1 + rng_index(&s->rng, nv);
+        size_t need = cnf->off[nc] + 7 * r;
+        Cnf ex = { .n_vars = nv + d, .n_clauses = nc + 3 * r,
+                   .off = malloc((nc + 3 * r + 1) * sizeof *ex.off),
+                   .lits = malloc((need ? need : 1) * sizeof *ex.lits) };
+        if (!ex.off || !ex.lits) { fail = true; goto next; }
+        size_t pos = 0;
+        ex.off[0] = 0;
+        for (size_t ci = 0; ci < nc; ci++) {
+            size_t len = cnf_clause_len(cnf, ci);
+            memcpy(ex.lits + pos, cnf_clause(cnf, ci), len * sizeof *ex.lits);
+            pos += len;
+            ex.off[ci + 1] = pos;
+        }
+        for (size_t i = 0; i < r; i++) {
+            size_t x = rng_index(&s->rng, nv);
+            size_t ya = nv + rng_index(&s->rng, d);
+            size_t yb = nv + rng_index(&s->rng, d);
+            size_t ci = nc + 3 * i;
+            ex.lits[pos++] = (Lit){ (uint32_t)ya, false };
+            ex.lits[pos++] = (Lit){ (uint32_t)x, true };
+            ex.off[ci + 1] = pos;
+            ex.lits[pos++] = (Lit){ (uint32_t)yb, false };
+            ex.lits[pos++] = (Lit){ (uint32_t)x, true };
+            ex.off[ci + 2] = pos;
+            ex.lits[pos++] = (Lit){ (uint32_t)ya, true };
+            ex.lits[pos++] = (Lit){ (uint32_t)yb, true };
+            ex.lits[pos++] = (Lit){ (uint32_t)x, false };
+            ex.off[ci + 3] = pos;
+        }
+        ResultSolver rs = solver_new(&ex, rng_next_u64(&s->rng));
+        if (!rs.ok) { fail = true; goto next; }
+        if (!solver_init_glowest(rs.val)) { solver_free(rs.val); fail = true; goto next; }
+        solver_set_assignment(s, rs.val->assignment);
+        solver_free(rs.val);
+        if (!found || s->n_rogue < best_rogue) {
+            best_rogue = s->n_rogue;
+            memcpy(best, s->assignment, nv);
+            found = true;
+        }
+next:
+        cnf_free(&ex);
+    }
+    if (fail) { free(best); return false; }
+    if (found) solver_set_assignment(s, best);
+    else if (!solver_init_glowest(s)) { free(best); return false; }
+    free(best);
+    return true;
+}
+
 bool solver_init_reverse(Solver *s, InitMode init) {
     Cnf neg = {0};
     if (!cnf_negate(s->cnf, &neg)) return false;
@@ -1005,6 +1069,8 @@ bool solver_init_gob_recult(Solver *s, const SolverConfig *cfg) {
 
     size_t coef_k = cfg ? cfg->gob_recult_coef_k : solver_config_default().gob_recult_coef_k;
     size_t span = nc ? nc / 4 + 1 : 1;
+    /* shortcut: span capped at 128, widen if large instances need a bigger window */
+    if (span > 128) span = 128;
     uint64_t radius_u = (uint64_t)coef_k * (uint64_t)span;
     if (radius_u > (uint64_t)LLONG_MAX) radius_u = (uint64_t)LLONG_MAX;
     long long radius = (long long)radius_u;
@@ -1634,6 +1700,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_rarest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GLOWEST) {
             if (!solver_init_glowest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_YANUS) {
+            if (!solver_init_yanus(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_MIN_OVERLAP) {
             if (!solver_init_min_overlap(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GOB) {
