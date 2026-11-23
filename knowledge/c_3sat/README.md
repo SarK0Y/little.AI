@@ -100,9 +100,12 @@ Restart 0 starts from a chosen init (later restarts are always random):
   solution misses.
 - `--init gob-recult`: the clause system augmented with tail variables `Y` on the
   right-hand side (recultivation), solved by Kaczmarz; `x` is decoded by sign and
-  repaired and `Y` is dropped. `-play-baseline P` sets the tail-sum baseline to
-  `rng mod P` (`P >= 1`), `-set-baseline N` fixes it to `N` (if both given,
-  `-set-baseline` wins); default baseline is 0.
+  repaired and `Y` is dropped. By default a BaddyMove partial assignment gives a
+  crude baseline `Σ b_i` (each literal 1 if true, else 0); the tail-sum baseline `B`
+  is then brute-forced over `[-k·|crude|, k·|crude|]` (`-coef-k K`, default 2),
+  keeping the decoded assignment with the fewest rogue clauses. `-play-baseline P`
+  sets `B = rng mod P` (`P >= 1`), `-set-baseline N` fixes `B = N` (if both given,
+  `-set-baseline` wins); either explicit flag skips the brute-force.
 - `--init reverse-rarest|reverse-glowest|reverse-min-overlapping`: negate every
   clause, run the named constructive start on the reversed system, negate the
   assignment back (“vice versa”).
@@ -297,10 +300,15 @@ where `n` is the number of filtered equations, `k` is chosen once per init from
 the solver RNG and rounded to an even value, and `h = k/2` (indices modulo `n`).
 `x` and `Y` (all init 0) are solved together by cyclic Kaczmarz projections
 (`GOB_SWEEPS` passes) plus, each sweep, a coupling projection enforcing
-`Σ_i Y_i = B`. `B` (the tail-sum baseline) is 0 by default; `-play-baseline P`
-sets `B = rng mod P` (`P >= 1`, drawn from the solver RNG), and `-set-baseline N`
-fixes `B = N` (takes precedence over `-play-baseline` if both are given). Only
-`x` is kept: decoded by sign and repaired by `gob_repair`, like `gob-sign`.
+`Σ_i Y_i = B`. By default `B` is found by brute-force: a BaddyMove partial
+assignment supplies a crude baseline `Σ_i b_i`, where each literal of clause `i`
+becomes 1 if true under that assignment and 0 otherwise; every integer `B` in
+`[-k·|crude|, k·|crude|]` is tried (`-coef-k K`, default 2) and the decode with the
+fewest rogue clauses is kept. `-play-baseline P` instead sets `B = rng mod P`
+(`P >= 1`, drawn from the solver RNG), and `-set-baseline N` fixes `B = N` (takes
+precedence over `-play-baseline` if both are given); either explicit flag skips the
+brute-force. Only `x` is kept: decoded by sign and repaired by `gob_repair`, like
+`gob-sign`.
 
 ### Vice versa (`reverse-*`)
 
@@ -556,7 +564,7 @@ reporting tool, not a faster solver. The plain solver stays the default.
 - Extra options: `--strategy`, `--progress`, `--mode`, `--max-groups`, `--merge`, `--diversify`,
   `--group-len` (also accepted as `-group-len`), `--init`, `--terminator-rounds`,
   `--terminator-order`, `--neighborhood-timeout`, `--neighborhood-start`,
-  `-deep-dive`, `-pre-cook`, `-play-baseline`, `-set-baseline`.
+  `-deep-dive`, `-pre-cook`, `-play-baseline`, `-set-baseline`, `-coef-k`.
 
 ## Layout
 

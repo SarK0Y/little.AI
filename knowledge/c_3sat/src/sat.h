@@ -115,6 +115,7 @@ typedef enum {
     INIT_LIKHO,     /* pre-cooked start (all false by default), then a one-flip-per-variable repair pass */
     INIT_TERMINATOR, /* majority start, then rounds of flips where make > break */
     INIT_BADDYMOVE, /* like terminator, but randomly allows bad flips with -allow prob */
+    INIT_CASCADE,   /* ratio M/m vs _M/_m assignment by clause/alternative counts */
     INIT_NEIGHBORHOOD, /* light popularity/backtracking neighborhood search */
     INIT_NEIGHBORHOOD0, /* full neighborhood search per spec */
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
@@ -146,6 +147,7 @@ typedef struct {
     size_t gob_recult_play;     /* -play-baseline P: baseline = rng mod P (0 = off) */
     double gob_recult_set;      /* -set-baseline N: baseline = N */
     bool gob_recult_has_set;    /* true when -set-baseline was given */
+    size_t gob_recult_coef_k;   /* -coef-k K: auto baseline range [-K*|crude|, K*|crude|] */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -247,6 +249,8 @@ bool solver_init_terminator_pre(Solver *s, const SolverConfig *cfg);
 /* BaddyMove: terminator-like rounds, but bad moves (break>make) allowed with cfg->baddymove_allow. */
 void solver_baddymove(Solver *s, size_t rounds, TerminatorOrder order, double allow);
 bool solver_init_baddymove(Solver *s, const SolverConfig *cfg);
+/* Cascade: for each var, compare sat-clause/alternative ratio for x vs !x. */
+void solver_cascade(Solver *s);
 /* Neighborhood: popularity-ordered var growth with neighborhood completion and
  * timed backtracking. Returns false only on allocation failure. */
 bool solver_init_neighborhood(Solver *s, const SolverConfig *cfg);

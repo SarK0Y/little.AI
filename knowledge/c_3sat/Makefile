@@ -9,11 +9,11 @@ build: $(BUILD)/3sat
 
 $(BUILD)/3sat: src/main.c $(SRC) src/sat.h src/groups.h src/result.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/main.c $(SRC)
+	$(CC) $(CFLAGS) -o $@ src/main.c $(SRC) -lm
 
 $(BUILD)/test_sat: tests/test_sat.c $(SRC) src/sat.h src/groups.h src/result.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -g -Isrc -o $@ tests/test_sat.c $(SRC)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -g -Isrc -o $@ tests/test_sat.c $(SRC) -lm
 
 test: $(BUILD)/test_sat
 	./$(BUILD)/test_sat
@@ -28,14 +28,14 @@ bench: build
 
 $(BUILD)/bench_rarest: tools/bench_rarest.c $(SRC) src/sat.h src/groups.h src/result.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Isrc -o $@ tools/bench_rarest.c $(SRC)
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/bench_rarest.c $(SRC) -lm
 
 # gob/gob-sign projection diagnostics (see README, "Projection diagnostics")
 probe: $(BUILD)/probe
 
 $(BUILD)/probe: tools/probe.c $(SRC) src/sat.h src/groups.h src/result.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Isrc -o $@ tools/probe.c $(SRC)
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/probe.c $(SRC) -lm
 
 # make bench-rarest ARGS="1000 3.5 10 200000 9"
 # make bench-rarest ARGS="tests/fixtures/small_sat.cnf 100000 20"

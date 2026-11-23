@@ -573,6 +573,68 @@ static void test_init_glowest_hand_checked(void) {
     solver_free(s); cnf_free(&e);
 }
 
+static void test_terminator_hand_checked(void) {
+    /* Majority start leaves 1 unsat; terminator hill-climbs but may not solve. */
+    Cnf c = must_parse("p cnf 3 3\n1 2 0\n-1 2 0\n-2 3 0\n");
+    Solver *s = must_solver(&c, 1);
+    SolverConfig cfg = solver_config_default();
+    cfg.init = INIT_TERMINATOR;
+    cfg.terminator_rounds = 16;
+    cfg.terminator_order = TERM_FORWARD;
+    cfg.max_steps = 0; cfg.restarts = 0;
+    ResultSolve r = solver_solve(s, &cfg);
+    CHECK(r.ok);
+    if (r.ok) {
+        if (r.val.status == SOLVE_SAT) CHECK(verify(&c, r.val.assignment, r.val.n_vars));
+        solve_result_free(&r.val);
+    }
+    /* assignment is valid (all vars set) */
+    CHECK(solver_unsatisfied_count(s) <= 3);
+    solver_free(s); cnf_free(&c);
+}
+
+static void test_terminator_properties(void) {
+    Rng rng = rng_new(1234);
+    for (int t = 0; t < 60; t++) {
+        Cnf c = random_cnf(30, 120, rng_next_u64(&rng));
+        SolverConfig cfg = solver_config_default();
+        cfg.init = INIT_TERMINATOR;
+        cfg.terminator_rounds = 16;
+        cfg.max_steps = 0; cfg.restarts = 0;
+        Solver *s = must_solver(&c, 1);
+        ResultSolve r = solver_solve(s, &cfg);
+        CHECK(r.ok);
+        if (r.ok) {
+            if (r.val.status == SOLVE_SAT) {
+                CHECK(verify(&c, r.val.assignment, r.val.n_vars));
+                CHECK(solver_unsatisfied_count(s) == 0);
+            }
+            solve_result_free(&r.val);
+        }
+        solver_free(s); cnf_free(&c);
+    }
+}
+
+static void test_glowest_likho_terminator_solve(void) {
+    Rng rng = rng_new(777);
+    for (int t = 0; t < 40; t++) {
+        Cnf c = random_cnf(25, 100, rng_next_u64(&rng));
+        InitMode modes[] = { INIT_GLOWEST, INIT_LIKHO, INIT_TERMINATOR };
+        for (int mi = 0; mi < 3; mi++) {
+            SolverConfig cfg = solver_config_default();
+            cfg.init = modes[mi];
+            cfg.max_steps = 2000;
+            cfg.restarts = 5;
+            Solver *s = must_solver(&c, 1);
+            ResultSolve r = solver_solve(s, &cfg);
+            CHECK(r.ok);
+            if (r.ok) { if (r.val.status == SOLVE_SAT) { CHECK(verify(&c, r.val.assignment, r.val.n_vars)); CHECK(solver_unsatisfied_count(s) == 0); } solve_result_free(&r.val); }
+            solver_free(s);
+        }
+        cnf_free(&c);
+    }
+}
+
 static void test_init_min_overlap_hand_checked(void) {
     /* Step 0 is glowest's pick: x4 and x5 both have max(#x,#!x)=3, so x4 (lower
      * id) goes first and, all-negative, goes false. That satisfies clauses 1, 4
@@ -1454,6 +1516,9 @@ int main(void) {
     test_likho_strictly_improves_when_a_free_move_exists();
     test_likho_general_cnf_and_edge_cases();
     test_likho_in_group_mode();
+    test_terminator_hand_checked();
+    test_terminator_properties();
+    test_glowest_likho_terminator_solve();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

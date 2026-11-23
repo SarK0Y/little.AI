@@ -1,6 +1,7 @@
 #include "sat.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -391,6 +392,7 @@ SolverConfig solver_config_default(void) {
         .neighborhood_start = NB_MOST,
         .baddymove_allow = 0.0,
         .gob_recult_play = 0, .gob_recult_set = 0.0, .gob_recult_has_set = false,
+        .gob_recult_coef_k = 2,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -906,66 +908,124 @@ bool solver_init_gob_square(Solver *s, GobSquareCheck *check) {
 }
 
 
-bool solver_init_gob_recult(Solver *s, const SolverConfig *cfg) {
-    Cnf filtered = {0};
-    if (!no_twins(s->cnf, &filtered)) return false;
-    size_t nv = s->cnf->n_vars, nc = filtered.n_clauses;
-    size_t nx = nv ? nv : 1, ny = nc ? nc : 1;
-    double *x = calloc(nx, sizeof *x);
-    double *y = calloc(ny, sizeof *y);
-    bool *a = malloc(nx * sizeof *a);
-    if (!x || !y || !a) { free(x); free(y); free(a); cnf_free(&filtered); return false; }
-
-    double baseline = 0.0; /* target sum of tail variables Y_i */
-    if (cfg) {
-        if (cfg->gob_recult_has_set) baseline = cfg->gob_recult_set;
-        else if (cfg->gob_recult_play > 0)
-            baseline = (double)(rng_next_u64(&s->rng) % cfg->gob_recult_play);
-    }
-
+static void gob_recult_kh(size_t nc, Rng *rng, size_t *k_out, size_t *h_out) {
     size_t k = 2;
     if (nc > 0) {
-        k = (size_t)(rng_next_u64(&s->rng) % nc);
+        k = (size_t)rng_next_u64(rng) % nc;
         if (k == 0) k = 1 % nc;
         if (k == 0) k = 1;
-        if (k % 2 == 1) k = (k + 1 <= nc ? k + 1 : k - 1); /* round odd k */
+        if (k % 2 == 1) k = (k + 1 <= nc ? k + 1 : k - 1);
         if (k == 0) k = 2;
     }
-    size_t h = k / 2; /* (i + h) mod nc tail index */
+    *k_out = k; *h_out = k / 2;
+}
 
+static size_t gob_recult_crude_baseline(const Cnf *filtered, const bool *a) {
+    size_t crude = 0;
+    for (size_t ci = 0; ci < filtered->n_clauses; ci++) {
+        const Lit *cl = cnf_clause(filtered, ci);
+        size_t len = cnf_clause_len(filtered, ci);
+        for (size_t t = 0; t < len; t++) {
+            bool literal_true = cl[t].positive ? a[cl[t].var] : !a[cl[t].var];
+            crude += literal_true ? 1 : 0;
+        }
+    }
+    return crude;
+}
+
+static void gob_recult_run(const Cnf *filtered, size_t nv, size_t nc, size_t k, size_t h,
+                           double baseline, double *x, double *y) {
+    size_t nx = nv ? nv : 1, ny = nc ? nc : 1;
+    for (size_t i = 0; i < nx; i++) x[i] = 0.0;
+    for (size_t i = 0; i < ny; i++) y[i] = 0.0;
     for (size_t sweep = 0; sweep < GOB_SWEEPS; sweep++) {
         for (size_t ci = 0; ci < nc; ci++) {
-            const Lit *cl = cnf_clause(&filtered, ci);
-            size_t len = cnf_clause_len(&filtered, ci);
+            const Lit *cl = cnf_clause(filtered, ci);
+            size_t len = cnf_clause_len(filtered, ci);
             size_t j1 = nc ? (ci + k) % nc : 0;
             size_t j2 = nc ? (ci + h) % nc : 0;
-            double s1 = ((ci + k) % 2 == 0) ? 1.0 : -1.0; /* (-1)^(i+k) */
+            double s1 = ((ci + k) % 2 == 0) ? 1.0 : -1.0;
             double sum = 0;
             for (size_t t = 0; t < len; t++)
                 sum += cl[t].positive ? x[cl[t].var] : -x[cl[t].var];
             double rhs = 1.0 + y[ci] + s1 * y[j1] + y[j2];
-            double dot = sum - rhs; /* a·z - b */
-            double anorm = (double)len + 3.0;
-            double step = dot / anorm;
+            double step = (sum - rhs) / ((double)len + 3.0);
             if (step == 0.0) continue;
             for (size_t t = 0; t < len; t++)
                 x[cl[t].var] -= step * (cl[t].positive ? 1.0 : -1.0);
-            y[ci] -= step * (-1.0);
-            y[j1] -= step * (-s1);
-            y[j2] -= step * (-1.0);
+            y[ci] -= step * (-1.0); y[j1] -= step * (-s1); y[j2] -= step * (-1.0);
         }
-        if (nc > 0) { /* coupling: sum Y_i = baseline */
-            double sumy = 0;
-            for (size_t i = 0; i < nc; i++) sumy += y[i];
+        if (nc > 0) {
+            double sumy = 0; for (size_t i = 0; i < nc; i++) sumy += y[i];
             double step = (sumy - baseline) / (double)nc;
-            if (step != 0.0)
-                for (size_t i = 0; i < nc; i++) y[i] -= step;
+            if (step != 0.0) for (size_t i = 0; i < nc; i++) y[i] -= step;
         }
     }
-    gob_decode_sign(x, a, nv);
-    solver_set_assignment(s, a);
-    gob_repair(s);
-    free(x); free(y); free(a); cnf_free(&filtered);
+}
+
+bool solver_init_gob_recult(Solver *s, const SolverConfig *cfg) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars;
+    Cnf filtered = {0};
+    if (!no_twins(cnf, &filtered)) return false;
+    size_t nc = filtered.n_clauses;
+    size_t nx = nv ? nv : 1, ny = nc ? nc : 1;
+    double *x = calloc(nx, sizeof *x), *y = calloc(ny, sizeof *y);
+    bool *a = malloc(nx), *best_a = malloc(nx);
+    if (!x || !y || !a || !best_a) { free(x); free(y); free(a); free(best_a); cnf_free(&filtered); return false; }
+
+    size_t k, h;
+    gob_recult_kh(nc, &s->rng, &k, &h);
+
+    bool auto_baseline = !cfg || (!cfg->gob_recult_has_set && cfg->gob_recult_play == 0);
+    if (!auto_baseline) {
+        double baseline = cfg->gob_recult_has_set ? cfg->gob_recult_set
+                          : (double)(rng_next_u64(&s->rng) % cfg->gob_recult_play);
+        gob_recult_run(&filtered, nv, nc, k, h, baseline, x, y);
+        gob_decode_sign(x, a, nv);
+        solver_set_assignment(s, a); gob_repair(s);
+        free(x); free(y); free(a); free(best_a); cnf_free(&filtered); return true;
+    }
+
+    /* Crude baseline: sum of b_i over the linearized clauses, where each literal
+     * is 1 when true under BaddyMove's partial assignment, else 0. */
+    SolverConfig bcfg = cfg ? *cfg : solver_config_default();
+    bcfg.init = INIT_BADDYMOVE; bcfg.likho_pre_cook = INIT_NEIGHBORHOOD0;
+    bcfg.max_steps = 0; bcfg.restarts = 0; bcfg.terminator_rounds = 32;
+    bcfg.terminator_order = TERM_RANDOM; bcfg.baddymove_allow = 0.1;
+    bcfg.neighborhood_timeout_ms = 1000;
+    size_t crude_baseline = 0;
+    ResultSolver brs = solver_new(cnf, cfg && cfg->seed ? cfg->seed : 0x9e3779b97f4a7c15ULL);
+    if (brs.ok) {
+        if (solver_init_baddymove(brs.val, &bcfg))
+            crude_baseline = gob_recult_crude_baseline(&filtered, solver_assignment(brs.val));
+        solver_free(brs.val);
+    }
+
+    size_t coef_k = cfg ? cfg->gob_recult_coef_k : solver_config_default().gob_recult_coef_k;
+    uint64_t radius_u = (uint64_t)coef_k * (uint64_t)crude_baseline;
+    if (radius_u > (uint64_t)LLONG_MAX) radius_u = (uint64_t)LLONG_MAX;
+    long long radius = (long long)radius_u;
+
+    size_t best_unsat = SIZE_MAX; bool found = false;
+    for (long long d = 0; d <= radius && best_unsat > 0; d++) {
+        long long cands[3] = { 0, -d, d };
+        int ntry = (d == 0) ? 1 : 3;
+        for (int t = 0; t < ntry; t++) {
+            gob_recult_run(&filtered, nv, nc, k, h, (double)cands[t], x, y);
+            gob_decode_sign(x, a, nv);
+            solver_set_assignment(s, a); gob_repair(s);
+            if (!found || s->n_rogue < best_unsat) {
+                best_unsat = s->n_rogue;
+                memcpy(best_a, s->assignment, nv * sizeof *best_a);
+                found = true;
+                if (best_unsat == 0) break;
+            }
+        }
+    }
+    if (found) { solver_set_assignment(s, best_a); gob_repair(s); }
+    else { gob_recult_run(&filtered, nv, nc, k, h, 0.0, x, y); gob_decode_sign(x, a, nv); solver_set_assignment(s, a); gob_repair(s); }
+    free(x); free(y); free(a); free(best_a); cnf_free(&filtered);
     return true;
 }
 
@@ -1592,6 +1652,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_terminator_pre(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_BADDYMOVE) {
             if (!solver_init_baddymove(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_CASCADE) {
+            solver_cascade(s);
         } else if (restart == 0 && cfg->init == INIT_NEIGHBORHOOD) {
             if (!solver_init_neighborhood(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_NEIGHBORHOOD0) {
@@ -1737,6 +1799,50 @@ bool solver_init_baddymove(Solver *s, const SolverConfig *cfg) {
     solver_baddymove(s, cfg ? cfg->terminator_rounds : 16, cfg ? cfg->terminator_order : TERM_FORWARD,
                      cfg ? cfg->baddymove_allow : 0.0);
     return true;
+}
+
+void solver_cascade(Solver *s) {
+    const Cnf *cnf = s->cnf;
+    size_t nv = cnf->n_vars;
+    size_t *seen = calloc(nv ? nv : 1, sizeof *seen);
+    if (!seen) return; /* shortcut: alloc failure, keep assignment as-is */
+    size_t stamp = 0;
+    for (size_t v = 0; v < nv; v++) {
+        size_t M = 0, _M = 0, m = 0, _m = 0;
+        /* M/m: clauses sat by x=v true, m = distinct vars that can sat same clauses */
+        stamp++; if (!stamp) { memset(seen, 0, (nv ? nv : 1) * sizeof *seen); stamp = 1; }
+        for (size_t i = s->occ_off[v]; i < s->occ_off[v + 1]; i++) {
+            Occ o = s->occ[i];
+            if (!o.positive) continue;
+            M++;
+            const Lit *cl = cnf_clause(cnf, o.clause);
+            size_t len = cnf_clause_len(cnf, o.clause);
+            for (size_t k = 0; k < len; k++) {
+                size_t u = cl[k].var;
+                if (u == v || seen[u] == stamp) continue;
+                seen[u] = stamp; m++;
+            }
+        }
+        /* _M/_m: clauses sat by x=v false */
+        stamp++; if (!stamp) { memset(seen, 0, (nv ? nv : 1) * sizeof *seen); stamp = 1; }
+        for (size_t i = s->occ_off[v]; i < s->occ_off[v + 1]; i++) {
+            Occ o = s->occ[i];
+            if (o.positive) continue;
+            _M++;
+            const Lit *cl = cnf_clause(cnf, o.clause);
+            size_t len = cnf_clause_len(cnf, o.clause);
+            for (size_t k = 0; k < len; k++) {
+                size_t u = cl[k].var;
+                if (u == v || seen[u] == stamp) continue;
+                seen[u] = stamp; _m++;
+            }
+        }
+        double left = (double)M / (double)(m ? m : 1);
+        double right = (double)_M / (double)(_m ? _m : 1);
+        s->assignment[v] = left > right;
+    }
+    free(seen);
+    rebuild_counts(s);
 }
 
 void solver_init_majority(Solver *s) { random_assignment(s, true); }

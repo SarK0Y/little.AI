@@ -110,9 +110,10 @@ static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "likho") == 0) cli->cfg.init = INIT_LIKHO;
     else if (strcmp(value, "terminator") == 0) cli->cfg.init = INIT_TERMINATOR;
     else if (strcmp(value, "baddymove") == 0) cli->cfg.init = INIT_BADDYMOVE;
+    else if (strcmp(value, "cascade") == 0) cli->cfg.init = INIT_CASCADE;
     else if (strcmp(value, "neighborhood") == 0) cli->cfg.init = INIT_NEIGHBORHOOD;
     else if (strcmp(value, "neighborhood0") == 0) cli->cfg.init = INIT_NEIGHBORHOOD0;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|neighborhood|neighborhood0)", flag, value);
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|cascade|neighborhood|neighborhood0)", flag, value);
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
@@ -200,6 +201,14 @@ static ResultUnit opt_set_baseline(Cli *cli, const char *flag, const char *value
     return OK_UNIT(ResultUnit);
 }
 
+static ResultUnit opt_coef_k(Cli *cli, const char *flag, const char *value) {
+    size_t v;
+    TRY0(ResultUnit, parse_size(flag, value, &v));
+    if (v < 1) return ERRF(ResultUnit, ERR_USAGE, "%s must be >= 1", flag);
+    cli->cfg.gob_recult_coef_k = v;
+    return OK_UNIT(ResultUnit);
+}
+
 static void print_progress(void *ctx, size_t steps, size_t unsat) {
     (void)ctx;
     fprintf(stderr, "[%zu steps] %zu unsatisfied\n", steps, unsat);
@@ -227,6 +236,7 @@ static const OptSpec OPTS[] = {
     { "-allow", opt_baddymove_allow }, { "--allow", opt_baddymove_allow },
     { "-play-baseline", opt_play_baseline }, { "--play-baseline", opt_play_baseline },
     { "-set-baseline", opt_set_baseline },   { "--set-baseline", opt_set_baseline },
+    { "-coef-k", opt_coef_k },               { "--coef-k", opt_coef_k },
 };
 
 static void usage(void) {
@@ -235,13 +245,13 @@ static void usage(void) {
         "                      [--strategy ranked|greedy|random] [--progress N] [--out FILE]\n"
         "                      [--mode plain|groups] [--max-groups 1..1024] [--merge free|directed]\n"
         "                      [--diversify N] [--group-len N]\n"
-        "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|neighborhood|neighborhood0]\n"
+        "                      [--init majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|cascade|neighborhood|neighborhood0]\n"
         "                      [--terminator-rounds N] [--terminator-order forward|reverse|random]\n"
         "                      [--neighborhood-timeout MS] [--neighborhood-start most|least|random]\n"
         "                      [-allow P]\n"
         "                      [-deep-dive VARS NODES]\n"
         "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping]\n"
-        "                      [-play-baseline P] [-set-baseline N]\n");
+        "                      [-play-baseline P] [-set-baseline N] [-coef-k K]\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
