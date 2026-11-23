@@ -592,6 +592,15 @@ static void test_init_yanus(void) {
     CHECK(memcmp(solver_assignment(y), solver_assignment(g), c.n_vars) == 0);
     solver_free(y); solver_free(g);
 
+    cfg.yanus_attempts = 2;   /* -saturate fixes D from the clause count */
+    cfg.yanus_saturate = 0.5;
+    Solver *p = must_solver(&c, 55), *q = must_solver(&c, 55);
+    CHECK(solver_init_yanus(p, &cfg));
+    CHECK(solver_init_yanus(q, &cfg));
+    CHECK(memcmp(solver_assignment(p), solver_assignment(q), c.n_vars) == 0);
+    solver_free(p); solver_free(q);
+    cfg.yanus_saturate = 0.0;
+
     cfg.yanus_attempts = 2;   /* solver_solve dispatch */
     cfg.max_steps = 0;
     cfg.restarts = 0;

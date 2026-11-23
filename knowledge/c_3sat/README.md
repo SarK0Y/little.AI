@@ -91,9 +91,10 @@ Restart 0 starts from a chosen init (later restarts are always random):
 - `--init rarest`: deterministic constructive start (no RNG), rarest variables first.
 - `--init glowest`: deterministic constructive start, most frequent variables first.
 - `--init yanus`: random variable-expansion restarts of glowest; each attempt
-  adds `D` fresh variables and `R` random definitions `x = y_a ∨ y_b`, runs
-  glowest on the expanded CNF, and maps the original variables back. `D` and `R`
-  are drawn from the RNG each attempt; `-timeout N` (default 8) caps attempts
+  adds `D` fresh variables and `R` random definitions `x = (±y_a) ∨ (±y_b)`
+  (signs picked from the RNG), runs glowest on the expanded CNF, and maps the
+  original variables back. `D` and `R` are drawn from the RNG each attempt
+  (unless `-saturate F` fixes `D = F · n_clauses`); `-timeout N` (default 8) caps attempts
   (`0` = plain glowest). Early-exits on SAT, otherwise keeps the mapped start
   with the fewest rogue clauses.
 - `--init min-overlapping`: deterministic constructive start, first the most
@@ -165,12 +166,15 @@ They differ only in which unset variable is picked next:
 
 `--init yanus` changes the formula instead of the walk. Each attempt draws a
 fresh `D ∈ [1,n]` and `R ∈ [1,n]` from the solver RNG, appends `D` variables,
-and picks `R` random definitions `x = y_a ∨ y_b` (`x` an original variable,
-`y_a,y_b` fresh). A definition is three clauses: `(¬y_a ∨ x)`, `(¬y_b ∨ x)` and
-`(y_a ∨ y_b ∨ ¬x)`. Glowest runs on that expanded CNF; its values for the
+and picks `R` random definitions `x = (±y_a) ∨ (±y_b)` (`x` an original
+variable, `y_a,y_b` fresh, signs independent coin flips). With literals `l_a,l_b`
+a definition is three clauses: `(¬l_a ∨ x)`, `(¬l_b ∨ x)` and
+`(l_a ∨ l_b ∨ ¬x)`. Glowest runs on that expanded CNF; its values for the
 original `n` variables are copied back and scored on the original formula.
 The best start wins, and a zero-rogue mapped assignment ends the loop early.
 `-timeout N` sets the attempt budget (default 8; `0` falls back to glowest).
+`-saturate F` overrides the random `D` with `F · n_clauses` extra variables
+(`F = 0` keeps the RNG choice); `R` stays random.
 Both `plain` and `groups` mode dispatch to it.
 
 ### Gob
@@ -630,7 +634,7 @@ reporting tool, not a faster solver. The plain solver stays the default.
   `--group-len` (also accepted as `-group-len`), `--init`, `--terminator-rounds`,
   `--terminator-order`, `--neighborhood-timeout`, `--neighborhood-start`,
   `-deep-dive`, `-pre-cook`, `-play-baseline`, `-set-baseline`, `-coef-k`,
-  `-timeout`.
+  `-timeout`, `-saturate`.
 
 ## Layout
 

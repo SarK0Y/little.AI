@@ -394,6 +394,7 @@ SolverConfig solver_config_default(void) {
         .gob_recult_play = 0, .gob_recult_set = 0.0, .gob_recult_has_set = false,
         .gob_recult_coef_k = 2,
         .yanus_attempts = 8,
+        .yanus_saturate = 0.0,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -772,9 +773,16 @@ bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
     if (!best) return false;
     size_t best_rogue = SIZE_MAX;
     bool found = false, fail = false;
+    double saturate = cfg ? cfg->yanus_saturate : solver_config_default().yanus_saturate;
 
     for (size_t attempt = 0; attempt < attempts && !fail && best_rogue > 0; attempt++) {
         size_t d = 1 + rng_index(&s->rng, nv);
+        if (saturate > 0.0) {
+            double want = saturate * (double)nc;
+            if (want < 1.0) d = 1;
+            else if (want >= (double)SIZE_MAX) d = SIZE_MAX;
+            else d = (size_t)want;
+        }
         size_t r = 1 + rng_index(&s->rng, nv);
         size_t need = cnf->off[nc] + 7 * r;
         Cnf ex = { .n_vars = nv + d, .n_clauses = nc + 3 * r,
@@ -793,15 +801,16 @@ bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
             size_t x = rng_index(&s->rng, nv);
             size_t ya = nv + rng_index(&s->rng, d);
             size_t yb = nv + rng_index(&s->rng, d);
+            bool pa = rng_bool(&s->rng), pb = rng_bool(&s->rng);
             size_t ci = nc + 3 * i;
-            ex.lits[pos++] = (Lit){ (uint32_t)ya, false };
+            ex.lits[pos++] = (Lit){ (uint32_t)ya, !pa };
             ex.lits[pos++] = (Lit){ (uint32_t)x, true };
             ex.off[ci + 1] = pos;
-            ex.lits[pos++] = (Lit){ (uint32_t)yb, false };
+            ex.lits[pos++] = (Lit){ (uint32_t)yb, !pb };
             ex.lits[pos++] = (Lit){ (uint32_t)x, true };
             ex.off[ci + 2] = pos;
-            ex.lits[pos++] = (Lit){ (uint32_t)ya, true };
-            ex.lits[pos++] = (Lit){ (uint32_t)yb, true };
+            ex.lits[pos++] = (Lit){ (uint32_t)ya, pa };
+            ex.lits[pos++] = (Lit){ (uint32_t)yb, pb };
             ex.lits[pos++] = (Lit){ (uint32_t)x, false };
             ex.off[ci + 3] = pos;
         }

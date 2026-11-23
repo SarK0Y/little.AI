@@ -150,6 +150,7 @@ typedef struct {
     bool gob_recult_has_set;    /* true when -set-baseline was given */
     size_t gob_recult_coef_k;   /* -coef-k K: auto baseline range [-K*|crude|, K*|crude|] */
     size_t yanus_attempts;      /* -timeout N: random expansion attempts (0 = glowest only) */
+    double yanus_saturate;      /* -saturate F: extra vars = F * n_clauses (0 = random) */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -207,9 +208,10 @@ bool solver_init_rarest(Solver *s);
  * counts, satisfied clauses excluded, ties by id). Deterministic, no RNG.
  * false only on allocation failure. */
 bool solver_init_glowest(Solver *s);
-/* Yanus: each attempt adds D fresh variables and R random replacements x = y_a | y_b
- * (defining clauses), runs glowest on the expanded CNF and maps the original
- * variables back. Keeps the mapped assignment with the fewest rogue clauses;
+/* Yanus: each attempt adds D fresh variables and R random replacements
+ * x = (±y_a) | (±y_b) with RNG-picked signs (defining clauses), runs glowest
+ * on the expanded CNF and maps the original variables back. Keeps the mapped
+ * assignment with the fewest rogue clauses;
  * stops early on SAT. cfg->yanus_attempts = 0 falls back to glowest. */
 bool solver_init_yanus(Solver *s, const SolverConfig *cfg);
 /* Same constructive value rule, but the order is: first the most frequent
