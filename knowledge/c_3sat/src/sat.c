@@ -393,8 +393,13 @@ SolverConfig solver_config_default(void) {
         .baddymove_allow = 0.0,
         .gob_recult_play = 0, .gob_recult_set = 0.0, .gob_recult_has_set = false,
         .gob_recult_coef_k = 2,
-        .yanus_attempts = 8,
+        .yanus_attempts = 0,
+        .yanus_timeout_ms = 30,
         .yanus_saturate = 0.0,
+        .yanus_glowest = true,
+        .yanus_terminator = true,
+        .yanus_baddymove = false,
+        .yanus_diving = 0.0,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -763,19 +768,50 @@ bool solver_init_rarest(Solver *s) { return init_order(s, ORDER_RAREST); }
 bool solver_init_glowest(Solver *s) { return init_order(s, ORDER_GLOWEST); }
 bool solver_init_min_overlap(Solver *s) { return init_order(s, ORDER_MIN_OVERLAP); }
 
+static bool nb_timed_out(struct timespec deadline, bool has_deadline) {
+    if (!has_deadline) return false;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec > deadline.tv_sec ||
+           (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
+}
+
 bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
     const Cnf *cnf = s->cnf;
     size_t nv = cnf->n_vars, nc = cnf->n_clauses;
-    size_t attempts = cfg ? cfg->yanus_attempts : solver_config_default().yanus_attempts;
-    if (!nv || attempts == 0) return solver_init_glowest(s);
+    size_t attempts = cfg ? cfg->yanus_attempts : 0;
+    size_t timeout_ms = cfg ? cfg->yanus_timeout_ms : 30;
+    bool use_glowest = cfg ? cfg->yanus_glowest : true;
+    bool use_term = cfg ? cfg->yanus_terminator : true;
+    bool use_bad = cfg ? cfg->yanus_baddymove : false;
+    if (!nv) return solver_init_glowest(s);
+    if (attempts == 0 && timeout_ms == 0) return solver_init_glowest(s);
+    if (!use_glowest && !use_term && !use_bad) return solver_init_glowest(s);
 
     bool *best = malloc(nv * sizeof *best);
     if (!best) return false;
     size_t best_rogue = SIZE_MAX;
     bool found = false, fail = false;
     double saturate = cfg ? cfg->yanus_saturate : solver_config_default().yanus_saturate;
+    double diving = cfg ? cfg->yanus_diving : 0.0;
 
-    for (size_t attempt = 0; attempt < attempts && !fail && best_rogue > 0; attempt++) {
+    /* Accumulated expanded CNF for diving: each attempt adds vars/defs. */
+    Cnf ex = {0};
+    size_t ex_cap_cl = 0, ex_cap_lit = 0;
+    bool ex_init = false;
+    size_t nnv = 0; bool nnv_set = false;
+
+    struct timespec deadline = {0, 0};
+    bool has_deadline = timeout_ms > 0;
+    if (has_deadline) {
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += (time_t)(timeout_ms / 1000);
+        deadline.tv_nsec += (long)((timeout_ms % 1000) * 1000000UL);
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    }
+
+    for (size_t attempt = 0; (attempts == 0 || attempt < attempts) && !fail && best_rogue > 0; attempt++) {
+        if (has_deadline && nb_timed_out(deadline, true)) break;
         size_t d = 1 + rng_index(&s->rng, nv);
         if (saturate > 0.0) {
             double want = saturate * (double)nc;
@@ -783,26 +819,60 @@ bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
             else if (want >= (double)SIZE_MAX) d = SIZE_MAX;
             else d = (size_t)want;
         }
-        size_t r = 1 + rng_index(&s->rng, nv);
-        size_t need = cnf->off[nc] + 7 * r;
-        Cnf ex = { .n_vars = nv + d, .n_clauses = nc + 3 * r,
-                   .off = malloc((nc + 3 * r + 1) * sizeof *ex.off),
-                   .lits = malloc((need ? need : 1) * sizeof *ex.lits) };
-        if (!ex.off || !ex.lits) { fail = true; goto next; }
-        size_t pos = 0;
-        ex.off[0] = 0;
-        for (size_t ci = 0; ci < nc; ci++) {
-            size_t len = cnf_clause_len(cnf, ci);
-            memcpy(ex.lits + pos, cnf_clause(cnf, ci), len * sizeof *ex.lits);
-            pos += len;
-            ex.off[ci + 1] = pos;
+        size_t add = d;
+        if (diving > 0.0) {
+            double next = nnv_set ? (double)nnv * diving : (double)d * diving;
+            if (next < 1.0) break; /* nnv == 0 -> timeout */
+            nnv = next >= (double)SIZE_MAX ? SIZE_MAX : (size_t)next;
+            nnv_set = true;
+            add = nnv;
         }
+        if (!ex_init) {
+            ex_cap_cl = nc + 1; ex_cap_lit = cnf->off[nc] ? cnf->off[nc] : 1;
+            ex.n_vars = nv; ex.n_clauses = nc;
+            ex.off = malloc(ex_cap_cl * sizeof *ex.off);
+            ex.lits = malloc(ex_cap_lit * sizeof *ex.lits);
+            if (!ex.off || !ex.lits) { fail = true; break; }
+            ex.off[0] = 0;
+            for (size_t ci = 0; ci < nc; ci++) {
+                size_t len = cnf_clause_len(cnf, ci);
+                memcpy(ex.lits + ex.off[ci], cnf_clause(cnf, ci), len * sizeof *ex.lits);
+                ex.off[ci + 1] = ex.off[ci] + len;
+            }
+            ex_init = true;
+        }
+        if (diving <= 0.0) { /* non-diving: rebuild fresh each attempt */
+            ex.n_vars = nv; ex.n_clauses = nc;
+        }
+        size_t r = (saturate > 0.0 || diving > 0.0) ? add : 1 + rng_index(&s->rng, nv);
+        size_t new_vars = ex.n_vars + add;
+        size_t new_cl = ex.n_clauses + 3 * r;
+        size_t need_lit = ex.off[ex.n_clauses] + 7 * r;
+        if (new_cl + 1 > ex_cap_cl) {
+            size_t cap = ex_cap_cl ? ex_cap_cl * 2 : new_cl + 1;
+            while (cap < new_cl + 1) cap *= 2;
+            size_t *no = realloc(ex.off, cap * sizeof *no);
+            if (!no) { fail = true; break; }
+            ex.off = no; ex_cap_cl = cap;
+        }
+        if (need_lit > ex_cap_lit) {
+            size_t cap = ex_cap_lit ? ex_cap_lit * 2 : need_lit;
+            while (cap < need_lit) cap *= 2;
+            Lit *nl = realloc(ex.lits, cap * sizeof *nl);
+            if (!nl) { fail = true; break; }
+            ex.lits = nl; ex_cap_lit = cap;
+        }
+        size_t pos = ex.off[ex.n_clauses];
+        size_t base_ci = ex.n_clauses;
+        size_t base_var = ex.n_vars;
+        ex.n_vars = new_vars;
+        ex.n_clauses = new_cl;
         for (size_t i = 0; i < r; i++) {
             size_t x = rng_index(&s->rng, nv);
-            size_t ya = nv + rng_index(&s->rng, d);
-            size_t yb = nv + rng_index(&s->rng, d);
+            size_t ya = base_var + rng_index(&s->rng, add);
+            size_t yb = base_var + rng_index(&s->rng, add);
             bool pa = rng_bool(&s->rng), pb = rng_bool(&s->rng);
-            size_t ci = nc + 3 * i;
+            size_t ci = base_ci + 3 * i;
             ex.lits[pos++] = (Lit){ (uint32_t)ya, !pa };
             ex.lits[pos++] = (Lit){ (uint32_t)x, true };
             ex.off[ci + 1] = pos;
@@ -814,19 +884,32 @@ bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
             ex.lits[pos++] = (Lit){ (uint32_t)x, false };
             ex.off[ci + 3] = pos;
         }
+        ex.off[ex.n_clauses] = pos;
+
         ResultSolver rs = solver_new(&ex, rng_next_u64(&s->rng));
-        if (!rs.ok) { fail = true; goto next; }
-        if (!solver_init_glowest(rs.val)) { solver_free(rs.val); fail = true; goto next; }
+        if (!rs.ok) { fail = true; break; }
+        if (use_glowest) {
+            if (!solver_init_glowest(rs.val)) { solver_free(rs.val); fail = true; break; }
+        } else {
+            for (size_t v = 0; v < ex.n_vars; v++) rs.val->assignment[v] = rng_bool(&rs.val->rng);
+            rebuild_counts(rs.val);
+        }
         solver_set_assignment(s, rs.val->assignment);
         solver_free(rs.val);
+        if (use_bad)
+            solver_baddymove(s, cfg ? cfg->terminator_rounds : 16,
+                             cfg ? cfg->terminator_order : TERM_FORWARD,
+                             cfg ? cfg->baddymove_allow : 0.0);
+        else if (use_term)
+            solver_terminator(s, cfg ? cfg->terminator_rounds : 16,
+                              cfg ? cfg->terminator_order : TERM_FORWARD);
         if (!found || s->n_rogue < best_rogue) {
             best_rogue = s->n_rogue;
             memcpy(best, s->assignment, nv);
             found = true;
         }
-next:
-        cnf_free(&ex);
     }
+    if (ex_init) cnf_free(&ex);
     if (fail) { free(best); return false; }
     if (found) solver_set_assignment(s, best);
     else if (!solver_init_glowest(s)) { free(best); return false; }
@@ -1299,14 +1382,6 @@ typedef struct {
     int8_t tried; /* 1 tried first, 2 tried both */
     int8_t first;
 } NbDecision;
-
-static bool nb_timed_out(struct timespec deadline, bool has_deadline) {
-    if (!has_deadline) return false;
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return now.tv_sec > deadline.tv_sec ||
-           (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
-}
 
 static bool nb_clause_sat(const Cnf *cnf, size_t ci, const int8_t *val) {
     const Lit *cl = cnf_clause(cnf, ci);

@@ -149,8 +149,13 @@ typedef struct {
     double gob_recult_set;      /* -set-baseline N: baseline = N */
     bool gob_recult_has_set;    /* true when -set-baseline was given */
     size_t gob_recult_coef_k;   /* -coef-k K: auto baseline range [-K*|crude|, K*|crude|] */
-    size_t yanus_attempts;      /* -timeout N: random expansion attempts (0 = glowest only) */
-    double yanus_saturate;      /* -saturate F: extra vars = F * n_clauses (0 = random) */
+    size_t yanus_attempts;      /* -rounds N: random expansion attempts (0 = unlimited until timeout) */
+    size_t yanus_timeout_ms;    /* -timeout MS: wall-clock budget (default 30ms) */
+    double yanus_saturate;      /* -saturate F: extra vars D = R = F * n_clauses (0 = random) */
+    bool yanus_glowest;         /* run glowest on expanded CNF (default true) */
+    bool yanus_terminator;      /* hill-climb mapped assignment (default true) */
+    bool yanus_baddymove;       /* hill-climb with bad moves (default false) */
+    double yanus_diving;        /* -diving k: NNV[0]=D*k, NNV[i]=NNV[i-1]*k; 0=off */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;

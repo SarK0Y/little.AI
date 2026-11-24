@@ -94,9 +94,12 @@ Restart 0 starts from a chosen init (later restarts are always random):
   adds `D` fresh variables and `R` random definitions `x = (±y_a) ∨ (±y_b)`
   (signs picked from the RNG), runs glowest on the expanded CNF, and maps the
   original variables back. `D` and `R` are drawn from the RNG each attempt
-  (unless `-saturate F` fixes `D = F · n_clauses`); `-timeout N` (default 8) caps attempts
-  (`0` = plain glowest). Early-exits on SAT, otherwise keeps the mapped start
-  with the fewest rogue clauses.
+  (unless `-saturate F` fixes `D = R = F · n_clauses`); `-timeout N` (default 8) caps attempts
+  (`-timeout 0 -rounds 0` = plain glowest). Each mapped attempt is hill-climbed by Terminator
+  (`--terminator-rounds`, `--terminator-order`, `-allow` for bad moves);
+  `-yanus-mode glowest|terminator|baddymove|both` (default `both`) selects the
+  phase. Early-exits on SAT, otherwise
+  keeps the mapped start with the fewest rogue clauses.
 - `--init min-overlapping`: deterministic constructive start, first the most
   frequent variable, then the one overlapping the solved part least.
 - `--init gob`: deterministic linear-relaxation start (no RNG), clauses as signed
@@ -170,11 +173,15 @@ and picks `R` random definitions `x = (±y_a) ∨ (±y_b)` (`x` an original
 variable, `y_a,y_b` fresh, signs independent coin flips). With literals `l_a,l_b`
 a definition is three clauses: `(¬l_a ∨ x)`, `(¬l_b ∨ x)` and
 `(l_a ∨ l_b ∨ ¬x)`. Glowest runs on that expanded CNF; its values for the
-original `n` variables are copied back and scored on the original formula.
-The best start wins, and a zero-rogue mapped assignment ends the loop early.
-`-timeout N` sets the attempt budget (default 8; `0` falls back to glowest).
+original `n` variables are copied back, Terminator hill-climbs them on the
+original formula, and the best start wins. A zero-rogue mapped assignment ends
+the loop early.
+`-timeout MS` sets a wall-clock budget (default 30ms) and `-rounds N` caps attempts
+(default 0 = unlimited until timeout).
 `-saturate F` overrides the random `D` with `F · n_clauses` extra variables
-(`F = 0` keeps the RNG choice); `R` stays random.
+and sets `R = D` (`F = 0` keeps both RNG-chosen). `-diving K` grows the expanded system on failed attempts: `NNV[0]=D*K`,
+`NNV[i]=NNV[i-1]*K` vars/defs are **added** (cumulative, not remade); if `NNV < 1`
+it stops early (timeout), otherwise `D=R=NNV` for that attempt.
 Both `plain` and `groups` mode dispatch to it.
 
 ### Gob
@@ -634,7 +641,7 @@ reporting tool, not a faster solver. The plain solver stays the default.
   `--group-len` (also accepted as `-group-len`), `--init`, `--terminator-rounds`,
   `--terminator-order`, `--neighborhood-timeout`, `--neighborhood-start`,
   `-deep-dive`, `-pre-cook`, `-play-baseline`, `-set-baseline`, `-coef-k`,
-  `-timeout`, `-saturate`.
+  `-timeout`, `-rounds`, `-saturate`, `-yanus-mode`, `-diving`.
 
 ## Layout
 

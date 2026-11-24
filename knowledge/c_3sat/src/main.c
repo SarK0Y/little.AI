@@ -210,6 +210,9 @@ static ResultUnit opt_coef_k(Cli *cli, const char *flag, const char *value) {
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_yanus_timeout(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->cfg.yanus_timeout_ms);
+}
+static ResultUnit opt_yanus_rounds(Cli *cli, const char *flag, const char *value) {
     return parse_size(flag, value, &cli->cfg.yanus_attempts);
 }
 static ResultUnit opt_yanus_saturate(Cli *cli, const char *flag, const char *value) {
@@ -219,6 +222,23 @@ static ResultUnit opt_yanus_saturate(Cli *cli, const char *flag, const char *val
     if (!*value || errno || *end || v < 0.0)
         return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected float >= 0)", flag, value);
     cli->cfg.yanus_saturate = v;
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_yanus_mode(Cli *cli, const char *flag, const char *value) {
+    cli->cfg.yanus_glowest = false; cli->cfg.yanus_terminator = false; cli->cfg.yanus_baddymove = false;
+    if (strcmp(value, "glowest") == 0) { cli->cfg.yanus_glowest = true; }
+    else if (strcmp(value, "terminator") == 0) { cli->cfg.yanus_terminator = true; }
+    else if (strcmp(value, "baddymove") == 0) { cli->cfg.yanus_baddymove = true; }
+    else if (strcmp(value, "both") == 0) { cli->cfg.yanus_glowest = true; cli->cfg.yanus_terminator = true; }
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected glowest|terminator|baddymove|both)", flag, value);
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_yanus_diving(Cli *cli, const char *flag, const char *value) {
+    char *end = NULL; errno = 0;
+    double v = strtod(value, &end);
+    if (!*value || errno || *end || v < 0.0)
+        return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected float >= 0)", flag, value);
+    cli->cfg.yanus_diving = v;
     return OK_UNIT(ResultUnit);
 }
 
@@ -251,7 +271,10 @@ static const OptSpec OPTS[] = {
     { "-set-baseline", opt_set_baseline },   { "--set-baseline", opt_set_baseline },
     { "-coef-k", opt_coef_k },               { "--coef-k", opt_coef_k },
     { "-timeout", opt_yanus_timeout },       { "--timeout", opt_yanus_timeout },
+    { "-rounds", opt_yanus_rounds },         { "--rounds", opt_yanus_rounds },
     { "-saturate", opt_yanus_saturate },     { "--saturate", opt_yanus_saturate },
+    { "-yanus-mode", opt_yanus_mode },       { "--yanus-mode", opt_yanus_mode },
+    { "-diving", opt_yanus_diving },         { "--diving", opt_yanus_diving },
 };
 
 static void usage(void) {
@@ -267,8 +290,9 @@ static void usage(void) {
         "                      [-deep-dive VARS NODES]\n"
         "                      [-pre-cook zero|majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping]\n"
         "                      [-play-baseline P] [-set-baseline N] [-coef-k K]\n"
-        "                      [-timeout N]  (Yanus random-expansion attempts, 0 = glowest only)\n"
-        "                      [-saturate F] (Yanus extra vars = F * n_clauses, 0 = random)\n");
+        "                      [-timeout MS] [-rounds N] (Yanus: default 30ms, 0 rounds)\n"
+        "                      [-saturate F] (Yanus extra vars = F * n_clauses, 0 = random)\n"
+        "                      [-yanus-mode glowest|terminator|baddymove|both] [-diving K]\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
