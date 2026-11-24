@@ -151,11 +151,11 @@ typedef struct {
     size_t gob_recult_coef_k;   /* -coef-k K: auto baseline range [-K*|crude|, K*|crude|] */
     size_t yanus_attempts;      /* -rounds N: random expansion attempts (0 = unlimited until timeout) */
     size_t yanus_timeout_ms;    /* -timeout MS: wall-clock budget (default 30ms) */
-    double yanus_saturate;      /* -saturate F: extra vars D = R = F * n_clauses (0 = random) */
+    double yanus_saturate;      /* -saturate F: extra vars D = F * n_clauses (0 = random) */
     bool yanus_glowest;         /* run glowest on expanded CNF (default true) */
     bool yanus_terminator;      /* hill-climb mapped assignment (default true) */
     bool yanus_baddymove;       /* hill-climb with bad moves (default false) */
-    double yanus_diving;        /* -diving k: NNV[0]=D*k, NNV[i]=NNV[i-1]*k; 0=off */
+    double yanus_diving;        /* -diving k: NNV[0]=D*k, NNV[i]=NNV[i-1]*k added; 0=off */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -213,11 +213,10 @@ bool solver_init_rarest(Solver *s);
  * counts, satisfied clauses excluded, ties by id). Deterministic, no RNG.
  * false only on allocation failure. */
 bool solver_init_glowest(Solver *s);
-/* Yanus: each attempt adds D fresh variables and R random replacements
- * x = (±y_a) | (±y_b) with RNG-picked signs (defining clauses), runs glowest
- * on the expanded CNF and maps the original variables back. Keeps the mapped
- * assignment with the fewest rogue clauses;
- * stops early on SAT. cfg->yanus_attempts = 0 falls back to glowest. */
+/* Yanus: each attempt replaces original variables by fresh pairs in the signed
+ * equation sense (v -> a+b), runs glowest on the expanded CNF and maps back by
+ * v = a XOR b. Keeps the mapped assignment with the fewest rogue clauses;
+ * stops early on SAT. cfg->yanus_attempts=0 and timeout=0 falls back to glowest. */
 bool solver_init_yanus(Solver *s, const SolverConfig *cfg);
 /* Same constructive value rule, but the order is: first the most frequent
  * variable (glowest's pick, ties by id), then at every step the unset variable

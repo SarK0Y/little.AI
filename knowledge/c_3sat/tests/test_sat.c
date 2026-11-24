@@ -585,13 +585,14 @@ static void test_init_yanus(void) {
     CHECK(memcmp(solver_assignment(a), solver_assignment(b), c.n_vars) == 0);
     solver_free(a); solver_free(b);
 
-    cfg.yanus_attempts = 0;   /* no attempts: plain glowest */
+    cfg.yanus_attempts = 0; cfg.yanus_timeout_ms = 0; /* no attempts: plain glowest */
     Solver *y = must_solver(&c, 999), *g = must_solver(&c, 999);
     CHECK(solver_init_yanus(y, &cfg));
     CHECK(solver_init_glowest(g));
     CHECK(memcmp(solver_assignment(y), solver_assignment(g), c.n_vars) == 0);
     solver_free(y); solver_free(g);
 
+    cfg.yanus_timeout_ms = solver_config_default().yanus_timeout_ms;
     cfg.yanus_attempts = 2;   /* -saturate fixes D from the clause count */
     cfg.yanus_saturate = 0.5;
     Solver *p = must_solver(&c, 55), *q = must_solver(&c, 55);

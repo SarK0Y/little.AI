@@ -90,16 +90,18 @@ Restart 0 starts from a chosen init (later restarts are always random):
 - `--init majority` (default): every variable takes its majority polarity.
 - `--init rarest`: deterministic constructive start (no RNG), rarest variables first.
 - `--init glowest`: deterministic constructive start, most frequent variables first.
-- `--init yanus`: random variable-expansion restarts of glowest; each attempt
-  adds `D` fresh variables and `R` random definitions `x = (±y_a) ∨ (±y_b)`
-  (signs picked from the RNG), runs glowest on the expanded CNF, and maps the
-  original variables back. `D` and `R` are drawn from the RNG each attempt
-  (unless `-saturate F` fixes `D = R = F · n_clauses`); `-timeout N` (default 8) caps attempts
-  (`-timeout 0 -rounds 0` = plain glowest). Each mapped attempt is hill-climbed by Terminator
+- `--init yanus`: random variable-substitution restarts of glowest; each attempt
+  replaces original variables by fresh pairs in the signed-equation sense
+  (`v -> a + b`: `+v` becomes `+a,+b`, `-v` becomes `-a,-b`; no clauses added),
+  runs glowest on the expanded CNF, and maps back with `v = a XOR b`. `D` fresh
+  vars are drawn from the RNG each attempt (unless `-saturate F` fixes
+  `D = F · n_clauses`; odd `D` gives one single-var substitution); `-timeout MS`
+  (default 30ms) and `-rounds N` (default 0 = unlimited) cap attempts. Each
+  mapped attempt is hill-climbed by Terminator
   (`--terminator-rounds`, `--terminator-order`, `-allow` for bad moves);
   `-yanus-mode glowest|terminator|baddymove|both` (default `both`) selects the
-  phase. Early-exits on SAT, otherwise
-  keeps the mapped start with the fewest rogue clauses.
+  phase. `-diving K` grows `D` cumulatively on failed attempts. Early-exits on
+  SAT, otherwise keeps the mapped start with the fewest rogue clauses.
 - `--init min-overlapping`: deterministic constructive start, first the most
   frequent variable, then the one overlapping the solved part least.
 - `--init gob`: deterministic linear-relaxation start (no RNG), clauses as signed
@@ -167,21 +169,22 @@ They differ only in which unset variable is picked next:
 
 ### Yanus
 
-`--init yanus` changes the formula instead of the walk. Each attempt draws a
-fresh `D ∈ [1,n]` and `R ∈ [1,n]` from the solver RNG, appends `D` variables,
-and picks `R` random definitions `x = (±y_a) ∨ (±y_b)` (`x` an original
-variable, `y_a,y_b` fresh, signs independent coin flips). With literals `l_a,l_b`
-a definition is three clauses: `(¬l_a ∨ x)`, `(¬l_b ∨ x)` and
-`(l_a ∨ l_b ∨ ¬x)`. Glowest runs on that expanded CNF; its values for the
-original `n` variables are copied back, Terminator hill-climbs them on the
-original formula, and the best start wins. A zero-rogue mapped assignment ends
-the loop early.
+`--init yanus` substitutes original variables by fresh variables in the signed
+equation system. Each attempt draws a fresh `D ∈ [1,n]` from the solver RNG
+(unless `-saturate F` fixes `D = F · n_clauses`) and replaces `D/2` original
+variables by pairs `(a,b)`, with one single-var substitution if `D` is odd.
+`+v` is expanded to `+a,+b` and `-v` to `-a,-b` in every clause where `v`
+appears; the clause count never changes. Glowest runs on that expanded CNF;
+the original value is recovered as `a XOR b` (or the single replacement),
+Terminator hill-climbs it on the original formula, and the best start wins.
+A zero-rogue mapped assignment ends the loop early.
 `-timeout MS` sets a wall-clock budget (default 30ms) and `-rounds N` caps attempts
 (default 0 = unlimited until timeout).
 `-saturate F` overrides the random `D` with `F · n_clauses` extra variables
-and sets `R = D` (`F = 0` keeps both RNG-chosen). `-diving K` grows the expanded system on failed attempts: `NNV[0]=D*K`,
-`NNV[i]=NNV[i-1]*K` vars/defs are **added** (cumulative, not remade); if `NNV < 1`
-it stops early (timeout), otherwise `D=R=NNV` for that attempt.
+(`F = 0` keeps `D` RNG-chosen). `-diving K` grows the expanded system on failed
+attempts: `NNV[0]=D*K`, `NNV[i]=NNV[i-1]*K` fresh variables are **added**
+(cumulative, not remade); if `NNV < 1` it stops early, otherwise that attempt
+substitutes `NNV/2` more original variables (one single if odd).
 Both `plain` and `groups` mode dispatch to it.
 
 ### Gob

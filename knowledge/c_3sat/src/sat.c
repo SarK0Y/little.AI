@@ -776,6 +776,9 @@ static bool nb_timed_out(struct timespec deadline, bool has_deadline) {
            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
 }
 
+/* Yanus replaces original variables by fresh pairs in the signed-equation
+ * sense: v -> (a + b), so +v becomes +a,+b and -v becomes -a,-b. No clauses
+ * are added; the mapped value of v is a XOR b. */
 bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
     const Cnf *cnf = s->cnf;
     size_t nv = cnf->n_vars, nc = cnf->n_clauses;
@@ -789,16 +792,18 @@ bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
     if (!use_glowest && !use_term && !use_bad) return solver_init_glowest(s);
 
     bool *best = malloc(nv * sizeof *best);
-    if (!best) return false;
+    size_t *rep0 = malloc(nv * sizeof *rep0), *rep1 = malloc(nv * sizeof *rep1);
+    bool *mapped = malloc(nv * sizeof *mapped);
+    if (!best || !rep0 || !rep1 || !mapped) {
+        free(best); free(rep0); free(rep1); free(mapped); return false;
+    }
+    for (size_t v = 0; v < nv; v++) { rep0[v] = SIZE_MAX; rep1[v] = SIZE_MAX; }
+
     size_t best_rogue = SIZE_MAX;
+    size_t n_replaced = 0, ex_vars = nv;
     bool found = false, fail = false;
     double saturate = cfg ? cfg->yanus_saturate : solver_config_default().yanus_saturate;
     double diving = cfg ? cfg->yanus_diving : 0.0;
-
-    /* Accumulated expanded CNF for diving: each attempt adds vars/defs. */
-    Cnf ex = {0};
-    size_t ex_cap_cl = 0, ex_cap_lit = 0;
-    bool ex_init = false;
     size_t nnv = 0; bool nnv_set = false;
 
     struct timespec deadline = {0, 0};
@@ -826,76 +831,78 @@ bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
             nnv = next >= (double)SIZE_MAX ? SIZE_MAX : (size_t)next;
             nnv_set = true;
             add = nnv;
+        } else {
+            /* non-diving: fresh replacements each attempt */
+            for (size_t v = 0; v < nv; v++) { rep0[v] = SIZE_MAX; rep1[v] = SIZE_MAX; }
+            n_replaced = 0;
+            ex_vars = nv;
         }
-        if (!ex_init) {
-            ex_cap_cl = nc + 1; ex_cap_lit = cnf->off[nc] ? cnf->off[nc] : 1;
-            ex.n_vars = nv; ex.n_clauses = nc;
-            ex.off = malloc(ex_cap_cl * sizeof *ex.off);
-            ex.lits = malloc(ex_cap_lit * sizeof *ex.lits);
-            if (!ex.off || !ex.lits) { fail = true; break; }
-            ex.off[0] = 0;
-            for (size_t ci = 0; ci < nc; ci++) {
-                size_t len = cnf_clause_len(cnf, ci);
-                memcpy(ex.lits + ex.off[ci], cnf_clause(cnf, ci), len * sizeof *ex.lits);
-                ex.off[ci + 1] = ex.off[ci] + len;
+
+        size_t pairs = add / 2, singles = add % 2;
+        for (size_t k = 0; k < pairs && n_replaced < nv; k++) {
+            size_t v = SIZE_MAX;
+            for (size_t tries = 0; tries < 1024 && v == SIZE_MAX; tries++) {
+                size_t c = rng_index(&s->rng, nv);
+                if (rep0[c] == SIZE_MAX) v = c;
             }
-            ex_init = true;
+            if (v == SIZE_MAX) { for (size_t c = 0; c < nv; c++) if (rep0[c] == SIZE_MAX) { v = c; break; } }
+            if (v == SIZE_MAX) { fail = true; break; }
+            if (ex_vars > UINT32_MAX - 1) { fail = true; break; }
+            rep0[v] = ex_vars++;
+            rep1[v] = ex_vars++;
+            n_replaced++;
         }
-        if (diving <= 0.0) { /* non-diving: rebuild fresh each attempt */
-            ex.n_vars = nv; ex.n_clauses = nc;
+        if (singles && n_replaced < nv && ex_vars <= UINT32_MAX) {
+            size_t v = SIZE_MAX;
+            for (size_t tries = 0; tries < 1024 && v == SIZE_MAX; tries++) {
+                size_t c = rng_index(&s->rng, nv);
+                if (rep0[c] == SIZE_MAX) v = c;
+            }
+            if (v == SIZE_MAX) { for (size_t c = 0; c < nv; c++) if (rep0[c] == SIZE_MAX) { v = c; break; } }
+            if (v != SIZE_MAX) { rep0[v] = ex_vars++; n_replaced++; }
         }
-        size_t r = (saturate > 0.0 || diving > 0.0) ? add : 1 + rng_index(&s->rng, nv);
-        size_t new_vars = ex.n_vars + add;
-        size_t new_cl = ex.n_clauses + 3 * r;
-        size_t need_lit = ex.off[ex.n_clauses] + 7 * r;
-        if (new_cl + 1 > ex_cap_cl) {
-            size_t cap = ex_cap_cl ? ex_cap_cl * 2 : new_cl + 1;
-            while (cap < new_cl + 1) cap *= 2;
-            size_t *no = realloc(ex.off, cap * sizeof *no);
-            if (!no) { fail = true; break; }
-            ex.off = no; ex_cap_cl = cap;
+
+        size_t total_lits = 0;
+        for (size_t ci = 0; ci < nc; ci++) {
+            size_t len = cnf_clause_len(cnf, ci);
+            const Lit *cl = cnf_clause(cnf, ci);
+            for (size_t k = 0; k < len; k++) total_lits += (rep0[cl[k].var] != SIZE_MAX) + (rep1[cl[k].var] != SIZE_MAX);
         }
-        if (need_lit > ex_cap_lit) {
-            size_t cap = ex_cap_lit ? ex_cap_lit * 2 : need_lit;
-            while (cap < need_lit) cap *= 2;
-            Lit *nl = realloc(ex.lits, cap * sizeof *nl);
-            if (!nl) { fail = true; break; }
-            ex.lits = nl; ex_cap_lit = cap;
+        Cnf ex = { .n_vars = ex_vars, .n_clauses = nc,
+                   .off = malloc((nc + 1) * sizeof *ex.off),
+                   .lits = malloc((total_lits ? total_lits : 1) * sizeof *ex.lits) };
+        if (!ex.off || !ex.lits) { cnf_free(&ex); fail = true; break; }
+        size_t pos = 0;
+        for (size_t ci = 0; ci < nc; ci++) {
+            ex.off[ci] = pos;
+            size_t len = cnf_clause_len(cnf, ci);
+            const Lit *cl = cnf_clause(cnf, ci);
+            for (size_t k = 0; k < len; k++) {
+                size_t v = cl[k].var;
+                bool sign = cl[k].positive;
+                if (rep0[v] != SIZE_MAX) ex.lits[pos++] = (Lit){ (uint32_t)rep0[v], sign };
+                if (rep1[v] != SIZE_MAX) ex.lits[pos++] = (Lit){ (uint32_t)rep1[v], sign };
+            }
         }
-        size_t pos = ex.off[ex.n_clauses];
-        size_t base_ci = ex.n_clauses;
-        size_t base_var = ex.n_vars;
-        ex.n_vars = new_vars;
-        ex.n_clauses = new_cl;
-        for (size_t i = 0; i < r; i++) {
-            size_t x = rng_index(&s->rng, nv);
-            size_t ya = base_var + rng_index(&s->rng, add);
-            size_t yb = base_var + rng_index(&s->rng, add);
-            bool pa = rng_bool(&s->rng), pb = rng_bool(&s->rng);
-            size_t ci = base_ci + 3 * i;
-            ex.lits[pos++] = (Lit){ (uint32_t)ya, !pa };
-            ex.lits[pos++] = (Lit){ (uint32_t)x, true };
-            ex.off[ci + 1] = pos;
-            ex.lits[pos++] = (Lit){ (uint32_t)yb, !pb };
-            ex.lits[pos++] = (Lit){ (uint32_t)x, true };
-            ex.off[ci + 2] = pos;
-            ex.lits[pos++] = (Lit){ (uint32_t)ya, pa };
-            ex.lits[pos++] = (Lit){ (uint32_t)yb, pb };
-            ex.lits[pos++] = (Lit){ (uint32_t)x, false };
-            ex.off[ci + 3] = pos;
-        }
-        ex.off[ex.n_clauses] = pos;
+        ex.off[nc] = pos;
 
         ResultSolver rs = solver_new(&ex, rng_next_u64(&s->rng));
-        if (!rs.ok) { fail = true; break; }
+        if (!rs.ok) { cnf_free(&ex); fail = true; break; }
         if (use_glowest) {
-            if (!solver_init_glowest(rs.val)) { solver_free(rs.val); fail = true; break; }
+            if (!solver_init_glowest(rs.val)) { solver_free(rs.val); cnf_free(&ex); fail = true; break; }
         } else {
             for (size_t v = 0; v < ex.n_vars; v++) rs.val->assignment[v] = rng_bool(&rs.val->rng);
             rebuild_counts(rs.val);
         }
-        solver_set_assignment(s, rs.val->assignment);
+        const bool *ea = solver_assignment(rs.val);
+        for (size_t v = 0; v < nv; v++) {
+            if (rep1[v] != SIZE_MAX) mapped[v] = ea[rep0[v]] ^ ea[rep1[v]];
+            else if (rep0[v] != SIZE_MAX) mapped[v] = ea[rep0[v]];
+            else mapped[v] = ea[v];
+        }
         solver_free(rs.val);
+        cnf_free(&ex);
+        solver_set_assignment(s, mapped);
         if (use_bad)
             solver_baddymove(s, cfg ? cfg->terminator_rounds : 16,
                              cfg ? cfg->terminator_order : TERM_FORWARD,
@@ -909,7 +916,7 @@ bool solver_init_yanus(Solver *s, const SolverConfig *cfg) {
             found = true;
         }
     }
-    if (ex_init) cnf_free(&ex);
+    free(rep0); free(rep1); free(mapped);
     if (fail) { free(best); return false; }
     if (found) solver_set_assignment(s, best);
     else if (!solver_init_glowest(s)) { free(best); return false; }
