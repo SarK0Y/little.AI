@@ -114,6 +114,7 @@ static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "neighborhood") == 0) cli->cfg.init = INIT_NEIGHBORHOOD;
     else if (strcmp(value, "neighborhood0") == 0) cli->cfg.init = INIT_NEIGHBORHOOD0;
     else if (strcmp(value, "yanus") == 0) cli->cfg.init = INIT_YANUS;
+    else if (strcmp(value, "knots") == 0) cli->cfg.init = INIT_KNOTS;
     else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|cascade|neighborhood|neighborhood0|yanus)", flag, value);
     return OK_UNIT(ResultUnit);
 }

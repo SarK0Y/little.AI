@@ -1,7 +1,7 @@
 CC      ?= gcc
 CFLAGS  ?= -std=gnu11 -O2 -Wall -Wextra
 BUILD   := build
-SRC     := src/sat.c src/groups.c
+SRC     := src/sat.c src/groups.c src/knots.c
 
 .PHONY: build test bench bench-rarest probe clean
 

@@ -434,6 +434,7 @@ void solver_free(Solver *s) {
     free(s->rogue); free(s->rogue_pos); free(s->stats); free(s->cands);
     free(s);
 }
+const Cnf *solver_cnf(const Solver *s) { return s->cnf; }
 
 static void add_rogue(Solver *s, size_t c) {
     if (s->rogue_pos[c] != SIZE_MAX) return;
@@ -1793,6 +1794,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_glowest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_YANUS) {
             if (!solver_init_yanus(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_KNOTS) {
+            if (!solver_init_knots(s, cfg)) return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, s->n_rogue, NULL, 0 }));
         } else if (restart == 0 && cfg->init == INIT_MIN_OVERLAP) {
             if (!solver_init_min_overlap(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GOB) {

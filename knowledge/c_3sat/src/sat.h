@@ -119,6 +119,7 @@ typedef enum {
     INIT_NEIGHBORHOOD, /* light popularity/backtracking neighborhood search */
     INIT_NEIGHBORHOOD0, /* full neighborhood search per spec */
     INIT_YANUS,     /* random x = y_a OR y_b expansions, glowest, map back */
+    INIT_KNOTS,     /* pool-based clause solver, see notes/knots.txt */
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
 
@@ -186,6 +187,7 @@ typedef RESULT(SolveResult) ResultSolve;
 
 ResultSolver solver_new(const Cnf *cnf, uint64_t seed);
 void solver_free(Solver *s);
+const Cnf *solver_cnf(const Solver *s);
 ResultSolve solver_solve(Solver *s, const SolverConfig *cfg);
 /* Contradictory unit pairs (x)/(-x); false only on allocation failure. Caller frees *out. */
 bool cnf_find_contradictions(const Cnf *cnf, Contradiction **out, size_t *out_n);
@@ -218,6 +220,8 @@ bool solver_init_glowest(Solver *s);
  * v = a XOR b. Keeps the mapped assignment with the fewest rogue clauses;
  * stops early on SAT. cfg->yanus_attempts=0 and timeout=0 falls back to glowest. */
 bool solver_init_yanus(Solver *s, const SolverConfig *cfg);
+/* Knots: pool-based solver. true on SAT/assignment, false on logical fail or OOM. */
+bool solver_init_knots(Solver *s, const SolverConfig *cfg);
 /* Same constructive value rule, but the order is: first the most frequent
  * variable (glowest's pick, ties by id), then at every step the unset variable
  * with the smallest share of its occurrences already in satisfied clauses

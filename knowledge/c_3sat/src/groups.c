@@ -203,6 +203,7 @@ ResultGroup group_solve(const Cnf *cnf, const SolverConfig *cfg, const GroupConf
     if (cfg->init == INIT_RAREST) { if (!solver_init_rarest(full)) NOMEM(); }
     else if (cfg->init == INIT_GLOWEST) { if (!solver_init_glowest(full)) NOMEM(); }
     else if (cfg->init == INIT_YANUS) { if (!solver_init_yanus(full, cfg)) NOMEM(); }
+    else if (cfg->init == INIT_KNOTS) { if (!solver_init_knots(full, cfg)) { out.status = SOLVE_UNKNOWN; goto fail_cleanup; } }
     else if (cfg->init == INIT_MIN_OVERLAP) { if (!solver_init_min_overlap(full)) NOMEM(); }
     else if (cfg->init == INIT_GOB) { if (!solver_init_gob(full)) NOMEM(); }
     else if (cfg->init == INIT_GOB_SIGN) { if (!solver_init_gob_sign(full)) NOMEM(); }
@@ -392,6 +393,7 @@ ResultGroup group_solve(const Cnf *cnf, const SolverConfig *cfg, const GroupConf
         out.status = SOLVE_UNKNOWN;
     }
 
+fail_cleanup:
     for (size_t k = 0; k < cap; k++) { free(groups[k].clauses); free(groups[k].assignment); }
     free(groups); free(base); free(sel); free(mem_off); free(mem); free(fired); free(mark); free(cand);
     solver_free(full);

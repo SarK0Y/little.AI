@@ -1,0 +1,11 @@
+Major remarks & corrections
+
+1. pool size is matter of available solutions. 
+1.1. 3-lit clause provides 0..1 forks ( j j j 0 or -j -j -j 0) & 0..6 tautologies ( j j -j 0..-j -j j 0 );  2-lit clause has 0..1 forks (j j 0 or -j -j 0) & 0..2 tautologies (-j j 0 j -j 0); unit is about only one fork.
+2. each clause either makes new pool or belongs to already existed one(s) ==> pool is determined by vars it contains
+3. pool consists of external vars which were processed in previous step(s) & inner vars which didn't appear earlier
+4. 1st of the all, algo tries to exploit inner vars of given pool to mitigate conflict
+5. if external vars are needed to resolve conflict - jump to orig pool where those vars are internal ones, so those vars could be restated to meet downward terms
+5.1. meanwhile, each failed variant gets removed from a pool, so fatal conflict means emptied pool before sys gets completed (fail returns UNKNOWN)
+6. make algo in file knots.c
+7. so, rename "Janus" to "Knots"
