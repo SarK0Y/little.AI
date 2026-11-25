@@ -151,7 +151,9 @@ Functions
 - Frees all Knots memory and returns ok/fail.
 
 Important current behavior/risks
-- Local variant removal criteria: immediate `apply_variant==0` incompatibility in `solve` marks dead; wrap pass in `try_restate_at` also marks dead on incompatibility. First-pass restate skips incompatible without marking dead.
+- Variant removal criteria: `apply_variant==0` means incompatible with current assignment. In `solve` and `try_restate_at` wrap, such variants are kept live first (they may be blocked by temporary external vars). When a clause has no progressed variant, Knots first tries `restate_external`; only if that fails does it mark currently incompatible variants dead and retry. First-pass restate still skips incompatible without marking dead.
+- "Temporary external vars": assigned vars outside the current clause's inner choice, owned by other decisions/pools; they can be undone by later restatement.
 - `clear_dead_after` is same-pool only; dead marks outside that scope persist until overwritten/never cleared.
 - `pool_has_external_set` + local-first restatement tries to exploit inner-only pools, but fallback/global behavior can still jump broadly when externals exist.
 - Variants are all satisfying masks; fork/tautology classes from spec are not represented as explicit state transitions.
+- 17 AIM damn-case rerun after this change: 7 SAT, 10 UNKNOWN, 0 ERR (no regression/improvement observed).

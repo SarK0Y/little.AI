@@ -172,7 +172,7 @@ static bool try_restate_at(K*k,size_t jump){
         if(!push_dec(k,jcl,vi)) return false;
         Dec*d=&k->stk[k->sp-1]; int ar=apply_variant(k,jcl,vi,d);
         if(ar<0) return false;
-        if(ar==0){ k->sp--; undo_dec(k,d); k->vs[jcl][vi].dead=1; continue; }
+        if(ar==0){ k->sp--; undo_dec(k,d); continue; } /* keep live; may be valid after external restate */
         if(k->trace && k->ref){
             const Lit*cl=cnf_clause(k->cnf,jcl); size_t n=cnf_clause_len(k->cnf,jcl); uint8_t m=k->vs[jcl][vi].mask;
             bool bad=false; for(size_t i=0;i<n;i++){ int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1); bool rv=k->ref[cl[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
@@ -278,7 +278,7 @@ static bool solve(K*k){
                 if(!push_dec(k,ci,vi)) return false;
                 Dec*d=&k->stk[k->sp-1]; int ar=apply_variant(k,ci,vi,d);
                 if(ar<0) return false;
-                if(ar==0){ k->sp--; undo_dec(k,d); k->vs[ci][vi].dead=1; continue; }
+                if(ar==0){ k->sp--; undo_dec(k,d); continue; } /* temp external conflict: keep variant live */
                 if(k->trace && k->ref){
                     const Lit*cl2=cnf_clause(k->cnf,ci); size_t n2=cnf_clause_len(k->cnf,ci); uint8_t m2=k->vs[ci][vi].mask;
                     bool bad=false; for(size_t i=0;i<n2;i++){ int want=(m2&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); bool rv=k->ref[cl2[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
@@ -288,12 +288,20 @@ static bool solve(K*k){
             }
         }
         if(!progressed){
-            if(!restate_external(k,ci)) {
-                size_t pid=clause_pool(k,ci);
-                if(pid==SIZE_MAX || !pool_has_external_set(k,pid)) return false;
-                return false;
+            /* no variant applicable now; try restating external owners, else mark live-incompatible as dead */
+            if(restate_external(k,ci)) { pi=k->pos[k->stk[k->sp-1].clause]; continue; }
+            bool killed=false;
+            for(size_t vi=0; vi<k->vn[ci]; vi++){
+                if(k->vs[ci][vi].dead) continue;
+                const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci); uint8_t m=k->vs[ci][vi].mask;
+                bool compat=true;
+                for(size_t i=0;i<n;i++){ int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1); int8_t cur=k->val[cl[i].var]; if(cur>=0 && cur!=want){compat=false;break;} }
+                if(!compat){ k->vs[ci][vi].dead=1; killed=true; }
             }
-            pi=k->pos[k->stk[k->sp-1].clause];
+            if(killed) continue;
+            size_t pid=clause_pool(k,ci);
+            if(pid==SIZE_MAX || !pool_has_external_set(k,pid)) return false;
+            return false;
         }
     }
 }
