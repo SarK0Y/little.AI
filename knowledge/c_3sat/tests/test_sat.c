@@ -573,6 +573,46 @@ static void test_init_glowest_hand_checked(void) {
     solver_free(s); cnf_free(&e);
 }
 
+
+static void test_init_knots(void) {
+    SolverConfig cfg = solver_config_default();
+    cfg.max_steps = 0; cfg.restarts = 0; cfg.init = INIT_KNOTS;
+
+    /* UNSAT unit pair is still detected up front */
+    {
+        Cnf c = must_parse("p cnf 1 2\n1 0\n-1 0\n");
+        ResultSolver rs = solver_new(&c, 1); CHECK(rs.ok); Solver *s = rs.val;
+        ResultSolve rv = solver_solve(s, &cfg); CHECK(rv.ok);
+        CHECK(rv.val.status == SOLVE_UNSAT);
+        solve_result_free(&rv.val); solver_free(s); cnf_free(&c);
+    }
+
+    /* small SAT */
+    {
+        Cnf c = must_parse("p cnf 3 3\n1 -2 3 0\n-1 2 3 0\n-1 -2 -3 0\n");
+        ResultSolver rs = solver_new(&c, 7); CHECK(rs.ok); Solver *s = rs.val;
+        ResultSolve rv = solver_solve(s, &cfg); CHECK(rv.ok);
+        CHECK(rv.val.status == SOLVE_SAT);
+        CHECK(verify(&c, rv.val.assignment, c.n_vars));
+        solve_result_free(&rv.val); solver_free(s); cnf_free(&c);
+    }
+
+    /* AIM-like small case should be SAT */
+    {
+        const char *path = "/tmp/opencode/cnf/ex/aim/aim-50-1_6-yes1-1.cnf";
+        FILE *f = fopen(path, "r");
+        if (f) {
+            fclose(f);
+            ResultCnf rc = cnf_from_dimacs_file(path);
+            CHECK(rc.ok); Cnf c = rc.val;
+            ResultSolver rs = solver_new(&c, 1); CHECK(rs.ok); Solver *s = rs.val;
+            ResultSolve rv = solver_solve(s, &cfg); CHECK(rv.ok);
+            CHECK(rv.val.status == SOLVE_SAT);
+            CHECK(verify(&c, rv.val.assignment, c.n_vars));
+            solve_result_free(&rv.val); solver_free(s); cnf_free(&c);
+        }
+    }
+}
 static void test_init_yanus(void) {
     Cnf c = must_parse("p cnf 4 4\n1 2 3 0\n-1 4 0\n-2 4 0\n-3 -4 0\n");
     SolverConfig cfg = solver_config_default();
@@ -1534,6 +1574,7 @@ int main(void) {
     test_init_rarest_hand_checked();
     test_init_glowest_hand_checked();
     test_init_yanus();
+    test_init_knots();
     test_init_min_overlap_hand_checked();
     test_init_gob_hand_checked();
     test_init_gob_sign_hand_checked();

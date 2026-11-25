@@ -135,6 +135,10 @@ Restart 0 starts from a chosen init (later restarts are always random):
   `--neighborhood-timeout MS` (default 1000) bounds backtracking;
   `--neighborhood-start most|least|random` picks the global start/next var
   (`random` uses the solver RNG).
+- `--init knots`: pool-based clause solver (`notes/knots.txt`). Clauses add
+  satisfying variants into var-connected pools (inner/external vars); conflicts
+  try inner vars first, then restate the owning external decision and remove the
+  failed variant. Empty pool before completion returns `UNKNOWN`.
 - `--init likho`: pre-cooked start (all-false by default), then a
   neutral/switch-domain repair pass.
 - `-deep-dive VARS NODES`: implies `--init likho`, caps switch domains at VARS
