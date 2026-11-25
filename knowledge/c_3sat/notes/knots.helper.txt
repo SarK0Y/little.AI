@@ -1,0 +1,157 @@
+Knots helper notes (current implementation)
+File: knowledge/c_3sat/src/knots.c
+Spec: knowledge/c_3sat/notes/knots.txt
+
+Purpose
+- Implements `--init knots` pool-based clause solver.
+- Success: sets Solver assignment, returns true. Logical fail/UNKNOWN or OOM: returns false (caller maps to UNKNOWN in current wiring).
+
+Data structures and fields
+
+`Varnt` (clause variant / available solution)
+- `mask` (uint8_t): bit i = 1 means clause literal i is satisfied by this variant. Bits cover literals in clause order.
+- `dead` (uint8_t): 1 if variant removed from pool/search; 0 if still available.
+
+`Dec` (decision stack entry)
+- `clause` (size_t): clause index this decision satisfies.
+- `vi` (size_t): variant index chosen in `k->vs[clause]`.
+- `chg` (size_t*): vars set by this decision (only vars previously unset).
+- `cn` (size_t): number of vars in `chg`.
+- `cap` (size_t): allocated capacity of `chg`.
+
+`Pool` (var-connected component)
+- `vars` (size_t*): var ids in pool.
+- `nv` (size_t): number of vars.
+- `cv` (size_t): vars capacity.
+- `cls` (size_t*): clause ids in pool.
+- `nc` (size_t): number of clauses.
+- `cc` (size_t): clauses capacity.
+
+`K` (global Knots state)
+- `cnf` (const Cnf*): input CNF.
+- `nvrs` (size_t): number of variables.
+- `ncls` (size_t): number of clauses.
+- `val` (int8_t*): current var assignment, per var: -1 unset, 0 false, 1 true.
+- `owner` (size_t*): var -> clause index that first set it in current search; SIZE_MAX if unset or not decision-owned. Used to find "internal/orig" decision and restatement point.
+- `var_pool` (size_t*): var -> pool id, SIZE_MAX if not attached yet.
+- `pools` (Pool*): pool array.
+- `np` (size_t): pool count.
+- `cp` (size_t): pool array capacity.
+- `vs` (Varnt**): per clause variant array.
+- `vn` (size_t*): per clause variant count.
+- `stk` (Dec*): decision stack.
+- `sp` (size_t): stack pointer/count.
+- `sc` (size_t): stack capacity.
+- `order` (size_t*): clause processing order, grouped by pool.
+- `pos` (size_t*): clause index -> position in `order`.
+- `ref` (const bool*): optional reference assignment for trace/debug (`KNOTS_REF` file, bits 0/1).
+- `trace` (int): trace level from `KNOTS_TRACE`.
+
+Functions
+
+`ltrue(l,v)`
+- Input: literal `l`, var value `v`.
+- Returns true when `v` is set and literal evaluates true.
+
+`lfalse(l,v)`
+- Returns true when `v` is set and literal evaluates false.
+
+`pool_has_var(p,v)`
+- Linear scan: whether pool already contains var `v`.
+
+`pool_add_var(p,v)`
+- Adds var to pool if absent, growing array. Returns false on OOM.
+
+`pool_add_cls(p,ci)`
+- Appends clause id to pool, growing array. Returns false on OOM.
+
+`new_pool(k,out)`
+- Allocates/extends pool array, initializes new empty pool, returns its id in `*out`.
+
+`merge_pool(k,dst,src)`
+- Merges `src` pool into `dst`: moves vars/clauses, updates `var_pool` for src vars, clears src lists. Used when clause connects previously separate pools.
+
+`attach_pool(k,ci)`
+- Determines clause pool by vars' existing pools; merges all touched pools into one `dst`.
+- Creates new pool if no var seen before.
+- Adds clause and all its vars to `dst`; updates `var_pool`.
+- Implements spec 2/3 at construction time: pool determined by vars; unseen vars become pool members.
+
+`build_variants(k,ci)`
+- Allocates variant list for clause. For n<=7, enumerates all satisfying masks `1..(2^n-1)`. Each mask is a possible solution variant (`dead=0`).
+- n>=8 case capped to 256 masks by code guard (current crude limit).
+
+`clause_sat(k,ci)`
+- True if any clause literal is true under `k->val`.
+
+`clause_conflict(k,ci)`
+- True if every clause literal is false under `k->val` (no unset/true literal left).
+
+`push_dec(k,clause,vi)`
+- Pushes decision record on stack. Grows stack if needed. Initializes `cn=0`.
+
+`dec_add(d,var)`
+- Records var in decision `chg` list. Returns false on OOM.
+
+`clause_pool(k,ci)`
+- Returns pool id for clause by first var with `var_pool!=SIZE_MAX`; SIZE_MAX if none.
+
+`clear_dead_after(k,jcl)`
+- Clears `dead` flags for variants of clauses after `jcl` in `order`, but only within same pool as `jcl`.
+- Reason: downstream dead marks were context-dependent on `jcl` decision; restating `jcl` changes context.
+
+`undo_dec(k,d)`
+- Undoes decision: for each changed var, clears `owner` if owned by this clause, sets `val=-1`, resets `cn`.
+
+`apply_variant(k,ci,vi,d)`
+- Compatibility pass: rejects if any literal required by mask conflicts with already-set var.
+- Apply pass: sets unset vars to mask-required values, sets `owner[var]=ci` if owner unset, records var via `dec_add`.
+- Returns: 1 applied, 0 incompatible with current assignment, -1 OOM.
+
+`owner_dec(k,var)`
+- Maps `owner[var]` (clause id) to current stack index. SIZE_MAX if var not currently decision-owned on stack.
+
+`any_live(k,ci)`
+- True if clause has any variant with `dead==0`.
+
+`try_restate_at(k,jump)`
+- Restates decision at stack index `jump` (spec 5/5.1).
+- Saves old clause/variant, undoes stack down to `jump`, clears same-pool downstream dead flags.
+- Tries variants after `old_vi`: pushes/apply; `ar==0` skipped (not dead) in this pass. If success, returns true.
+- If no later variant worked, marks `old_vi` dead, then tries all remaining live variants from 0; in this wrap pass `ar==0` marks variant dead.
+- Returns false if no applicable live variant remains (pool/choice exhausted for that decision state).
+
+`pool_has_external_set(k,pid)`
+- Checks if pool has any assigned var whose owner is outside this pool or unset owner. Used to decide whether external jump/restatement is allowed.
+
+`restate_external(k,ci)`
+- Conflict/no-progress handler (spec 4/5/5.1).
+- Finds owner decisions for vars in conflicting clause; splits into local-pool owners and external owners.
+- Tries local owners first (latest first) via `try_restate_at`.
+- If no local fix and pool has no external-set vars, returns false (do not jump outside inner-only pool).
+- Else tries external owners; fallback tries same-pool decisions, then global stack only when externals exist.
+- Returns true if a restatement decision was applied.
+
+`solve(k)`
+- Main loop over pool-grouped clause order.
+- Advances past satisfied clauses. If all done, SAT.
+- If current clause has no live variants, fatal.
+- If conflict: `restate_external`; on fail, fatal when pool inner-only/no external-set; on success, rewinds to restated clause pos.
+- If unsatisfied but not conflict: tries variants in 2 passes. Pass 0 prefers variants that set inner/unset vars (`sets_inner==true`); pass 1 allows others (spec 4).
+- On `apply_variant==0` during try, marks variant dead immediately (current-assignment incompatibility).
+- On success pushes decision and advances `pi`.
+- If no progress, same as conflict restatement path.
+
+`solver_init_knots(s,cfg)`
+- Entry point called by solver init.
+- Allocates and initializes `K` state, variant arrays, pools, order/pos.
+- Builds variants and attaches pools for each clause.
+- Builds pool-grouped processing order (clauses of same pool contiguous).
+- Runs `solve`. On success copies `val` to Solver assignment as bools; on fail sets all false.
+- Frees all Knots memory and returns ok/fail.
+
+Important current behavior/risks
+- Local variant removal criteria: immediate `apply_variant==0` incompatibility in `solve` marks dead; wrap pass in `try_restate_at` also marks dead on incompatibility. First-pass restate skips incompatible without marking dead.
+- `clear_dead_after` is same-pool only; dead marks outside that scope persist until overwritten/never cleared.
+- `pool_has_external_set` + local-first restatement tries to exploit inner-only pools, but fallback/global behavior can still jump broadly when externals exist.
+- Variants are all satisfying masks; fork/tautology classes from spec are not represented as explicit state transitions.
