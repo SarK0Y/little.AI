@@ -409,6 +409,7 @@ SolverConfig solver_config_default(void) {
         .knots_likho = false,
         .knots_yanus = false,
         .knots_gob_recult = false,
+        .knots_mono = false,
         .path_rider = 0,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
@@ -1917,7 +1918,71 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
                 if (cfg->knots_yanus) solver_init_yanus(s, cfg);
                 if (cfg->knots_gob_recult) solver_init_gob_recult(s, cfg);
             }
-            if (s->n_rogue != 0) return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, s->n_rogue, NULL, 0 }));
+            if (s->n_rogue != 0) {
+                if (cfg->knots_mono) {
+                    size_t ci = s->rogue[0];
+                    fprintf(stderr, "MONO fail final unsat=%zu first_rogue=%zu\n", s->n_rogue, ci);
+                    const Cnf *cc=s->cnf; size_t fn=cnf_clause_len(cc,ci); const Lit*cl=cnf_clause(cc,ci);
+                    fprintf(stderr, "MONO failed-block vars="); for(size_t i=0;i<fn;i++) fprintf(stderr,"%s%u",i?" ":"",cl[i].var+1); fprintf(stderr,"\n");
+                    size_t bl=0; for(size_t x=0;x<cc->n_clauses;x++){ if(cnf_clause_len(cc,x)!=fn) continue; bool same=true; for(size_t i=0;i<fn;i++){ bool fnd=false; for(size_t j=0;j<fn;j++) if(cnf_clause(cc,x)[j].var==cl[i].var){fnd=true;break;} if(!fnd){same=false;break;} } if(same) bl++; }
+                    size_t spc=(fn>=8)?0:((size_t)1<<fn); size_t av=spc>bl?spc-bl:0;
+                    fprintf(stderr,"MONO failed-block clauses=%zu space=%zu available=%zu\n",bl,spc,av);
+                    fprintf(stderr,"  active:");
+                    { bool bs=false; for(size_t i=0;i<fn;i++) fprintf(stderr," %u=%d",cl[i].var+1,s->assignment[cl[i].var]?1:0);
+                      for(size_t x=0;x<cc->n_clauses && !bs;x++){ if(cnf_clause_len(cc,x)!=fn) continue; bool same=true; for(size_t i=0;i<fn;i++){ bool fnd=false; for(size_t j=0;j<fn;j++) if(cnf_clause(cc,x)[j].var==cl[i].var){fnd=true;break;} if(!fnd){same=false;break;} } if(same){ const Lit*cy=cnf_clause(cc,x); size_t ny=cnf_clause_len(cc,x); for(size_t k2=0;k2<ny;k2++){ bool val=s->assignment[cy[k2].var]; if(cy[k2].positive?val:!val){bs=true;break;} } } }
+                      fprintf(stderr," block_sat=%s\n", bs?"yes":"no"); }
+                    for(size_t x=0;x<cc->n_clauses;x++){ if(cnf_clause_len(cc,x)!=fn) continue; bool same=true; for(size_t i=0;i<fn;i++){ bool fnd=false; for(size_t j=0;j<fn;j++) if(cnf_clause(cc,x)[j].var==cl[i].var){fnd=true;break;} if(!fnd){same=false;break;} } if(same){ fprintf(stderr,"  clause %zu [",x); const Lit*c2=cnf_clause(cc,x); for(size_t j=0;j<fn;j++) fprintf(stderr,"%s%u%s",c2[j].positive?"":"-",c2[j].var+1,j+1<fn?" ":""); fprintf(stderr,"]\n"); } }
+                    /* external blocks: other var-set blocks sharing any var with failed block */
+                    bool *in_fail=calloc(cc->n_vars?cc->n_vars:1,1);
+                    if(in_fail){
+                        for(size_t i=0;i<fn;i++) in_fail[cl[i].var]=true;
+                        bool *seen_sig=calloc(cc->n_clauses?cc->n_clauses:1,1);
+                        bool any_ext=false;
+                        for(size_t x=0;x<cc->n_clauses;x++){
+                            if(seen_sig && seen_sig[x]) continue;
+                            const Lit*cx=cnf_clause(cc,x); size_t nx=cnf_clause_len(cc,x);
+                            bool shares=false, same_set=(nx==fn);
+                            if(same_set){ same_set=true; for(size_t i=0;i<fn;i++){ bool fnd=false; for(size_t j=0;j<nx;j++) if(cx[j].var==cl[i].var){fnd=true;break;} if(!fnd){same_set=false;break;} } }
+                            if(same_set){ continue; }
+                            for(size_t j=0;j<nx;j++) if(in_fail[cx[j].var]) { shares=true; break; }
+                            if(!shares) continue;
+                            /* report this external block once by var-set */
+                            /* mark all clauses with same var-set as seen */
+                            size_t bl2=0; size_t sp2=(nx>=8)?0:((size_t)1<<nx);
+                            for(size_t y=0;y<cc->n_clauses;y++){
+                                if(cnf_clause_len(cc,y)!=nx) continue;
+                                bool same2=true; for(size_t i=0;i<nx;i++){ bool fnd=false; for(size_t j=0;j<nx;j++) if(cnf_clause(cc,y)[j].var==cx[i].var){fnd=true;break;} if(!fnd){same2=false;break;} }
+                                if(same2){ bl2++; if(seen_sig) seen_sig[y]=true; }
+                            }
+                            size_t av2=sp2>bl2?sp2-bl2:0;
+                            if(!any_ext){ fprintf(stderr,"MONO external-blocks:\n"); any_ext=true; }
+                            fprintf(stderr,"  MONO ext-block vars="); for(size_t j=0;j<nx;j++) fprintf(stderr,"%s%u",j?" ":"",cx[j].var+1);
+                            fprintf(stderr," clauses=%zu space=%zu available=%zu\n",bl2,sp2,av2);
+                            fprintf(stderr,"    active:");
+                            bool block_sat=false;
+                            for(size_t j=0;j<nx;j++) fprintf(stderr," %u=%d", cx[j].var+1, s->assignment[cx[j].var]?1:0);
+                            for(size_t y=0;y<cc->n_clauses && !block_sat;y++){
+                                if(cnf_clause_len(cc,y)!=nx) continue;
+                                bool same2=true; for(size_t i=0;i<nx;i++){ bool fnd=false; for(size_t j=0;j<nx;j++) if(cnf_clause(cc,y)[j].var==cx[i].var){fnd=true;break;} if(!fnd){same2=false;break;} }
+                                if(same2){
+                                    const Lit *cy=cnf_clause(cc,y); size_t ny=cnf_clause_len(cc,y);
+                                    block_sat=false;
+                                    for(size_t k2=0;k2<ny;k2++){ bool val=s->assignment[cy[k2].var]; if(cy[k2].positive?val:!val){ block_sat=true; break; } }
+                                }
+                            }
+                            fprintf(stderr," block_sat=%s\n", block_sat?"yes":"no");
+                            for(size_t y=0;y<cc->n_clauses;y++){
+                                if(cnf_clause_len(cc,y)!=nx) continue;
+                                bool same2=true; for(size_t i=0;i<nx;i++){ bool fnd=false; for(size_t j=0;j<nx;j++) if(cnf_clause(cc,y)[j].var==cx[i].var){fnd=true;break;} if(!fnd){same2=false;break;} }
+                                if(same2){ fprintf(stderr,"    clause %zu [",y); const Lit*c2=cnf_clause(cc,y); for(size_t j=0;j<nx;j++) fprintf(stderr,"%s%u%s",c2[j].positive?"":"-",c2[j].var+1,j+1<nx?" ":""); fprintf(stderr,"]\n"); }
+                            }
+                        }
+                        if(!any_ext) fprintf(stderr,"MONO external-blocks: none\n");
+                        free(seen_sig); free(in_fail);
+                    }
+                }
+                return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, s->n_rogue, NULL, 0 }));
+            }
             (void)kok;
         } else if (restart == 0 && cfg->init == INIT_MIN_OVERLAP) {
             if (!solver_init_min_overlap(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");

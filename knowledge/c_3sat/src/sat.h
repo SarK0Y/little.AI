@@ -168,6 +168,7 @@ typedef struct {
     bool knots_likho;           /* Knots: apply likho after knots */
     bool knots_yanus;           /* Knots: apply yanus after knots */
     bool knots_gob_recult;      /* Knots: apply gob-recult after knots */
+    bool knots_mono;            /* Knots: mono-block diagnostics */
     size_t path_rider;          /* -path-rider P: enumerate 2^P var assignments */
     ProgressFn on_progress;
     void *progress_ctx;

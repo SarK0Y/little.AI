@@ -9,7 +9,10 @@
 
 typedef struct { uint8_t mask; uint8_t dead; } Varnt;
 typedef struct { size_t clause; size_t vi; size_t *chg; size_t cn, cap; } Dec;
-typedef struct { size_t *vars; size_t nv, cv; size_t *cls; size_t nc, cc; } Pool;
+typedef struct {
+    size_t *vars; size_t nv, cv; size_t *cls; size_t nc, cc;
+    uint64_t sig;   /* sorted vars signature hash for mono block */
+} Pool;
 typedef struct {
     const Cnf *cnf; size_t nvrs, ncls;
     int8_t *val;
@@ -25,6 +28,7 @@ typedef struct {
     bool random_mode;
     uint64_t rng;
     KnotsSort sort;
+    bool mono;
 } K;
 
 static bool ltrue(const Lit*l,int8_t v){return v>=0 && ((v==1)==l->positive);}
@@ -237,6 +241,81 @@ static bool restate_external(K*k,size_t ci){
 
 static uint64_t krng(K*k){ uint64_t x=k->rng; x^=x<<13; x^=x>>7; x^=x<<17; return k->rng=x; }
 
+static uint64_t vars_sig(const size_t *v, size_t n){
+    /* sort copy small n<=3 usually */
+    size_t t[8]; size_t m=n<8?n:8;
+    for(size_t i=0;i<m;i++) t[i]=v[i];
+    for(size_t i=0;i<m;i++) for(size_t j=i+1;j<m;j++) if(t[j]<t[i]){ size_t x=t[i]; t[i]=t[j]; t[j]=x; }
+    uint64_t h=1469598103934665603ULL;
+    for(size_t i=0;i<m;i++){ h^=(uint64_t)t[i]; h*=1099511628211ULL; }
+    h ^= (uint64_t)n<<56;
+    return h;
+}
+static uint64_t clause_sig(const Cnf *cnf, size_t ci){
+    const Lit*cl=cnf_clause(cnf,ci); size_t n=cnf_clause_len(cnf,ci);
+    size_t v[8]; for(size_t i=0;i<n && i<8;i++) v[i]=cl[i].var;
+    return vars_sig(v,n);
+}
+
+static void print_clause(FILE *f, const Cnf *cnf, size_t ci){
+    const Lit*cl=cnf_clause(cnf,ci); size_t n=cnf_clause_len(cnf,ci);
+    fprintf(f, "clause %zu [", ci);
+    for(size_t i=0;i<n;i++) fprintf(f, "%s%u%s", cl[i].positive?"":"-", cl[i].var+1, i+1<n?" ":"");
+    fprintf(f, "]");
+}
+
+static void mono_report(K*k, size_t fail_ci){
+    if(!k->mono) return;
+    size_t fpid = clause_pool(k, fail_ci);
+    uint64_t fsig = clause_sig(k->cnf, fail_ci);
+    size_t fn = cnf_clause_len(k->cnf, fail_ci);
+    fprintf(stderr, "MONO fail %zu pool=%zu vars=%zu sig=%016llx\n", fail_ci, fpid, fn, (unsigned long long)fsig);
+    /* report failed block */
+    fprintf(stderr, "MONO failed-block vars=");
+    { const Lit*cl=cnf_clause(k->cnf,fail_ci); for(size_t i=0;i<fn;i++) fprintf(stderr, "%s%u", i?" ":"", cl[i].var+1); }
+    fprintf(stderr, "\n");
+    size_t block_len=0; for(size_t ci=0;ci<k->ncls;ci++) if(clause_sig(k->cnf,ci)==fsig) block_len++;
+    size_t space = (fn>=8)?0:((size_t)1<<fn);
+    size_t avail = space>block_len ? space-block_len : 0;
+    fprintf(stderr, "MONO failed-block clauses=%zu space=%zu available=%zu\n", block_len, space, avail);
+    fprintf(stderr, "  active:");
+    { const Lit*cl=cnf_clause(k->cnf,fail_ci); bool bs=false;
+      for(size_t i=0;i<fn;i++){ int8_t vv=k->val[cl[i].var]; fprintf(stderr," %u=%s",cl[i].var+1,vv<0?"?":(vv?"1":"0")); }
+      for(size_t ci=0;ci<k->ncls && !bs;ci++) if(clause_sig(k->cnf,ci)==fsig) bs=clause_sat(k,ci);
+      fprintf(stderr," block_sat=%s\n", bs?"yes":"no"); }
+    if(space && block_len>=space) fprintf(stderr, "MONO failed-block UNSOLVABLE full block\n");
+    for(size_t ci=0;ci<k->ncls;ci++) if(clause_sig(k->cnf,ci)==fsig){ fprintf(stderr, "  "); print_clause(stderr,k->cnf,ci); fprintf(stderr,"\n"); }
+    /* external owner pool */
+    size_t ext_pid = SIZE_MAX;
+    if(fpid!=SIZE_MAX){
+        Pool *p=&k->pools[fpid];
+        for(size_t i=0;i<p->nv;i++){ size_t v=p->vars[i]; size_t o=k->owner[v]; if(o!=SIZE_MAX && clause_pool(k,o)!=fpid){ ext_pid=clause_pool(k,o); break; } }
+    }
+    if(ext_pid!=SIZE_MAX){
+        fprintf(stderr, "MONO external-pool %zu\n", ext_pid);
+        /* find representative block in external pool: block of fail_ci? no, block that has external vars */
+        /* report all blocks in ext pool */
+        for(size_t i=0;i<k->pools[ext_pid].nc;i++){
+            size_t ci=k->pools[ext_pid].cls[i]; uint64_t sig=clause_sig(k->cnf,ci);
+            /* report block once */
+            bool first=true; for(size_t j=0;j<i;j++) if(clause_sig(k->cnf,k->pools[ext_pid].cls[j])==sig){first=false;break;}
+            if(!first) continue;
+            size_t n=cnf_clause_len(k->cnf,ci); size_t bl=0; for(size_t x=0;x<k->ncls;x++) if(clause_sig(k->cnf,x)==sig) bl++;
+            size_t spc=(n>=8)?0:((size_t)1<<n); size_t av=spc>bl?spc-bl:0;
+            fprintf(stderr, "  MONO ext-block vars="); const Lit*cl=cnf_clause(k->cnf,ci); for(size_t t=0;t<n;t++) fprintf(stderr,"%s%u",t?" ":"",cl[t].var+1);
+            fprintf(stderr, " clauses=%zu space=%zu available=%zu\n", bl,spc,av);
+            fprintf(stderr, "    active:");
+            bool block_sat=false;
+            for(size_t t=0;t<n;t++){ int8_t vv=k->val[cl[t].var]; fprintf(stderr," %u=%s", cl[t].var+1, vv<0?"?":(vv?"1":"0")); }
+            for(size_t x=0;x<k->ncls && !block_sat;x++) if(clause_sig(k->cnf,x)==sig) block_sat=clause_sat(k,x);
+            fprintf(stderr, " block_sat=%s\n", block_sat?"yes":"no");
+            for(size_t x=0;x<k->ncls;x++) if(clause_sig(k->cnf,x)==sig){ fprintf(stderr,"    "); print_clause(stderr,k->cnf,x); fprintf(stderr,"\n"); }
+        }
+    } else {
+        fprintf(stderr, "MONO external-pool none\n");
+    }
+}
+
 static void build_order(K*k, KnotsSort sort){
     size_t oi=0; bool *seen=calloc(k->ncls?k->ncls:1,1);
     if(!seen) return;
@@ -324,7 +403,7 @@ static bool solve(K*k){
         if(pi>=k->ncls) return true;
         pick_next(k,pi);
         size_t ci=k->order[pi];
-        if(!any_live(k,ci)) { if(k->trace) fprintf(stderr,"TRACE fatal empty ci=%zu pool=%zu sp=%zu\n",ci,clause_pool(k,ci),k->sp); return false; }
+        if(!any_live(k,ci)) { if(k->trace) fprintf(stderr,"TRACE fatal empty ci=%zu pool=%zu sp=%zu\n",ci,clause_pool(k,ci),k->sp); mono_report(k,ci); return false; }
 
         if(clause_conflict(k,ci)){
             bool conf_before=true;
@@ -342,6 +421,7 @@ static bool solve(K*k){
                     for(size_t i=k->sp;i>0 && i+12>k->sp;i--){ Dec*d=&k->stk[i-1]; fprintf(stderr,"  dec clause=%zu vi=%zu/%zu dead=%u\n",d->clause,d->vi,k->vn[d->clause],k->vs[d->clause][d->vi].dead); }
                 }
                 (void)conf_before;
+                mono_report(k,ci);
                 return false;
             }
             if(k->trace>=2) fprintf(stderr,"TRACE backtrack to clause=%zu sp=%zu\n",k->stk[k->sp-1].clause,k->sp);
@@ -416,8 +496,8 @@ static bool solve(K*k){
             }
             if(killed) continue;
             size_t pid=clause_pool(k,ci);
-            if(pid==SIZE_MAX || !pool_has_external_set(k,pid)) return false;
-            return false;
+            if(pid==SIZE_MAX || !pool_has_external_set(k,pid)) { mono_report(k,ci); return false; }
+            mono_report(k,ci); return false;
         }
     }
 }
@@ -436,6 +516,7 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     k.random_mode = cfg ? cfg->knots_random_mode : false;
     k.rng = cfg ? (cfg->knots_seed ? cfg->knots_seed : 1u) : 1u;
     k.sort = cfg ? cfg->knots_sort : KNOTS_SORT_NONE;
+    k.mono = cfg ? cfg->knots_mono : false;
     {
         const char *t=getenv("KNOTS_TRACE"); if(t && *t) k.trace=atoi(t);
         const char *rp=getenv("KNOTS_REF"); if(rp && *rp){ FILE*f=fopen(rp,"r"); if(f){ bool*rb=malloc(k.nvrs?k.nvrs:1); if(rb){ for(size_t i=0;i<k.nvrs;i++){int c=fgetc(f); if(c=='0'||c=='1') rb[i]=(c=='1'); else rb[i]=false;} k.ref=rb; } fclose(f);} }
