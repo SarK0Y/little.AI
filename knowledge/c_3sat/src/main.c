@@ -215,7 +215,10 @@ static ResultUnit opt_yanus_timeout(Cli *cli, const char *flag, const char *valu
     return parse_size(flag, value, &cli->cfg.yanus_timeout_ms);
 }
 static ResultUnit opt_yanus_rounds(Cli *cli, const char *flag, const char *value) {
-    return parse_size(flag, value, &cli->cfg.yanus_attempts);
+    size_t v; TRY0(ResultUnit, parse_size(flag, value, &v));
+    cli->cfg.yanus_attempts = v;
+    cli->cfg.knots_rounds = v;
+    return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_yanus_saturate(Cli *cli, const char *flag, const char *value) {
     char *end = NULL;
@@ -241,6 +244,51 @@ static ResultUnit opt_yanus_diving(Cli *cli, const char *flag, const char *value
     if (!*value || errno || *end || v < 0.0)
         return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected float >= 0)", flag, value);
     cli->cfg.yanus_diving = v;
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_knots_random_mode(Cli *cli, const char *flag, const char *value) {
+    char *end = NULL; errno = 0;
+    unsigned long long v = strtoull(value, &end, 10);
+    if (!*value || errno || *end)
+        return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected integer seed, 0 disables)", flag, value);
+    cli->cfg.knots_random_mode = (v != 0);
+    cli->cfg.knots_seed = (uint64_t)v;
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_knots_sort(Cli *cli, const char *flag, const char *value) {
+    (void)flag;
+    if (strcmp(value,"desc")==0) cli->cfg.knots_sort = KNOTS_SORT_DESC;
+    else if (strcmp(value,"asc")==0) cli->cfg.knots_sort = KNOTS_SORT_ASC;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected desc|asc)", flag, value);
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_knots_sort_dyn(Cli *cli, const char *flag, const char *value) {
+    (void)flag;
+    if (strcmp(value,"desc")==0) cli->cfg.knots_sort = KNOTS_SORT_DYN_DESC;
+    else if (strcmp(value,"asc")==0) cli->cfg.knots_sort = KNOTS_SORT_DYN_ASC;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected desc|asc)", flag, value);
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_path_rider(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->cfg.path_rider);
+}
+static ResultUnit opt_knots_mode(Cli *cli, const char *flag, const char *value) {
+    (void)flag;
+    cli->cfg.knots_glowest = false; cli->cfg.knots_terminator = false; cli->cfg.knots_likho = false; cli->cfg.knots_yanus = false; cli->cfg.knots_gob_recult = false;
+    char buf[64]; strncpy(buf, value, sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+    for(char *p=buf; *p; p++) if(*p=='+') *p=',';
+    char *tok = strtok(buf, ",");
+    bool any=false;
+    while(tok){
+        if(strcmp(tok,"glowest")==0){ cli->cfg.knots_glowest=true; any=true; }
+        else if(strcmp(tok,"terminator")==0){ cli->cfg.knots_terminator=true; any=true; }
+        else if(strcmp(tok,"likho")==0){ cli->cfg.knots_likho=true; any=true; }
+        else if(strcmp(tok,"yanus")==0){ cli->cfg.knots_yanus=true; any=true; }
+        else if(strcmp(tok,"gob-recult")==0 || strcmp(tok,"gob_recult")==0){ cli->cfg.knots_gob_recult=true; any=true; }
+        else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for -knots-mode: `%s` (expected glowest|terminator|likho|yanus|gob-recult|combo)", value);
+        tok=strtok(NULL,",");
+    }
+    if(!any) return ERRF(ResultUnit, ERR_USAGE, "Invalid value for -knots-mode: `%s`", value);
     return OK_UNIT(ResultUnit);
 }
 
@@ -277,6 +325,12 @@ static const OptSpec OPTS[] = {
     { "-saturate", opt_yanus_saturate },     { "--saturate", opt_yanus_saturate },
     { "-yanus-mode", opt_yanus_mode },       { "--yanus-mode", opt_yanus_mode },
     { "-diving", opt_yanus_diving },         { "--diving", opt_yanus_diving },
+    { "-random-mode", opt_knots_random_mode }, { "--random-mode", opt_knots_random_mode },
+    { "-sorted", opt_knots_sort },             { "--sorted", opt_knots_sort },
+    { "-sort", opt_knots_sort },               { "--sort", opt_knots_sort },
+    { "-sorted-dyn", opt_knots_sort_dyn },     { "--sorted-dyn", opt_knots_sort_dyn },
+    { "-path-rider", opt_path_rider },         { "--path-rider", opt_path_rider },
+    { "-knots-mode", opt_knots_mode },         { "--knots-mode", opt_knots_mode },
 };
 
 static void usage(void) {
@@ -294,7 +348,12 @@ static void usage(void) {
         "                      [-play-baseline P] [-set-baseline N] [-coef-k K]\n"
         "                      [-timeout MS] [-rounds N] (Yanus: default 30ms, 0 rounds)\n"
         "                      [-saturate F] (Yanus extra vars = F * n_clauses, 0 = random)\n"
-        "                      [-yanus-mode glowest|terminator|baddymove|both] [-diving K]\n");
+        "                      [-yanus-mode glowest|terminator|baddymove|both] [-diving K]\n"
+        "                      [-random-mode SEED] (Knots: random clause order, 0 disables; -rounds N attempts)\n"
+        "                      [-sorted desc|asc|-sort desc|asc] (Knots: clause order by var popularity)\n"
+        "                      [-sorted-dyn desc|asc] (Knots: dynamic popularity per step)\n"
+        "                      [-path-rider P] (Knots: try 2^P random var-equality assignments)\n"
+        "                      [-knots-mode glowest|terminator|likho|yanus|gob-recult|combo] (Knots post-process)\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {

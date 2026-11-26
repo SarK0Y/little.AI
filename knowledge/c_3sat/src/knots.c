@@ -22,6 +22,9 @@ typedef struct {
     size_t *pos;        /* clause -> index in order */
     const bool *ref;    /* optional reference SAT assignment for tracing */
     int trace;
+    bool random_mode;
+    uint64_t rng;
+    KnotsSort sort;
 } K;
 
 static bool ltrue(const Lit*l,int8_t v){return v>=0 && ((v==1)==l->positive);}
@@ -232,17 +235,103 @@ static bool restate_external(K*k,size_t ci){
     return false;
 }
 
+static uint64_t krng(K*k){ uint64_t x=k->rng; x^=x<<13; x^=x>>7; x^=x<<17; return k->rng=x; }
+
+static void build_order(K*k, KnotsSort sort){
+    size_t oi=0; bool *seen=calloc(k->ncls?k->ncls:1,1);
+    if(!seen) return;
+    if(sort!=KNOTS_SORT_NONE){
+        size_t *pop=calloc(k->nvrs?k->nvrs:1,sizeof*pop);
+        if(pop){
+            for(size_t ci=0;ci<k->ncls;ci++){
+                const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci);
+                for(size_t i=0;i<n;i++) pop[cl[i].var]++;
+            }
+            bool any=true;
+            while(any){
+                any=false; size_t best_v=SIZE_MAX; size_t best_p=0;
+                for(size_t v=0;v<k->nvrs;v++){
+                    if(pop[v]==0) continue;
+                    /* check if var appears in any unseen clause */
+                    bool has=false;
+                    for(size_t ci=0;ci<k->ncls && !has;ci++) if(!seen[ci]){ const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci); for(size_t i=0;i<n;i++) if(cl[i].var==v){has=true;break;} }
+                    if(!has){ pop[v]=0; continue; }
+                    if(best_v==SIZE_MAX || (sort==KNOTS_SORT_DESC ? pop[v]>best_p : pop[v]<best_p)){
+                        best_v=v; best_p=pop[v]; any=true;
+                    }
+                }
+                if(!any) break;
+                for(size_t ci=0;ci<k->ncls;ci++){
+                    if(seen[ci]) continue;
+                    const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci);
+                    bool has=false; for(size_t i=0;i<n;i++) if(cl[i].var==best_v){has=true;break;}
+                    if(has){ k->order[oi++]=ci; seen[ci]=true; }
+                }
+                pop[best_v]=0;
+            }
+            free(pop);
+        }
+    }
+    if(oi==0){
+        /* default: pool-grouped */
+        for(size_t i=0;i<k->ncls;i++){
+            if(seen[i]) continue;
+            size_t pid = clause_pool(k,i);
+            if(pid==SIZE_MAX){ k->order[oi++]=i; seen[i]=true; continue; }
+            Pool *p=&k->pools[pid];
+            for(size_t j=0;j<p->nc;j++){ size_t ci=p->cls[j]; if(!seen[ci]){ k->order[oi++]=ci; seen[ci]=true; } }
+            if(!seen[i]){ k->order[oi++]=i; seen[i]=true; }
+        }
+    }
+    for(size_t i=0;i<k->ncls;i++) if(!seen[i]) k->order[oi++]=i;
+    for(size_t i=0;i<k->ncls;i++) k->pos[k->order[i]]=i;
+    free(seen);
+}
+static size_t pick_next(K*k,size_t pi){
+    if(k->sort==KNOTS_SORT_DYN_DESC || k->sort==KNOTS_SORT_DYN_ASC){
+        /* recalc popularity among unsatisfied clauses from pi onward */
+        size_t *pop=calloc(k->nvrs?k->nvrs:1,sizeof*pop);
+        if(pop){
+            for(size_t j=pi;j<k->ncls;j++){
+                size_t ci=k->order[j]; if(clause_sat(k,ci)) continue;
+                const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci);
+                for(size_t i=0;i<n;i++) pop[cl[i].var]++;
+            }
+            size_t best_j=pi; size_t best_p=0; bool have=false;
+            for(size_t j=pi;j<k->ncls;j++){
+                size_t ci=k->order[j]; if(clause_sat(k,ci)) continue;
+                const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci);
+                size_t p=0; for(size_t i=0;i<n;i++){ size_t pv=pop[cl[i].var]; if(pv>p) p=pv; }
+                if(!have || (k->sort==KNOTS_SORT_DYN_DESC ? p>best_p : p<best_p)){ have=true; best_p=p; best_j=j; }
+            }
+            free(pop);
+            if(have && best_j!=pi){ size_t tmp=k->order[pi]; k->order[pi]=k->order[best_j]; k->order[best_j]=tmp; k->pos[k->order[pi]]=pi; k->pos[k->order[best_j]]=best_j; }
+        }
+        return pi;
+    }
+    if(!k->random_mode) return pi;
+    size_t n=k->ncls-pi; if(n<=1) return pi;
+    size_t j = pi + (size_t)(krng(k) % n);
+    size_t tmp=k->order[pi]; k->order[pi]=k->order[j]; k->order[j]=tmp;
+    k->pos[k->order[pi]]=pi; k->pos[k->order[j]]=j;
+    return pi;
+}
+
 static bool solve(K*k){
     size_t pi=0;
     while(1){
-        while(pi<k->ncls && clause_sat(k,k->order[pi])) pi++;
+        while(pi<k->ncls){ size_t ci=k->order[pi]; if(clause_sat(k,ci)) pi++; else break; }
         if(pi>=k->ncls) return true;
+        pick_next(k,pi);
         size_t ci=k->order[pi];
         if(!any_live(k,ci)) { if(k->trace) fprintf(stderr,"TRACE fatal empty ci=%zu pool=%zu sp=%zu\n",ci,clause_pool(k,ci),k->sp); return false; }
 
         if(clause_conflict(k,ci)){
             bool conf_before=true;
             if(!restate_external(k,ci)) {
+                /* Restating may undo the conflicting decisions without finding a
+                   replacement. Re-check: the clause can now be open, not conflicted. */
+                if(!clause_conflict(k,ci)) { pi=k->pos[ci]; continue; }
                 if(k->trace){
                     size_t pid=clause_pool(k,ci);
                     fprintf(stderr,"TRACE fatal conflict ci=%zu pool=%zu sp=%zu ext=%d conf_now=%d\n",ci,pid,k->sp,(pid!=SIZE_MAX && pool_has_external_set(k,pid))?1:0, clause_conflict(k,ci)?1:0);
@@ -256,6 +345,12 @@ static bool solve(K*k){
                 return false;
             }
             if(k->trace>=2) fprintf(stderr,"TRACE backtrack to clause=%zu sp=%zu\n",k->stk[k->sp-1].clause,k->sp);
+            if(k->trace && k->ref){
+                size_t j=k->stk[k->sp-1].clause; size_t jvi=k->stk[k->sp-1].vi;
+                const Lit*cl=cnf_clause(k->cnf,j); size_t n=cnf_clause_len(k->cnf,j); uint8_t m=k->vs[j][jvi].mask;
+                bool bad=false; for(size_t i=0;i<n;i++){ int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1); bool rv=k->ref[cl[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
+                if(bad) fprintf(stderr,"TRACE restated-to-deviation jcl=%zu vi=%zu\n",j,jvi);
+            }
             pi=k->pos[k->stk[k->sp-1].clause];
             continue;
         }
@@ -281,8 +376,29 @@ static bool solve(K*k){
                 if(ar==0){ k->sp--; undo_dec(k,d); continue; } /* temp external conflict: keep variant live */
                 if(k->trace && k->ref){
                     const Lit*cl2=cnf_clause(k->cnf,ci); size_t n2=cnf_clause_len(k->cnf,ci); uint8_t m2=k->vs[ci][vi].mask;
-                    bool bad=false; for(size_t i=0;i<n2;i++){ int want=(m2&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); bool rv=k->ref[cl2[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
-                    if(bad) fprintf(stderr,"TRACE pick ci=%zu vi=%zu deviates-from-ref\n",ci,vi);
+                    bool bad=false;
+                    for(size_t i=0;i<n2;i++){ int want=(m2&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); bool rv=k->ref[cl2[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
+                    if(bad){
+                        bool ref_ok=false; size_t ref_vi=SIZE_MAX;
+                        for(size_t rvi=0;rvi<k->vn[ci];rvi++){
+                            if(k->vs[ci][rvi].dead) continue;
+                            uint8_t rm=k->vs[ci][rvi].mask; bool ok=true;
+                            for(size_t i=0;i<n2;i++){ int want=(rm&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); bool rv=k->ref[cl2[i].var]; if((want?1:0)!=(rv?1:0)) {ok=false;break;} int8_t cur=k->val[cl2[i].var]; if(cur>=0 && cur!=want){ok=false;break;} }
+                            if(ok){ref_ok=true; ref_vi=rvi; break;}
+                        }
+                        fprintf(stderr,"TRACE pick ci=%zu vi=%zu deviates-from-ref ref_ok=%d ref_vi=%zu\n",ci,vi,ref_ok?1:0,ref_vi);
+                        if(!ref_ok){
+                            /* find which current assignments block ref */
+                            for(size_t rvi=0;rvi<k->vn[ci];rvi++){
+                                if(k->vs[ci][rvi].dead) continue;
+                                uint8_t rm=k->vs[ci][rvi].mask; bool ref_match=true;
+                                for(size_t i=0;i<n2;i++){ int want=(rm&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); bool rv=k->ref[cl2[i].var]; if((want?1:0)!=(rv?1:0)) {ref_match=false;break;} }
+                                if(!ref_match) continue;
+                                for(size_t i=0;i<n2;i++){ int want=(rm&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); int8_t cur=k->val[cl2[i].var]; if(cur>=0 && cur!=want){ fprintf(stderr,"  BLOCK v%u cur=%d want=%d owner_ci=%zu\n",cl2[i].var,(int)cur,want,k->owner[cl2[i].var]); } }
+                                break;
+                            }
+                        }
+                    }
                 }
                 progressed=true; pi++; break;
             }
@@ -317,6 +433,9 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     k.order=malloc((k.ncls?k.ncls:1)*sizeof*k.order);
     k.pos=malloc((k.ncls?k.ncls:1)*sizeof*k.pos);
     k.ref = NULL; k.trace = 0;
+    k.random_mode = cfg ? cfg->knots_random_mode : false;
+    k.rng = cfg ? (cfg->knots_seed ? cfg->knots_seed : 1u) : 1u;
+    k.sort = cfg ? cfg->knots_sort : KNOTS_SORT_NONE;
     {
         const char *t=getenv("KNOTS_TRACE"); if(t && *t) k.trace=atoi(t);
         const char *rp=getenv("KNOTS_REF"); if(rp && *rp){ FILE*f=fopen(rp,"r"); if(f){ bool*rb=malloc(k.nvrs?k.nvrs:1); if(rb){ for(size_t i=0;i<k.nvrs;i++){int c=fgetc(f); if(c=='0'||c=='1') rb[i]=(c=='1'); else rb[i]=false;} k.ref=rb; } fclose(f);} }
@@ -324,25 +443,23 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     if(!k.val||!k.owner||!k.var_pool||!k.vs||!k.vn||!as||!k.order||!k.pos) goto oom;
     for(size_t v=0;v<k.nvrs;v++){ k.val[v]=-1; k.owner[v]=SIZE_MAX; k.var_pool[v]=SIZE_MAX; }
     for(size_t i=0;i<k.ncls;i++){ build_variants(&k,i); if(!attach_pool(&k,i)) goto oom; }
-    /* process clauses grouped by pool to exploit inner-only pools locally */
-    {
-        size_t oi=0; bool *seen=calloc(k.ncls?k.ncls:1,1);
-        if(!seen) goto oom;
-        for(size_t i=0;i<k.ncls;i++){
-            if(seen[i]) continue;
-            size_t pid = clause_pool(&k,i);
-            if(pid==SIZE_MAX){ k.order[oi++]=i; seen[i]=true; continue; }
-            Pool *p=&k.pools[pid];
-            for(size_t j=0;j<p->nc;j++){ size_t ci=p->cls[j]; if(!seen[ci]){ k.order[oi++]=ci; seen[ci]=true; } }
-            if(!seen[i]){ k.order[oi++]=i; seen[i]=true; }
-        }
-        for(size_t i=0;i<k.ncls;i++) if(!seen[i]) k.order[oi++]=i;
-        for(size_t i=0;i<k.ncls;i++) k.pos[k.order[i]]=i;
-        free(seen);
+    build_order(&k, cfg ? cfg->knots_sort : KNOTS_SORT_NONE);
+    bool ok=false;
+    size_t rounds = (cfg && cfg->knots_rounds) ? cfg->knots_rounds : 1;
+    if(!k.random_mode) rounds = 1;
+    for(size_t r=0;r<rounds && !ok;r++){
+        for(size_t v=0;v<k.nvrs;v++){ k.val[v]=-1; k.owner[v]=SIZE_MAX; }
+        for(size_t i=0;i<k.ncls;i++) for(size_t vi=0;vi<k.vn[i];vi++) k.vs[i][vi].dead=0;
+        for(size_t i=0;i<k.sp;i++) free(k.stk[i].chg);
+        k.sp=0;
+        build_order(&k, cfg ? cfg->knots_sort : KNOTS_SORT_NONE);
+        k.rng += 0x9e3779b97f4a7c15ULL + r;
+        ok = solve(&k);
+        if(k.trace) fprintf(stderr,"TRACE round %zu ok=%d\n",r,ok?1:0);
     }
-    bool ok=solve(&k);
     for(size_t v=0;v<k.nvrs;v++) as[v]= ok ? (k.val[v]>0) : false;
     solver_set_assignment(s,as);
+    /* Post-modes are applied by solver_solve on SAT or UNKNOWN for Knots init. */
     for(size_t i=0;i<k.ncls;i++) free(k.vs[i]);
     for(size_t i=0;i<k.sp;i++) free(k.stk[i].chg);
     for(size_t i=0;i<k.np;i++){ free(k.pools[i].vars); free(k.pools[i].cls); }

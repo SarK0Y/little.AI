@@ -140,7 +140,8 @@ Restart 0 starts from a chosen init (later restarts are always random):
   try inner vars first, then restate the owning external decision and remove the
   failed variant. Variants incompatible with temporary external assignments are
   kept live unless no external restatement is possible; exhausted pool before
-  completion returns `UNKNOWN`.
+  completion returns `UNKNOWN`. `-random-mode SEED` picks next unsatisfied clauses randomly (`0` disables);
+  `-rounds N` repeats random attempts (default 1). `-sorted desc|asc` (alias `-sort`) orders clauses by variable popularity: `desc` picks clauses with the most frequent variable first, then next, etc.; `asc` the reverse. `-sorted-dyn desc|asc` recalculates popularity per step among unsatisfied clauses. `-path-rider P` picks `P` random vars, enumerates `2^(P-1)` equality/neg-equality assignments relative to the first, reduces CNF per assignment, and runs the selected solver; returns first SAT or best UNKNOWN. `-knots-mode glowest|terminator|likho|yanus|combo` post-processes a Knots SAT assignment with glowest/terminator/likho/yanus repair (uses `--terminator-*`, `-deep-dive`, `-saturate/-rounds/-timeout/-yanus-mode/-diving`).
 - `--init likho`: pre-cooked start (all-false by default), then a
   neutral/switch-domain repair pass.
 - `-deep-dive VARS NODES`: implies `--init likho`, caps switch domains at VARS

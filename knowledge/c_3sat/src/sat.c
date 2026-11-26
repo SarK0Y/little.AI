@@ -400,6 +400,16 @@ SolverConfig solver_config_default(void) {
         .yanus_terminator = true,
         .yanus_baddymove = false,
         .yanus_diving = 0.0,
+        .knots_random_mode = false,
+        .knots_seed = 1,
+        .knots_rounds = 1,
+        .knots_sort = KNOTS_SORT_NONE,
+        .knots_glowest = false,
+        .knots_terminator = false,
+        .knots_likho = false,
+        .knots_yanus = false,
+        .knots_gob_recult = false,
+        .path_rider = 0,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -1766,6 +1776,109 @@ bool cnf_find_contradictions(const Cnf *cnf, Contradiction **out, size_t *out_n)
     return true;
 }
 
+static bool cnf_build_reduced(const Cnf *src, const size_t *map, const bool *neg, Cnf *out){
+    /* map[v]=SIZE_MAX means keep var (remapped later); else map to map[v] with xor neg[v]. */
+    size_t nv=src->n_vars;
+    size_t *id=malloc((nv?nv:1)*sizeof*id);
+    if(!id) return false;
+    size_t nn=0;
+    for(size_t v=0;v<nv;v++){ if(map[v]==SIZE_MAX) id[v]=nn++; else id[v]=SIZE_MAX; }
+    /* resolve mapping to kept vars */
+    size_t *rmap=malloc((nv?nv:1)*sizeof*rmap); bool *rneg=malloc(nv?nv:1);
+    if(!rmap||!rneg){ free(id); free(rmap); free(rneg); return false; }
+    for(size_t v=0;v<nv;v++){
+        size_t cur=v; bool n=false; size_t guard=0;
+        while(map[cur]!=SIZE_MAX && guard++<=nv){ n ^= neg[cur]; cur = map[cur]; }
+        if(map[cur]!=SIZE_MAX){ free(id); free(rmap); free(rneg); return false; }
+        rmap[v]=cur; rneg[v]=n;
+    }
+    out->n_vars=nn; out->n_clauses=0; out->off=NULL; out->lits=NULL;
+    size_t capoff=0,caplit=0;
+    if(!vec_reserve((void**)&out->off,&capoff,sizeof*out->off,1)){ free(id); free(rmap); free(rneg); return false; }
+    out->off[0]=0;
+    Lit *cur=malloc(16*sizeof*cur); size_t ncur=0, capcur=16;
+    if(!cur){ free(id); free(rmap); free(rneg); cnf_free(out); return false; }
+    for(size_t ci=0;ci<src->n_clauses;ci++){
+        ncur=0; bool taut=false;
+        const Lit *cl=cnf_clause(src,ci); size_t n=cnf_clause_len(src,ci);
+        for(size_t i=0;i<n && !taut;i++){
+            size_t v=rmap[cl[i].var]; bool pos = cl[i].positive ^ rneg[cl[i].var];
+            Lit nl={(uint32_t)id[v], pos};
+            bool dup=false;
+            for(size_t k=0;k<ncur;k++){ if(cur[k].var==nl.var){ if(cur[k].positive!=nl.positive) taut=true; else dup=true; break; } }
+            if(dup||taut) continue;
+            if(ncur==capcur){ size_t nc=capcur*2; Lit*tmp=realloc(cur,nc*sizeof*cur); if(!tmp){ free(cur); free(id); free(rmap); free(rneg); cnf_free(out); return false; } cur=tmp; capcur=nc; }
+            cur[ncur++]=nl;
+        }
+        if(taut) continue;
+        size_t start=out->off[out->n_clauses];
+        if(!vec_reserve((void**)&out->lits,&caplit,sizeof*out->lits,start+ncur) ||
+           !vec_reserve((void**)&out->off,&capoff,sizeof*out->off,out->n_clauses+2)){
+            free(cur); free(id); free(rmap); free(rneg); cnf_free(out); return false;
+        }
+        for(size_t k=0;k<ncur;k++) out->lits[start+k]=cur[k];
+        out->off[++out->n_clauses]=start+ncur;
+    }
+    if(!out->lits) out->lits=malloc(sizeof*out->lits);
+    free(cur); free(id); free(rmap); free(rneg);
+    return out->lits!=NULL;
+}
+
+static ResultSolve solver_solve_path_rider(Solver *s, const SolverConfig *cfg){
+    const Cnf *cnf=s->cnf; size_t p=cfg->path_rider;
+    if(p<2 || p>cnf->n_vars) return ERRF(ResultSolve, ERR_USAGE, "-path-rider P requires 2 <= P <= n_vars");
+    if(p-1 >= sizeof(size_t)*8) return ERRF(ResultSolve, ERR_USAGE, "-path-rider too large");
+    size_t combos = (size_t)1 << (p-1);
+    Rng rng = rng_new(cfg->seed);
+    size_t *pick=malloc(p*sizeof*pick);
+    bool *used=calloc(cnf->n_vars?cnf->n_vars:1,1);
+    if(!pick||!used){ free(pick); free(used); return ERRF(ResultSolve, ERR_NOMEM, "out of memory"); }
+    for(size_t i=0;i<p;i++){
+        size_t v;
+        do { v = rng_index(&rng, cnf->n_vars); } while(used[v]);
+        used[v]=true; pick[i]=v;
+    }
+    free(used);
+    size_t *map=malloc((cnf->n_vars?cnf->n_vars:1)*sizeof*map);
+    bool *neg=malloc(cnf->n_vars?cnf->n_vars:1);
+    bool *best_a=calloc(cnf->n_vars?cnf->n_vars:1,1);
+    if(!map||!neg||!best_a){ free(pick); free(map); free(neg); free(best_a); return ERRF(ResultSolve, ERR_NOMEM, "out of memory"); }
+    size_t best_unsat=SIZE_MAX; size_t best_steps=0;
+    for(size_t mask=0; mask<combos; mask++){
+        for(size_t v=0;v<cnf->n_vars;v++){ map[v]=SIZE_MAX; neg[v]=false; }
+        size_t base=pick[0];
+        for(size_t i=1;i<p;i++){ map[pick[i]]=base; neg[pick[i]] = ((mask>>(i-1))&1u)!=0; }
+        Cnf red={0};
+        if(!cnf_build_reduced(cnf,map,neg,&red)){ free(pick); free(map); free(neg); free(best_a); return ERRF(ResultSolve, ERR_NOMEM, "out of memory"); }
+        SolverConfig sc=*cfg; sc.path_rider=0;
+        Solver *ss=TRY(ResultSolve, solver_new(&red, cfg->seed + mask + 1));
+        ResultSolve rs=solver_solve(ss, &sc);
+        if(!rs.ok){ solver_free(ss); cnf_free(&red); free(pick); free(map); free(neg); free(best_a); return rs; }
+        SolveResult r=rs.val;
+        if(r.status==SOLVE_SAT){
+            /* map reduced assignment back */
+            size_t *id=malloc((cnf->n_vars?cnf->n_vars:1)*sizeof*id); size_t nn=0;
+            for(size_t v=0;v<cnf->n_vars;v++){ if(map[v]==SIZE_MAX) id[v]=nn++; else id[v]=SIZE_MAX; }
+            bool *full=malloc(cnf->n_vars?cnf->n_vars:1);
+            if(!id||!full){ free(id); free(full); solve_result_free(&r); solver_free(ss); cnf_free(&red); free(pick); free(map); free(neg); free(best_a); return ERRF(ResultSolve, ERR_NOMEM, "out of memory"); }
+            for(size_t v=0;v<cnf->n_vars;v++){
+                size_t cur=v; bool n=false; size_t guard=0;
+                while(map[cur]!=SIZE_MAX && guard++<=cnf->n_vars){ n^=neg[cur]; cur=map[cur]; }
+                bool val = (cur<cnf->n_vars && id[cur]<r.n_vars) ? r.assignment[id[cur]] : false;
+                full[v]= n ? !val : val;
+            }
+            free(id);
+            solve_result_free(&r); solver_free(ss); cnf_free(&red); free(pick); free(map); free(neg); free(best_a);
+            return OK(ResultSolve, ((SolveResult){ SOLVE_SAT, full, cnf->n_vars, best_steps, 0, 0, NULL, 0 }));
+        }
+        if(r.status==SOLVE_UNKNOWN && r.best_unsatisfied < best_unsat){ best_unsat=r.best_unsatisfied; best_steps=r.steps; }
+        /* keep no best assignment for now */
+        solve_result_free(&r); solver_free(ss); cnf_free(&red);
+    }
+    free(pick); free(map); free(neg); free(best_a);
+    return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, best_steps, 0, best_unsat==SIZE_MAX?cnf->n_clauses:best_unsat, NULL, 0 }));
+}
+
 ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
     const Cnf *cnf = s->cnf;
     Contradiction *contradictions = NULL;
@@ -1782,6 +1895,7 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
         memset(s->assignment, 0, cnf->n_vars);
         return make_sat(s, 0, 0);
     }
+    if (cfg->path_rider > 0) return solver_solve_path_rider(s, cfg);
     PickFn pick = cfg->pick ? cfg->pick : pick_ranked;
     size_t total = 0, best = SIZE_MAX;
     for (size_t restart = 0; restart <= cfg->restarts; restart++) {
@@ -1795,7 +1909,16 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
         } else if (restart == 0 && cfg->init == INIT_YANUS) {
             if (!solver_init_yanus(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_KNOTS) {
-            if (!solver_init_knots(s, cfg)) return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, s->n_rogue, NULL, 0 }));
+            bool kok = solver_init_knots(s, cfg);
+            if (cfg->knots_glowest || cfg->knots_terminator || cfg->knots_likho || cfg->knots_yanus || cfg->knots_gob_recult) {
+                if (cfg->knots_glowest) solver_init_glowest(s);
+                if (cfg->knots_terminator) solver_terminator(s, cfg->terminator_rounds, cfg->terminator_order);
+                if (cfg->knots_likho) solver_likho(s, cfg);
+                if (cfg->knots_yanus) solver_init_yanus(s, cfg);
+                if (cfg->knots_gob_recult) solver_init_gob_recult(s, cfg);
+            }
+            if (s->n_rogue != 0) return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, s->n_rogue, NULL, 0 }));
+            (void)kok;
         } else if (restart == 0 && cfg->init == INIT_MIN_OVERLAP) {
             if (!solver_init_min_overlap(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_GOB) {

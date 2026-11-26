@@ -123,6 +123,8 @@ typedef enum {
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
 
+typedef enum { KNOTS_SORT_NONE = 0, KNOTS_SORT_DESC, KNOTS_SORT_ASC, KNOTS_SORT_DYN_DESC, KNOTS_SORT_DYN_ASC } KnotsSort;
+
 /* Variable visit order for Terminator rounds. */
 typedef enum { TERM_FORWARD, TERM_REVERSE, TERM_RANDOM } TerminatorOrder;
 /* Start-var strategy for Neighborhood0. */
@@ -157,6 +159,16 @@ typedef struct {
     bool yanus_terminator;      /* hill-climb mapped assignment (default true) */
     bool yanus_baddymove;       /* hill-climb with bad moves (default false) */
     double yanus_diving;        /* -diving k: NNV[0]=D*k, NNV[i]=NNV[i-1]*k added; 0=off */
+    bool knots_random_mode;     /* Knots: pick clauses randomly */
+    uint64_t knots_seed;        /* Knots: RNG seed for -random-mode */
+    size_t knots_rounds;        /* Knots: random-mode attempts, 0 = default 1 */
+    KnotsSort knots_sort;       /* Knots: order clauses by var popularity */
+    bool knots_glowest;         /* Knots: apply glowest after knots */
+    bool knots_terminator;      /* Knots: apply terminator after knots */
+    bool knots_likho;           /* Knots: apply likho after knots */
+    bool knots_yanus;           /* Knots: apply yanus after knots */
+    bool knots_gob_recult;      /* Knots: apply gob-recult after knots */
+    size_t path_rider;          /* -path-rider P: enumerate 2^P var assignments */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
