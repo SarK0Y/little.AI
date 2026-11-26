@@ -12,6 +12,7 @@ typedef struct { size_t clause; size_t vi; size_t *chg; size_t cn, cap; } Dec;
 typedef struct {
     size_t *vars; size_t nv, cv; size_t *cls; size_t nc, cc;
     uint64_t sig;   /* sorted vars signature hash for mono block */
+    bool gray;
 } Pool;
 typedef struct {
     const Cnf *cnf; size_t nvrs, ncls;
@@ -29,6 +30,7 @@ typedef struct {
     uint64_t rng;
     KnotsSort sort;
     bool mono;
+    bool gray_phase; /* reprocessing gray blocks */
 } K;
 
 static bool ltrue(const Lit*l,int8_t v){return v>=0 && ((v==1)==l->positive);}
@@ -172,19 +174,15 @@ static bool try_restate_at(K*k,size_t jump){
         }
         return true;
     }
-    /* exhausted all variants after old_vi in this context; mark old_vi dead? no, try from 0 with dead marks? */
+    /* exhausted in this context; before gray processing, don't drain pool */
+    if(!k->gray_phase) return false;
     k->vs[jcl][old_vi].dead=1;
     for(size_t vi=0;vi<k->vn[jcl];vi++){
         if(k->vs[jcl][vi].dead) continue;
         if(!push_dec(k,jcl,vi)) return false;
         Dec*d=&k->stk[k->sp-1]; int ar=apply_variant(k,jcl,vi,d);
         if(ar<0) return false;
-        if(ar==0){ k->sp--; undo_dec(k,d); continue; } /* keep live; may be valid after external restate */
-        if(k->trace && k->ref){
-            const Lit*cl=cnf_clause(k->cnf,jcl); size_t n=cnf_clause_len(k->cnf,jcl); uint8_t m=k->vs[jcl][vi].mask;
-            bool bad=false; for(size_t i=0;i<n;i++){ int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1); bool rv=k->ref[cl[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
-            if(bad) fprintf(stderr,"TRACE restate-wrap jcl=%zu vi=%zu deviates-from-ref\n",jcl,vi);
-        }
+        if(ar==0){ k->sp--; undo_dec(k,d); continue; }
         return true;
     }
     return false;
@@ -264,6 +262,16 @@ static void print_clause(FILE *f, const Cnf *cnf, size_t ci){
     fprintf(f, "]");
 }
 
+static void print_variant(FILE *f, const Cnf *cnf, size_t ci, uint8_t mask, bool dead){
+    const Lit*cl=cnf_clause(cnf,ci); size_t n=cnf_clause_len(cnf,ci);
+    fprintf(f, "%s{", dead?"dead":"live");
+    for(size_t i=0;i<n;i++){
+        int want=(mask&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1);
+        fprintf(f, "%s%u=%d", i?" ":"", cl[i].var+1, want);
+    }
+    fprintf(f, "}");
+}
+
 static void mono_report(K*k, size_t fail_ci){
     if(!k->mono) return;
     size_t fpid = clause_pool(k, fail_ci);
@@ -284,7 +292,12 @@ static void mono_report(K*k, size_t fail_ci){
       for(size_t ci=0;ci<k->ncls && !bs;ci++) if(clause_sig(k->cnf,ci)==fsig) bs=clause_sat(k,ci);
       fprintf(stderr," block_sat=%s\n", bs?"yes":"no"); }
     if(space && block_len>=space) fprintf(stderr, "MONO failed-block UNSOLVABLE full block\n");
-    for(size_t ci=0;ci<k->ncls;ci++) if(clause_sig(k->cnf,ci)==fsig){ fprintf(stderr, "  "); print_clause(stderr,k->cnf,ci); fprintf(stderr,"\n"); }
+    for(size_t ci=0;ci<k->ncls;ci++) if(clause_sig(k->cnf,ci)==fsig){
+        fprintf(stderr, "  "); print_clause(stderr,k->cnf,ci);
+        fprintf(stderr, " variants:");
+        for(size_t vi=0;vi<k->vn[ci];vi++){ fprintf(stderr," "); print_variant(stderr,k->cnf,ci,k->vs[ci][vi].mask,k->vs[ci][vi].dead!=0); }
+        fprintf(stderr,"\n");
+    }
     /* external owner pool */
     size_t ext_pid = SIZE_MAX;
     if(fpid!=SIZE_MAX){
@@ -309,7 +322,12 @@ static void mono_report(K*k, size_t fail_ci){
             for(size_t t=0;t<n;t++){ int8_t vv=k->val[cl[t].var]; fprintf(stderr," %u=%s", cl[t].var+1, vv<0?"?":(vv?"1":"0")); }
             for(size_t x=0;x<k->ncls && !block_sat;x++) if(clause_sig(k->cnf,x)==sig) block_sat=clause_sat(k,x);
             fprintf(stderr, " block_sat=%s\n", block_sat?"yes":"no");
-            for(size_t x=0;x<k->ncls;x++) if(clause_sig(k->cnf,x)==sig){ fprintf(stderr,"    "); print_clause(stderr,k->cnf,x); fprintf(stderr,"\n"); }
+            for(size_t x=0;x<k->ncls;x++) if(clause_sig(k->cnf,x)==sig){
+                fprintf(stderr,"    "); print_clause(stderr,k->cnf,x);
+                fprintf(stderr," variants:");
+                for(size_t vi=0;vi<k->vn[x];vi++){ fprintf(stderr," "); print_variant(stderr,k->cnf,x,k->vs[x][vi].mask,k->vs[x][vi].dead!=0); }
+                fprintf(stderr,"\n");
+            }
         }
     } else {
         fprintf(stderr, "MONO external-pool none\n");
@@ -396,46 +414,57 @@ static size_t pick_next(K*k,size_t pi){
     return pi;
 }
 
+static bool is_gray_clause(K*k,size_t ci){
+    size_t pid=clause_pool(k,ci);
+    return pid!=SIZE_MAX && k->pools[pid].gray;
+}
+static void mark_gray(K*k,size_t ci){
+    size_t pid=clause_pool(k,ci);
+    if(pid!=SIZE_MAX) k->pools[pid].gray=true;
+}
+
 static bool solve(K*k){
     size_t pi=0;
     while(1){
-        while(pi<k->ncls){ size_t ci=k->order[pi]; if(clause_sat(k,ci)) pi++; else break; }
-        if(pi>=k->ncls) return true;
+        while(pi<k->ncls){
+            size_t ci=k->order[pi];
+            if(clause_sat(k,ci) || (!k->gray_phase && is_gray_clause(k,ci))) { pi++; continue; }
+            break;
+        }
+        if(pi>=k->ncls){
+            size_t bad=SIZE_MAX; bool any_gray=false;
+            for(size_t i=0;i<k->ncls;i++){
+                size_t ci=k->order[i];
+                if(clause_sat(k,ci)) continue;
+                if(!k->gray_phase && is_gray_clause(k,ci)) { any_gray=true; continue; }
+                bad=i; break;
+            }
+            if(bad==SIZE_MAX){
+                if(!k->gray_phase && any_gray){ k->gray_phase=true; pi=0; continue; }
+                return true;
+            }
+            if(!k->gray_phase){
+                bool only_gray=true;
+                for(size_t i=0;i<k->ncls;i++){ size_t ci=k->order[i]; if(!clause_sat(k,ci) && !is_gray_clause(k,ci)){ only_gray=false; break; } }
+                if(only_gray){ k->gray_phase=true; pi=0; continue; }
+            }
+            pi=bad;
+        }
         pick_next(k,pi);
         size_t ci=k->order[pi];
-        if(!any_live(k,ci)) { if(k->trace) fprintf(stderr,"TRACE fatal empty ci=%zu pool=%zu sp=%zu\n",ci,clause_pool(k,ci),k->sp); mono_report(k,ci); return false; }
+        if(!k->gray_phase && is_gray_clause(k,ci)){ pi++; continue; }
+        if(!any_live(k,ci)) { mono_report(k,ci); return false; }
 
         if(clause_conflict(k,ci)){
-            bool conf_before=true;
             if(!restate_external(k,ci)) {
-                /* Restating may undo the conflicting decisions without finding a
-                   replacement. Re-check: the clause can now be open, not conflicted. */
                 if(!clause_conflict(k,ci)) { pi=k->pos[ci]; continue; }
-                if(k->trace){
-                    size_t pid=clause_pool(k,ci);
-                    fprintf(stderr,"TRACE fatal conflict ci=%zu pool=%zu sp=%zu ext=%d conf_now=%d\n",ci,pid,k->sp,(pid!=SIZE_MAX && pool_has_external_set(k,pid))?1:0, clause_conflict(k,ci)?1:0);
-                    const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci);
-                    for(size_t i=0;i<n;i++) fprintf(stderr,"  lit v%u=%d owner=%zu od=%zu\n",cl[i].var, (int)k->val[cl[i].var], k->owner[cl[i].var], owner_dec(k,cl[i].var));
-                    fprintf(stderr,"  live ci=%d\n", any_live(k,ci)?1:0);
-                    for(size_t vi=0;vi<k->vn[ci];vi++) fprintf(stderr,"  v[%zu] dead=%u\n",vi,k->vs[ci][vi].dead);
-                    for(size_t i=k->sp;i>0 && i+12>k->sp;i--){ Dec*d=&k->stk[i-1]; fprintf(stderr,"  dec clause=%zu vi=%zu/%zu dead=%u\n",d->clause,d->vi,k->vn[d->clause],k->vs[d->clause][d->vi].dead); }
-                }
-                (void)conf_before;
-                mono_report(k,ci);
-                return false;
+                if(!k->gray_phase){ mark_gray(k,ci); pi=0; continue; }
+                mono_report(k,ci); return false;
             }
-            if(k->trace>=2) fprintf(stderr,"TRACE backtrack to clause=%zu sp=%zu\n",k->stk[k->sp-1].clause,k->sp);
-            if(k->trace && k->ref){
-                size_t j=k->stk[k->sp-1].clause; size_t jvi=k->stk[k->sp-1].vi;
-                const Lit*cl=cnf_clause(k->cnf,j); size_t n=cnf_clause_len(k->cnf,j); uint8_t m=k->vs[j][jvi].mask;
-                bool bad=false; for(size_t i=0;i<n;i++){ int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1); bool rv=k->ref[cl[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
-                if(bad) fprintf(stderr,"TRACE restated-to-deviation jcl=%zu vi=%zu\n",j,jvi);
-            }
-            pi=k->pos[k->stk[k->sp-1].clause];
+            { size_t np=k->pos[k->stk[k->sp-1].clause]; pi = np < pi ? np : 0; }
             continue;
         }
 
-        /* 4: inner vars first */
         bool progressed=false;
         for(size_t pass=0; pass<2 && !progressed; pass++){
             for(size_t vi=0; vi<k->vn[ci]; vi++){
@@ -453,39 +482,13 @@ static bool solve(K*k){
                 if(!push_dec(k,ci,vi)) return false;
                 Dec*d=&k->stk[k->sp-1]; int ar=apply_variant(k,ci,vi,d);
                 if(ar<0) return false;
-                if(ar==0){ k->sp--; undo_dec(k,d); continue; } /* temp external conflict: keep variant live */
-                if(k->trace && k->ref){
-                    const Lit*cl2=cnf_clause(k->cnf,ci); size_t n2=cnf_clause_len(k->cnf,ci); uint8_t m2=k->vs[ci][vi].mask;
-                    bool bad=false;
-                    for(size_t i=0;i<n2;i++){ int want=(m2&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); bool rv=k->ref[cl2[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
-                    if(bad){
-                        bool ref_ok=false; size_t ref_vi=SIZE_MAX;
-                        for(size_t rvi=0;rvi<k->vn[ci];rvi++){
-                            if(k->vs[ci][rvi].dead) continue;
-                            uint8_t rm=k->vs[ci][rvi].mask; bool ok=true;
-                            for(size_t i=0;i<n2;i++){ int want=(rm&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); bool rv=k->ref[cl2[i].var]; if((want?1:0)!=(rv?1:0)) {ok=false;break;} int8_t cur=k->val[cl2[i].var]; if(cur>=0 && cur!=want){ok=false;break;} }
-                            if(ok){ref_ok=true; ref_vi=rvi; break;}
-                        }
-                        fprintf(stderr,"TRACE pick ci=%zu vi=%zu deviates-from-ref ref_ok=%d ref_vi=%zu\n",ci,vi,ref_ok?1:0,ref_vi);
-                        if(!ref_ok){
-                            /* find which current assignments block ref */
-                            for(size_t rvi=0;rvi<k->vn[ci];rvi++){
-                                if(k->vs[ci][rvi].dead) continue;
-                                uint8_t rm=k->vs[ci][rvi].mask; bool ref_match=true;
-                                for(size_t i=0;i<n2;i++){ int want=(rm&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); bool rv=k->ref[cl2[i].var]; if((want?1:0)!=(rv?1:0)) {ref_match=false;break;} }
-                                if(!ref_match) continue;
-                                for(size_t i=0;i<n2;i++){ int want=(rm&(1u<<i))?(cl2[i].positive?1:0):(cl2[i].positive?0:1); int8_t cur=k->val[cl2[i].var]; if(cur>=0 && cur!=want){ fprintf(stderr,"  BLOCK v%u cur=%d want=%d owner_ci=%zu\n",cl2[i].var,(int)cur,want,k->owner[cl2[i].var]); } }
-                                break;
-                            }
-                        }
-                    }
-                }
+                if(ar==0){ k->sp--; undo_dec(k,d); continue; }
                 progressed=true; pi++; break;
             }
         }
         if(!progressed){
-            /* no variant applicable now; try restating external owners, else mark live-incompatible as dead */
-            if(restate_external(k,ci)) { pi=k->pos[k->stk[k->sp-1].clause]; continue; }
+            if(restate_external(k,ci)) { size_t np=k->pos[k->stk[k->sp-1].clause]; pi = np < pi ? np : 0; continue; }
+            if(!k->gray_phase){ mark_gray(k,ci); pi=0; continue; }
             bool killed=false;
             for(size_t vi=0; vi<k->vn[ci]; vi++){
                 if(k->vs[ci][vi].dead) continue;
@@ -495,8 +498,6 @@ static bool solve(K*k){
                 if(!compat){ k->vs[ci][vi].dead=1; killed=true; }
             }
             if(killed) continue;
-            size_t pid=clause_pool(k,ci);
-            if(pid==SIZE_MAX || !pool_has_external_set(k,pid)) { mono_report(k,ci); return false; }
             mono_report(k,ci); return false;
         }
     }
@@ -517,6 +518,7 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     k.rng = cfg ? (cfg->knots_seed ? cfg->knots_seed : 1u) : 1u;
     k.sort = cfg ? cfg->knots_sort : KNOTS_SORT_NONE;
     k.mono = cfg ? cfg->knots_mono : false;
+    k.gray_phase = false;
     {
         const char *t=getenv("KNOTS_TRACE"); if(t && *t) k.trace=atoi(t);
         const char *rp=getenv("KNOTS_REF"); if(rp && *rp){ FILE*f=fopen(rp,"r"); if(f){ bool*rb=malloc(k.nvrs?k.nvrs:1); if(rb){ for(size_t i=0;i<k.nvrs;i++){int c=fgetc(f); if(c=='0'||c=='1') rb[i]=(c=='1'); else rb[i]=false;} k.ref=rb; } fclose(f);} }

@@ -1931,7 +1931,15 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
                     { bool bs=false; for(size_t i=0;i<fn;i++) fprintf(stderr," %u=%d",cl[i].var+1,s->assignment[cl[i].var]?1:0);
                       for(size_t x=0;x<cc->n_clauses && !bs;x++){ if(cnf_clause_len(cc,x)!=fn) continue; bool same=true; for(size_t i=0;i<fn;i++){ bool fnd=false; for(size_t j=0;j<fn;j++) if(cnf_clause(cc,x)[j].var==cl[i].var){fnd=true;break;} if(!fnd){same=false;break;} } if(same){ const Lit*cy=cnf_clause(cc,x); size_t ny=cnf_clause_len(cc,x); for(size_t k2=0;k2<ny;k2++){ bool val=s->assignment[cy[k2].var]; if(cy[k2].positive?val:!val){bs=true;break;} } } }
                       fprintf(stderr," block_sat=%s\n", bs?"yes":"no"); }
-                    for(size_t x=0;x<cc->n_clauses;x++){ if(cnf_clause_len(cc,x)!=fn) continue; bool same=true; for(size_t i=0;i<fn;i++){ bool fnd=false; for(size_t j=0;j<fn;j++) if(cnf_clause(cc,x)[j].var==cl[i].var){fnd=true;break;} if(!fnd){same=false;break;} } if(same){ fprintf(stderr,"  clause %zu [",x); const Lit*c2=cnf_clause(cc,x); for(size_t j=0;j<fn;j++) fprintf(stderr,"%s%u%s",c2[j].positive?"":"-",c2[j].var+1,j+1<fn?" ":""); fprintf(stderr,"]\n"); } }
+                    for(size_t x=0;x<cc->n_clauses;x++){ if(cnf_clause_len(cc,x)!=fn) continue; bool same=true; for(size_t i=0;i<fn;i++){ bool fnd=false; for(size_t j=0;j<fn;j++) if(cnf_clause(cc,x)[j].var==cl[i].var){fnd=true;break;} if(!fnd){same=false;break;} } if(same){
+                        fprintf(stderr,"  clause %zu [",x); const Lit*c2=cnf_clause(cc,x); for(size_t j=0;j<fn;j++) fprintf(stderr,"%s%u%s",c2[j].positive?"":"-",c2[j].var+1,j+1<fn?" ":""); fprintf(stderr,"] variants:");
+                        for(unsigned m=0;m<(1u<<fn);m++){
+                            bool taut=false, dead=false; for(size_t j=0;j<fn;j++){ int want=(m&(1u<<j))?(c2[j].positive?1:0):(c2[j].positive?0:1); if((want?1:0)==(c2[j].positive?1:0)) taut=true; int cur=s->assignment[c2[j].var]?1:0; if(cur!=want) dead=true; }
+                            if(taut) continue;
+                            fprintf(stderr," %s{", dead?"dead":"live"); for(size_t j=0;j<fn;j++){ int want=(m&(1u<<j))?(c2[j].positive?1:0):(c2[j].positive?0:1); fprintf(stderr,"%s%u=%d",j?" ":"",c2[j].var+1,want); } fprintf(stderr,"}");
+                        }
+                        fprintf(stderr,"\n");
+                    } }
                     /* external blocks: other var-set blocks sharing any var with failed block */
                     bool *in_fail=calloc(cc->n_vars?cc->n_vars:1,1);
                     if(in_fail){
@@ -1974,7 +1982,15 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
                             for(size_t y=0;y<cc->n_clauses;y++){
                                 if(cnf_clause_len(cc,y)!=nx) continue;
                                 bool same2=true; for(size_t i=0;i<nx;i++){ bool fnd=false; for(size_t j=0;j<nx;j++) if(cnf_clause(cc,y)[j].var==cx[i].var){fnd=true;break;} if(!fnd){same2=false;break;} }
-                                if(same2){ fprintf(stderr,"    clause %zu [",y); const Lit*c2=cnf_clause(cc,y); for(size_t j=0;j<nx;j++) fprintf(stderr,"%s%u%s",c2[j].positive?"":"-",c2[j].var+1,j+1<nx?" ":""); fprintf(stderr,"]\n"); }
+                                if(same2){
+                                    fprintf(stderr,"    clause %zu [",y); const Lit*c2=cnf_clause(cc,y); for(size_t j=0;j<nx;j++) fprintf(stderr,"%s%u%s",c2[j].positive?"":"-",c2[j].var+1,j+1<nx?" ":""); fprintf(stderr,"] variants:");
+                                    for(unsigned m=0;m<(1u<<nx);m++){
+                                        bool taut=false, dead=false; for(size_t j=0;j<nx;j++){ int want=(m&(1u<<j))?(c2[j].positive?1:0):(c2[j].positive?0:1); if((want?1:0)==(c2[j].positive?1:0)) taut=true; int cur=s->assignment[c2[j].var]?1:0; if(cur!=want) dead=true; }
+                                        if(taut) continue;
+                                        fprintf(stderr," %s{", dead?"dead":"live"); for(size_t j=0;j<nx;j++){ int want=(m&(1u<<j))?(c2[j].positive?1:0):(c2[j].positive?0:1); fprintf(stderr,"%s%u=%d",j?" ":"",c2[j].var+1,want); } fprintf(stderr,"}");
+                                    }
+                                    fprintf(stderr,"\n");
+                                }
                             }
                         }
                         if(!any_ext) fprintf(stderr,"MONO external-blocks: none\n");

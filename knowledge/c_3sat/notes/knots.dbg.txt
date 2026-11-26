@@ -1,21 +1,46 @@
-Ran `-mono` on the failed case `aim-100-1_6-yes1-2.cnf` with the best Knots mode:
-
 ```text
+$ cd /home/evg/i_C_u/little.AI/knowledge/c_3sat
+$ timeout 60 ./build/3sat /tmp/opencode/cnf/ex/aim/aim-100-1_6-yes1-2.cnf --init knots -knots-mode terminator -mono --steps 0 --restarts 0 --out /tmp/opencode/kk.json
 MONO fail final unsat=6 first_rogue=88
 MONO failed-block vars=14 18 25
 MONO failed-block clauses=1 space=8 available=7
   active: 14=1 18=0 25=1 block_sat=no
-  clause 88 [-14 18 -25]
+  clause 88 [-14 18 -25] variants: live{14=1 18=0 25=1}
 MONO external-blocks:
   MONO ext-block vars=16 25 35 clauses=2 space=8 available=6
     active: 16=0 25=1 35=0 block_sat=yes
-    clause 0 [16 25 35]
-    clause 1 [16 25 -35]
-  ...
+    clause 0 [16 25 35] variants: dead{16=0 25=0 35=0}
+    clause 1 [16 25 -35] variants: dead{16=0 25=0 35=1}
+  MONO ext-block vars=16 25 48 clauses=1 space=8 available=7
+    active: 16=0 25=1 48=0 block_sat=yes
+    clause 2 [-16 25 -48] variants: dead{16=1 25=0 48=1}
+  MONO ext-block vars=25 48 86 clauses=2 space=8 available=6
+    active: 25=1 48=0 86=1 block_sat=yes
+    clause 3 [-25 -48 86] variants: dead{25=1 48=1 86=0}
+    clause 4 [-25 -48 -86] variants: dead{25=1 48=1 86=1}
+  MONO ext-block vars=25 65 87 clauses=1 space=8 available=7
+    active: 25=1 65=0 87=0 block_sat=yes
+    clause 86 [25 -65 87] variants: dead{25=0 65=1 87=0}
+  MONO ext-block vars=14 31 87 clauses=1 space=8 available=7
+    active: 14=1 31=0 87=0 block_sat=yes
+    clause 87 [14 31 87] variants: dead{14=0 31=0 87=0}
+  MONO ext-block vars=14 18 72 clauses=1 space=8 available=7
+    active: 14=1 18=0 72=1 block_sat=yes
+    clause 89 [-14 -18 -72] variants: dead{14=1 18=1 72=1}
+  MONO ext-block vars=14 18 30 clauses=1 space=8 available=7
+    active: 14=1 18=0 30=1 block_sat=yes
+    clause 90 [-14 -18 -30] variants: dead{14=1 18=1 30=1}
+  MONO ext-block vars=14 72 84 clauses=1 space=8 available=7
+    active: 14=1 72=1 84=0 block_sat=yes
+    clause 91 [-14 72 84] variants: dead{14=1 72=0 84=0}
+  MONO ext-block vars=14 43 71 clauses=1 space=8 available=7
+    active: 14=1 43=0 71=0 block_sat=yes
+    clause 149 [14 43 71] variants: dead{14=0 43=0 71=0}
+  MONO ext-block vars=4 18 73 clauses=1 space=8 available=7
+    active: 4=0 18=0 73=0 block_sat=yes
+    clause 151 [-4 18 73] variants: dead{4=1 18=0 73=0}
   MONO ext-block vars=5 18 88 clauses=1 space=8 available=7
     active: 5=1 18=0 88=0 block_sat=yes
-    clause 152 [5 18 88]
-UNKNOWN (0 steps, best 6 unsatisfied)
+    clause 152 [5 18 88] variants: dead{5=0 18=0 88=0}
+UNKNOWN (0 steps, best 6 unsatisfied) — /tmp/opencode/kk.json
 ```
-
-Failed block has 1/8 clauses used; current active assignment doesn’t satisfy it, while listed external blocks sharing its vars are currently satisfied.
