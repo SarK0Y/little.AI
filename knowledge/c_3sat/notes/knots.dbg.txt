@@ -1,0 +1,21 @@
+Ran `-mono` on the failed case `aim-100-1_6-yes1-2.cnf` with the best Knots mode:
+
+```text
+MONO fail final unsat=6 first_rogue=88
+MONO failed-block vars=14 18 25
+MONO failed-block clauses=1 space=8 available=7
+  active: 14=1 18=0 25=1 block_sat=no
+  clause 88 [-14 18 -25]
+MONO external-blocks:
+  MONO ext-block vars=16 25 35 clauses=2 space=8 available=6
+    active: 16=0 25=1 35=0 block_sat=yes
+    clause 0 [16 25 35]
+    clause 1 [16 25 -35]
+  ...
+  MONO ext-block vars=5 18 88 clauses=1 space=8 available=7
+    active: 5=1 18=0 88=0 block_sat=yes
+    clause 152 [5 18 88]
+UNKNOWN (0 steps, best 6 unsatisfied)
+```
+
+Failed block has 1/8 clauses used; current active assignment doesn’t satisfy it, while listed external blocks sharing its vars are currently satisfied.
