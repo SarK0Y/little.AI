@@ -30,6 +30,7 @@ typedef struct {
     uint64_t rng;
     KnotsSort sort;
     bool mono;
+    bool reverse;
     bool gray_phase; /* reprocessing gray blocks */
 } K;
 
@@ -99,11 +100,14 @@ static bool clause_conflict(K*k,size_t ci){
 }
 
 static bool push_dec(K*k,size_t clause,size_t vi){
-    if(k->sp==k->sc){ size_t c=k->sc?k->sc*2:32; Dec*ns=realloc(k->stk,c*sizeof*ns); if(!ns) return false; for(size_t i=k->sc;i<c;i++){ns[i].chg=NULL;ns[i].cn=0;ns[i].cap=0;} k->stk=ns;k->sc=c; }
+    if(k->sp==k->sc){ size_t c=k->sc?k->sc*2:32; Dec*ns=realloc(k->stk,c*sizeof*ns); if(!ns) return false;
+        for(size_t i=k->sc;i<c;i++){ ns[i].chg=malloc(8*sizeof*ns[i].chg); ns[i].cn=0; ns[i].cap=ns[i].chg?8:0; }
+        k->stk=ns; k->sc=c;
+    }
     Dec*d=&k->stk[k->sp++]; d->clause=clause; d->vi=vi; d->cn=0; return true;
 }
 static bool dec_add(Dec*d,size_t var){
-    if(d->cn==d->cap){ size_t c=d->cap?d->cap*2:4; size_t*n=realloc(d->chg,c*sizeof*n); if(!n) return false; d->chg=n; d->cap=c; }
+    if(d->cn>=d->cap) return false; /* fixed 3-var clause max, 8 slots */
     d->chg[d->cn++]=var; return true;
 }
 static size_t canon_pool(K*k,size_t p){
@@ -116,6 +120,7 @@ static size_t clause_pool(K*k,size_t ci){
     for(size_t i=0;i<n;i++){ size_t p=k->var_pool[cl[i].var]; if(p!=SIZE_MAX) return p; }
     return SIZE_MAX;
 }
+static inline int lit_want(const K*k,bool positive,unsigned bit){ int w=bit?(positive?1:0):(positive?0:1); return k->reverse?!w:w; }
 static void clear_dead_after(K*k,size_t jcl){
     /* clear dead marks for clauses after jcl in same pool only; other pools independent */
     size_t pid = clause_pool(k,jcl);
@@ -134,9 +139,9 @@ static void undo_dec(K*k,Dec*d){
 
 static int apply_variant(K*k,size_t ci,size_t vi,Dec*d){
     const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci); uint8_t m=k->vs[ci][vi].mask;
-    for(size_t i=0;i<n;i++){ int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1); int8_t cur=k->val[cl[i].var]; if(cur>=0 && cur!=want) return 0; }
+    for(size_t i=0;i<n;i++){ int want=lit_want(k,cl[i].positive,(m>>i)&1u); int8_t cur=k->val[cl[i].var]; if(cur>=0 && cur!=want) return 0; }
     for(size_t i=0;i<n;i++){
-        int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1);
+        int want=lit_want(k,cl[i].positive,(m>>i)&1u);
         if(k->val[cl[i].var]<0){
             k->val[cl[i].var]=(int8_t)want;
             if(k->owner[cl[i].var]==SIZE_MAX) k->owner[cl[i].var]=ci;
@@ -169,7 +174,7 @@ static bool try_restate_at(K*k,size_t jump){
         if(k->trace && k->ref){
             /* check if chosen variant contradicts ref on any set var */
             const Lit*cl=cnf_clause(k->cnf,jcl); size_t n=cnf_clause_len(k->cnf,jcl); uint8_t m=k->vs[jcl][vi].mask;
-            bool bad=false; for(size_t i=0;i<n;i++){ int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1); bool rv=k->ref[cl[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
+            bool bad=false; for(size_t i=0;i<n;i++){ int want=lit_want(k,cl[i].positive,(m>>i)&1u); bool rv=k->ref[cl[i].var]; if((want?1:0)!=(rv?1:0)) bad=true; }
             if(bad) fprintf(stderr,"TRACE restate jcl=%zu vi=%zu deviates-from-ref\n",jcl,vi);
         }
         return true;
@@ -262,11 +267,11 @@ static void print_clause(FILE *f, const Cnf *cnf, size_t ci){
     fprintf(f, "]");
 }
 
-static void print_variant(FILE *f, const Cnf *cnf, size_t ci, uint8_t mask, bool dead){
-    const Lit*cl=cnf_clause(cnf,ci); size_t n=cnf_clause_len(cnf,ci);
+static void print_variant(FILE *f, K*k, size_t ci, uint8_t mask, bool dead){
+    const Cnf*cnf=k->cnf; const Lit*cl=cnf_clause(cnf,ci); size_t n=cnf_clause_len(cnf,ci);
     fprintf(f, "%s{", dead?"dead":"live");
     for(size_t i=0;i<n;i++){
-        int want=(mask&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1);
+        int want=lit_want(k,cl[i].positive,(mask>>i)&1u);
         fprintf(f, "%s%u=%d", i?" ":"", cl[i].var+1, want);
     }
     fprintf(f, "}");
@@ -295,7 +300,7 @@ static void mono_report(K*k, size_t fail_ci){
     for(size_t ci=0;ci<k->ncls;ci++) if(clause_sig(k->cnf,ci)==fsig){
         fprintf(stderr, "  "); print_clause(stderr,k->cnf,ci);
         fprintf(stderr, " variants:");
-        for(size_t vi=0;vi<k->vn[ci];vi++){ fprintf(stderr," "); print_variant(stderr,k->cnf,ci,k->vs[ci][vi].mask,k->vs[ci][vi].dead!=0); }
+        for(size_t vi=0;vi<k->vn[ci];vi++){ fprintf(stderr," "); print_variant(stderr,k,ci,k->vs[ci][vi].mask,k->vs[ci][vi].dead!=0); }
         fprintf(stderr,"\n");
     }
     /* external owner pool */
@@ -325,7 +330,7 @@ static void mono_report(K*k, size_t fail_ci){
             for(size_t x=0;x<k->ncls;x++) if(clause_sig(k->cnf,x)==sig){
                 fprintf(stderr,"    "); print_clause(stderr,k->cnf,x);
                 fprintf(stderr," variants:");
-                for(size_t vi=0;vi<k->vn[x];vi++){ fprintf(stderr," "); print_variant(stderr,k->cnf,x,k->vs[x][vi].mask,k->vs[x][vi].dead!=0); }
+                for(size_t vi=0;vi<k->vn[x];vi++){ fprintf(stderr," "); print_variant(stderr,k,x,k->vs[x][vi].mask,k->vs[x][vi].dead!=0); }
                 fprintf(stderr,"\n");
             }
         }
@@ -472,7 +477,7 @@ static bool solve(K*k){
                 const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci); uint8_t m=k->vs[ci][vi].mask;
                 bool sets_inner=false, compat=true;
                 for(size_t i=0;i<n;i++){
-                    int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1);
+                    int want=lit_want(k,cl[i].positive,(m>>i)&1u);
                     int8_t cur=k->val[cl[i].var];
                     if(cur>=0){ if(cur!=want){compat=false;break;} }
                     else sets_inner=true;
@@ -494,7 +499,7 @@ static bool solve(K*k){
                 if(k->vs[ci][vi].dead) continue;
                 const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci); uint8_t m=k->vs[ci][vi].mask;
                 bool compat=true;
-                for(size_t i=0;i<n;i++){ int want=(m&(1u<<i))?(cl[i].positive?1:0):(cl[i].positive?0:1); int8_t cur=k->val[cl[i].var]; if(cur>=0 && cur!=want){compat=false;break;} }
+                for(size_t i=0;i<n;i++){ int want=lit_want(k,cl[i].positive,(m>>i)&1u); int8_t cur=k->val[cl[i].var]; if(cur>=0 && cur!=want){compat=false;break;} }
                 if(!compat){ k->vs[ci][vi].dead=1; killed=true; }
             }
             if(killed) continue;
@@ -518,6 +523,7 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     k.rng = cfg ? (cfg->knots_seed ? cfg->knots_seed : 1u) : 1u;
     k.sort = cfg ? cfg->knots_sort : KNOTS_SORT_NONE;
     k.mono = cfg ? cfg->knots_mono : false;
+    k.reverse = cfg ? cfg->knots_reverse : false;
     k.gray_phase = false;
     {
         const char *t=getenv("KNOTS_TRACE"); if(t && *t) k.trace=atoi(t);
@@ -533,7 +539,7 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     for(size_t r=0;r<rounds && !ok;r++){
         for(size_t v=0;v<k.nvrs;v++){ k.val[v]=-1; k.owner[v]=SIZE_MAX; }
         for(size_t i=0;i<k.ncls;i++) for(size_t vi=0;vi<k.vn[i];vi++) k.vs[i][vi].dead=0;
-        for(size_t i=0;i<k.sp;i++) free(k.stk[i].chg);
+        for(size_t i=0;i<k.sp;i++) k.stk[i].cn=0;
         k.sp=0;
         build_order(&k, cfg ? cfg->knots_sort : KNOTS_SORT_NONE);
         k.rng += 0x9e3779b97f4a7c15ULL + r;
@@ -544,7 +550,7 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     solver_set_assignment(s,as);
     /* Post-modes are applied by solver_solve on SAT or UNKNOWN for Knots init. */
     for(size_t i=0;i<k.ncls;i++) free(k.vs[i]);
-    for(size_t i=0;i<k.sp;i++) free(k.stk[i].chg);
+    for(size_t i=0;i<k.sc;i++) free(k.stk[i].chg);
     for(size_t i=0;i<k.np;i++){ free(k.pools[i].vars); free(k.pools[i].cls); }
     free(k.pools); free(k.stk);
     free((void*)k.ref);
@@ -552,7 +558,7 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     return ok;
 oom:
     if(k.vs) for(size_t i=0;i<k.ncls;i++) free(k.vs[i]);
-    for(size_t i=0;i<k.sp;i++) free(k.stk[i].chg);
+    for(size_t i=0;i<k.sc;i++) free(k.stk[i].chg);
     for(size_t i=0;i<k.np;i++){ free(k.pools[i].vars); free(k.pools[i].cls); }
     free(k.pools); free(k.stk);
     free((void*)k.ref);

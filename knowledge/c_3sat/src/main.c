@@ -277,6 +277,11 @@ static ResultUnit opt_knots_mono(Cli *cli, const char *flag, const char *value) 
     cli->cfg.knots_mono = true;
     return OK_UNIT(ResultUnit);
 }
+static ResultUnit opt_knots_reverse(Cli *cli, const char *flag, const char *value) {
+    (void)flag; (void)value;
+    cli->cfg.knots_reverse = true;
+    return OK_UNIT(ResultUnit);
+}
 static ResultUnit opt_knots_mode(Cli *cli, const char *flag, const char *value) {
     (void)flag;
     cli->cfg.knots_glowest = false; cli->cfg.knots_terminator = false; cli->cfg.knots_likho = false; cli->cfg.knots_yanus = false; cli->cfg.knots_gob_recult = false;
@@ -337,6 +342,7 @@ static const OptSpec OPTS[] = {
     { "-path-rider", opt_path_rider },         { "--path-rider", opt_path_rider },
     { "-knots-mode", opt_knots_mode },         { "--knots-mode", opt_knots_mode },
     { "-mono", opt_knots_mono },               { "--mono", opt_knots_mono },
+    { "-reverse", opt_knots_reverse },         { "--reverse", opt_knots_reverse },
 };
 
 static void usage(void) {
@@ -360,7 +366,8 @@ static void usage(void) {
         "                      [-sorted-dyn desc|asc] (Knots: dynamic popularity per step)\n"
         "                      [-path-rider P] (Knots: try 2^P random var-equality assignments)\n"
         "                      [-knots-mode glowest|terminator|likho|yanus|gob-recult|combo] (Knots post-process)\n"
-        "                      [-mono] (Knots: block diagnostics on fail)\n");
+        "                      [-mono] (Knots: block diagnostics on fail)\n"
+        "                      [-reverse] (Knots: negate every literal in each clause)\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
@@ -377,7 +384,7 @@ static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
         for (size_t k = 0; k < sizeof OPTS / sizeof OPTS[0]; k++)
             if (strcmp(OPTS[k].flag, argv[i]) == 0) { spec = &OPTS[k]; break; }
         if (!spec) return ERRF(ResultUnit, ERR_USAGE, "Unknown option: %s", argv[i]);
-        if (spec->apply == opt_knots_mono) { TRY0(ResultUnit, spec->apply(cli, argv[i], "1")); i -= 1; continue; }
+        if (spec->apply == opt_knots_mono || spec->apply == opt_knots_reverse) { TRY0(ResultUnit, spec->apply(cli, argv[i], "1")); i -= 1; continue; }
         if (i + 1 >= argc) return ERRF(ResultUnit, ERR_USAGE, "Missing value for %s", argv[i]);
         TRY0(ResultUnit, spec->apply(cli, argv[i], argv[i + 1]));
     }

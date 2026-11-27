@@ -410,6 +410,7 @@ SolverConfig solver_config_default(void) {
         .knots_yanus = false,
         .knots_gob_recult = false,
         .knots_mono = false,
+        .knots_reverse = false,
         .path_rider = 0,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
