@@ -411,6 +411,7 @@ SolverConfig solver_config_default(void) {
         .knots_gob_recult = false,
         .knots_mono = false,
         .knots_reverse = false,
+        .knots_keep_bad = 0,
         .path_rider = 0,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
@@ -1878,7 +1879,8 @@ static ResultSolve solver_solve_path_rider(Solver *s, const SolverConfig *cfg){
         solve_result_free(&r); solver_free(ss); cnf_free(&red);
     }
     free(pick); free(map); free(neg); free(best_a);
-    return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, best_steps, 0, best_unsat==SIZE_MAX?cnf->n_clauses:best_unsat, NULL, 0 }));
+    bool *ua=malloc(cnf->n_vars?cnf->n_vars:1); if(ua){ if(best_a && best_unsat!=SIZE_MAX) memcpy(ua,best_a,cnf->n_vars); else memset(ua,0,cnf->n_vars); }
+    return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, ua, cnf->n_vars, best_steps, 0, best_unsat==SIZE_MAX?cnf->n_clauses:best_unsat, NULL, 0 }));
 }
 
 ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
@@ -1890,9 +1892,12 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
     if (n_contradictions)
         return OK(ResultSolve, ((SolveResult){ SOLVE_UNSAT, NULL, cnf->n_vars, 0, 0, 0,
                                                contradictions, n_contradictions }));
-    for (size_t i = 0; i < cnf->n_clauses; i++)
-        if (cnf_clause_len(cnf, i) == 0)
-            return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, cnf->n_clauses, NULL, 0 }));
+    for (size_t i = 0; i < cnf->n_clauses; i++) {
+        if (cnf_clause_len(cnf, i) == 0) {
+            bool *ua=calloc(cnf->n_vars?cnf->n_vars:1,1);
+            return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, ua, cnf->n_vars, 0, 0, cnf->n_clauses, NULL, 0 }));
+        }
+    }
     if (cnf->n_clauses == 0) {
         memset(s->assignment, 0, cnf->n_vars);
         return make_sat(s, 0, 0);
@@ -1998,7 +2003,7 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
                         free(seen_sig); free(in_fail);
                     }
                 }
-                return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, 0, 0, s->n_rogue, NULL, 0 }));
+                bool *ua=malloc(cnf->n_vars?cnf->n_vars:1); if(ua) memcpy(ua,s->assignment,cnf->n_vars); return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, ua, cnf->n_vars, 0, 0, s->n_rogue, NULL, 0 }));
             }
             (void)kok;
         } else if (restart == 0 && cfg->init == INIT_MIN_OVERLAP) {
@@ -2046,7 +2051,9 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
         if (s->n_rogue == 0) return make_sat(s, total, restart);  /* last flip solved it */
     }
     if (s->n_rogue < best) best = s->n_rogue;
-    return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, NULL, cnf->n_vars, total, 0, best, NULL, 0 }));
+    bool *ua = malloc(cnf->n_vars ? cnf->n_vars : 1);
+    if (ua) memcpy(ua, s->assignment, cnf->n_vars);
+    return OK(ResultSolve, ((SolveResult){ SOLVE_UNKNOWN, ua, cnf->n_vars, total, 0, best, NULL, 0 }));
 }
 
 void solve_result_free(SolveResult *r) {

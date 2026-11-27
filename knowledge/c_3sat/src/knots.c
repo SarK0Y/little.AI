@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-typedef struct { uint8_t mask; uint8_t dead; } Varnt;
+typedef struct { uint8_t mask; uint8_t dead; uint32_t bad; } Varnt;
 typedef struct { size_t clause; size_t vi; size_t *chg; size_t cn, cap; } Dec;
 typedef struct {
     size_t *vars; size_t nv, cv; size_t *cls; size_t nc, cc;
@@ -31,6 +31,7 @@ typedef struct {
     KnotsSort sort;
     bool mono;
     bool reverse;
+    size_t keep_bad;
     bool gray_phase; /* reprocessing gray blocks */
 } K;
 
@@ -84,7 +85,7 @@ static void build_variants(K*k,size_t ci){
     size_t mmax=(n>=8)?256:(1u<<n);
     Varnt *vs=malloc((mmax?mmax:1)*sizeof*vs); size_t vn=0;
     if(!vs){k->vs[ci]=NULL;k->vn[ci]=0;return;}
-    for(size_t m=1;m<mmax;m++){ vs[vn].mask=(uint8_t)m; vs[vn].dead=0; vn++; }
+    for(size_t m=1;m<mmax;m++){ vs[vn].mask=(uint8_t)m; vs[vn].dead=0; vs[vn].bad=0; vn++; }
     k->vs[ci]=vs; k->vn[ci]=vn;
 }
 
@@ -128,7 +129,7 @@ static void clear_dead_after(K*k,size_t jcl){
     for(size_t p=jpos+1;p<k->ncls;p++){
         size_t i=k->order[p];
         if(pid!=SIZE_MAX && clause_pool(k,i)!=pid) continue;
-        for(size_t vi=0;vi<k->vn[i];vi++) k->vs[i][vi].dead=0;
+        for(size_t vi=0;vi<k->vn[i];vi++){ k->vs[i][vi].dead=0; k->vs[i][vi].bad=0; }
     }
 }
 
@@ -180,7 +181,13 @@ static bool try_restate_at(K*k,size_t jump){
         return true;
     }
     /* exhausted in this context; before gray processing, don't drain pool */
-    if(!k->gray_phase) return false;
+    if(!k->gray_phase) {
+        if(push_dec(k,jcl,old_vi)){
+            Dec*d=&k->stk[k->sp-1]; int ar=apply_variant(k,jcl,old_vi,d);
+            if(ar<=0){ k->sp--; undo_dec(k,d); }
+        }
+        return false;
+    }
     k->vs[jcl][old_vi].dead=1;
     for(size_t vi=0;vi<k->vn[jcl];vi++){
         if(k->vs[jcl][vi].dead) continue;
@@ -189,6 +196,10 @@ static bool try_restate_at(K*k,size_t jump){
         if(ar<0) return false;
         if(ar==0){ k->sp--; undo_dec(k,d); continue; }
         return true;
+    }
+    if(push_dec(k,jcl,old_vi)){
+        Dec*d=&k->stk[k->sp-1]; int ar=apply_variant(k,jcl,old_vi,d);
+        if(ar<=0){ k->sp--; undo_dec(k,d); }
     }
     return false;
 }
@@ -342,7 +353,27 @@ static void mono_report(K*k, size_t fail_ci){
 static void build_order(K*k, KnotsSort sort){
     size_t oi=0; bool *seen=calloc(k->ncls?k->ncls:1,1);
     if(!seen) return;
-    if(sort!=KNOTS_SORT_NONE){
+    if(sort==KNOTS_SORT_SATURATION){
+        /* group clauses by mono-signature (same var set), most saturated (largest block) first */
+        uint64_t *sigs=malloc((k->ncls?k->ncls:1)*sizeof*sigs);
+        size_t *blen=calloc(k->ncls?k->ncls:1,sizeof*blen);
+        if(sigs&&blen){
+            for(size_t ci=0;ci<k->ncls;ci++) sigs[ci]=clause_sig(k->cnf,ci);
+            for(size_t i=0;i<k->ncls;i++) for(size_t j=0;j<k->ncls;j++) if(sigs[j]==sigs[i]) blen[i]++;
+            bool any=true;
+            while(any){
+                any=false; size_t best=SIZE_MAX; size_t best_b=0;
+                for(size_t ci=0;ci<k->ncls;ci++){
+                    if(seen[ci]) continue;
+                    if(!any || blen[ci]>best_b){ any=true; best=ci; best_b=blen[ci]; }
+                }
+                if(!any) break;
+                uint64_t bs=sigs[best];
+                for(size_t ci=0;ci<k->ncls;ci++) if(!seen[ci] && sigs[ci]==bs){ k->order[oi++]=ci; seen[ci]=true; }
+            }
+        }
+        free(sigs); free(blen);
+    } else if(sort!=KNOTS_SORT_NONE){
         size_t *pop=calloc(k->nvrs?k->nvrs:1,sizeof*pop);
         if(pop){
             for(size_t ci=0;ci<k->ncls;ci++){
@@ -354,7 +385,6 @@ static void build_order(K*k, KnotsSort sort){
                 any=false; size_t best_v=SIZE_MAX; size_t best_p=0;
                 for(size_t v=0;v<k->nvrs;v++){
                     if(pop[v]==0) continue;
-                    /* check if var appears in any unseen clause */
                     bool has=false;
                     for(size_t ci=0;ci<k->ncls && !has;ci++) if(!seen[ci]){ const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci); for(size_t i=0;i<n;i++) if(cl[i].var==v){has=true;break;} }
                     if(!has){ pop[v]=0; continue; }
@@ -387,6 +417,10 @@ static void build_order(K*k, KnotsSort sort){
     }
     for(size_t i=0;i<k->ncls;i++) if(!seen[i]) k->order[oi++]=i;
     for(size_t i=0;i<k->ncls;i++) k->pos[k->order[i]]=i;
+    if(sort==KNOTS_SORT_SATURATION && k->ncls>0){
+        uint64_t s0=clause_sig(k->cnf,k->order[0]); size_t b0=0; for(size_t i=0;i<k->ncls;i++) if(clause_sig(k->cnf,i)==s0) b0++;
+        fprintf(stderr,"SAT-RANK first clause=%zu block_len=%zu\n",k->order[0],b0);
+    }
     free(seen);
 }
 static size_t pick_next(K*k,size_t pi){
@@ -445,10 +479,10 @@ static bool solve(K*k){
                 bad=i; break;
             }
             if(bad==SIZE_MAX){
-                if(!k->gray_phase && any_gray){ k->gray_phase=true; pi=0; continue; }
+                if(k->sort!=KNOTS_SORT_SATURATION && !k->gray_phase && any_gray){ k->gray_phase=true; pi=0; continue; }
                 return true;
             }
-            if(!k->gray_phase){
+            if(k->sort!=KNOTS_SORT_SATURATION && !k->gray_phase){
                 bool only_gray=true;
                 for(size_t i=0;i<k->ncls;i++){ size_t ci=k->order[i]; if(!clause_sat(k,ci) && !is_gray_clause(k,ci)){ only_gray=false; break; } }
                 if(only_gray){ k->gray_phase=true; pi=0; continue; }
@@ -458,12 +492,20 @@ static bool solve(K*k){
         pick_next(k,pi);
         size_t ci=k->order[pi];
         if(!k->gray_phase && is_gray_clause(k,ci)){ pi++; continue; }
-        if(!any_live(k,ci)) { mono_report(k,ci); return false; }
+        if(!any_live(k,ci)) {
+            if(k->sort==KNOTS_SORT_SATURATION){
+                uint64_t sig=clause_sig(k->cnf,ci); size_t bl=0;
+                for(size_t i=0;i<k->ncls;i++) if(clause_sig(k->cnf,i)==sig) bl++;
+                fprintf(stderr,"SAT-RANK fail clause=%zu pi=%zu block_len=%zu\n",ci,pi,bl);
+            }
+            mono_report(k,ci); return false;
+        }
 
         if(clause_conflict(k,ci)){
             if(!restate_external(k,ci)) {
                 if(!clause_conflict(k,ci)) { pi=k->pos[ci]; continue; }
-                if(!k->gray_phase){ mark_gray(k,ci); pi=0; continue; }
+                if(k->sort!=KNOTS_SORT_SATURATION && !k->gray_phase){ mark_gray(k,ci); pi=0; continue; }
+                if(k->sort==KNOTS_SORT_SATURATION){ uint64_t sig=clause_sig(k->cnf,ci); size_t bl=0; for(size_t i=0;i<k->ncls;i++) if(clause_sig(k->cnf,i)==sig) bl++; fprintf(stderr,"SAT-RANK fail clause=%zu pi=%zu block_len=%zu\n",ci,pi,bl); }
                 mono_report(k,ci); return false;
             }
             { size_t np=k->pos[k->stk[k->sp-1].clause]; pi = np < pi ? np : 0; }
@@ -493,14 +535,17 @@ static bool solve(K*k){
         }
         if(!progressed){
             if(restate_external(k,ci)) { size_t np=k->pos[k->stk[k->sp-1].clause]; pi = np < pi ? np : 0; continue; }
-            if(!k->gray_phase){ mark_gray(k,ci); pi=0; continue; }
+            if(k->sort!=KNOTS_SORT_SATURATION && !k->gray_phase){ mark_gray(k,ci); pi=0; continue; }
             bool killed=false;
             for(size_t vi=0; vi<k->vn[ci]; vi++){
                 if(k->vs[ci][vi].dead) continue;
                 const Lit*cl=cnf_clause(k->cnf,ci); size_t n=cnf_clause_len(k->cnf,ci); uint8_t m=k->vs[ci][vi].mask;
                 bool compat=true;
                 for(size_t i=0;i<n;i++){ int want=lit_want(k,cl[i].positive,(m>>i)&1u); int8_t cur=k->val[cl[i].var]; if(cur>=0 && cur!=want){compat=false;break;} }
-                if(!compat){ k->vs[ci][vi].dead=1; killed=true; }
+                if(!compat){
+                    k->vs[ci][vi].bad++;
+                    if(k->keep_bad==0 || k->vs[ci][vi].bad > (uint32_t)k->keep_bad){ k->vs[ci][vi].dead=1; killed=true; }
+                }
             }
             if(killed) continue;
             mono_report(k,ci); return false;
@@ -524,7 +569,8 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     k.sort = cfg ? cfg->knots_sort : KNOTS_SORT_NONE;
     k.mono = cfg ? cfg->knots_mono : false;
     k.reverse = cfg ? cfg->knots_reverse : false;
-    k.gray_phase = false;
+    k.keep_bad = cfg ? cfg->knots_keep_bad : 0;
+    k.gray_phase = (k.sort == KNOTS_SORT_SATURATION); /* saturation: no gray deferral */
     {
         const char *t=getenv("KNOTS_TRACE"); if(t && *t) k.trace=atoi(t);
         const char *rp=getenv("KNOTS_REF"); if(rp && *rp){ FILE*f=fopen(rp,"r"); if(f){ bool*rb=malloc(k.nvrs?k.nvrs:1); if(rb){ for(size_t i=0;i<k.nvrs;i++){int c=fgetc(f); if(c=='0'||c=='1') rb[i]=(c=='1'); else rb[i]=false;} k.ref=rb; } fclose(f);} }
@@ -538,7 +584,7 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     if(!k.random_mode) rounds = 1;
     for(size_t r=0;r<rounds && !ok;r++){
         for(size_t v=0;v<k.nvrs;v++){ k.val[v]=-1; k.owner[v]=SIZE_MAX; }
-        for(size_t i=0;i<k.ncls;i++) for(size_t vi=0;vi<k.vn[i];vi++) k.vs[i][vi].dead=0;
+        for(size_t i=0;i<k.ncls;i++) for(size_t vi=0;vi<k.vn[i];vi++){ k.vs[i][vi].dead=0; k.vs[i][vi].bad=0; }
         for(size_t i=0;i<k.sp;i++) k.stk[i].cn=0;
         k.sp=0;
         build_order(&k, cfg ? cfg->knots_sort : KNOTS_SORT_NONE);

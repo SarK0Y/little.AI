@@ -123,7 +123,7 @@ typedef enum {
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
 
-typedef enum { KNOTS_SORT_NONE = 0, KNOTS_SORT_DESC, KNOTS_SORT_ASC, KNOTS_SORT_DYN_DESC, KNOTS_SORT_DYN_ASC } KnotsSort;
+typedef enum { KNOTS_SORT_NONE = 0, KNOTS_SORT_DESC, KNOTS_SORT_ASC, KNOTS_SORT_DYN_DESC, KNOTS_SORT_DYN_ASC, KNOTS_SORT_SATURATION } KnotsSort;
 
 /* Variable visit order for Terminator rounds. */
 typedef enum { TERM_FORWARD, TERM_REVERSE, TERM_RANDOM } TerminatorOrder;
@@ -169,7 +169,8 @@ typedef struct {
     bool knots_yanus;           /* Knots: apply yanus after knots */
     bool knots_gob_recult;      /* Knots: apply gob-recult after knots */
     bool knots_mono;            /* Knots: mono-block diagnostics */
-    bool knots_reverse;         /* Knots: reverse clause order */
+    bool knots_reverse;         /* Knots: negate every literal */
+    size_t knots_keep_bad;      /* Knots: keep bad variant for S hits before killing */
     size_t path_rider;          /* -path-rider P: enumerate 2^P var assignments */
     ProgressFn on_progress;
     void *progress_ctx;

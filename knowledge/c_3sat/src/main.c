@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <errno.h>
+#include <time.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 
@@ -262,6 +263,11 @@ static ResultUnit opt_knots_sort(Cli *cli, const char *flag, const char *value) 
     else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected desc|asc)", flag, value);
     return OK_UNIT(ResultUnit);
 }
+static ResultUnit opt_knots_saturation(Cli *cli, const char *flag, const char *value) {
+    (void)flag; (void)value;
+    cli->cfg.knots_sort = KNOTS_SORT_SATURATION;
+    return OK_UNIT(ResultUnit);
+}
 static ResultUnit opt_knots_sort_dyn(Cli *cli, const char *flag, const char *value) {
     (void)flag;
     if (strcmp(value,"desc")==0) cli->cfg.knots_sort = KNOTS_SORT_DYN_DESC;
@@ -281,6 +287,9 @@ static ResultUnit opt_knots_reverse(Cli *cli, const char *flag, const char *valu
     (void)flag; (void)value;
     cli->cfg.knots_reverse = true;
     return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_knots_keep_bad(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->cfg.knots_keep_bad);
 }
 static ResultUnit opt_knots_mode(Cli *cli, const char *flag, const char *value) {
     (void)flag;
@@ -343,6 +352,8 @@ static const OptSpec OPTS[] = {
     { "-knots-mode", opt_knots_mode },         { "--knots-mode", opt_knots_mode },
     { "-mono", opt_knots_mono },               { "--mono", opt_knots_mono },
     { "-reverse", opt_knots_reverse },         { "--reverse", opt_knots_reverse },
+    { "-keep-bad", opt_knots_keep_bad },       { "--keep-bad", opt_knots_keep_bad },
+    { "-saturation", opt_knots_saturation },   { "--saturation", opt_knots_saturation },
 };
 
 static void usage(void) {
@@ -367,7 +378,9 @@ static void usage(void) {
         "                      [-path-rider P] (Knots: try 2^P random var-equality assignments)\n"
         "                      [-knots-mode glowest|terminator|likho|yanus|gob-recult|combo] (Knots post-process)\n"
         "                      [-mono] (Knots: block diagnostics on fail)\n"
-        "                      [-reverse] (Knots: negate every literal in each clause)\n");
+        "                      [-reverse] (Knots: negate every literal in each clause)\n"
+        "                      [-keep-bad S] (Knots: keep bad variant for S hits before killing)\n"
+        "                      [-saturation] (Knots: process most-saturated mono blocks first)\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
@@ -384,7 +397,7 @@ static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
         for (size_t k = 0; k < sizeof OPTS / sizeof OPTS[0]; k++)
             if (strcmp(OPTS[k].flag, argv[i]) == 0) { spec = &OPTS[k]; break; }
         if (!spec) return ERRF(ResultUnit, ERR_USAGE, "Unknown option: %s", argv[i]);
-        if (spec->apply == opt_knots_mono || spec->apply == opt_knots_reverse) { TRY0(ResultUnit, spec->apply(cli, argv[i], "1")); i -= 1; continue; }
+        if (spec->apply == opt_knots_mono || spec->apply == opt_knots_reverse || spec->apply == opt_knots_saturation) { TRY0(ResultUnit, spec->apply(cli, argv[i], "1")); i -= 1; continue; }
         if (i + 1 >= argc) return ERRF(ResultUnit, ERR_USAGE, "Missing value for %s", argv[i]);
         TRY0(ResultUnit, spec->apply(cli, argv[i], argv[i + 1]));
     }
@@ -435,8 +448,10 @@ static ResultUnit write_json(const char *path, const Cnf *cnf, const SolveResult
         fprintf(f, "]\n}\n");
     } else {
         fprintf(f, "{\n  \"status\": \"UNKNOWN\",\n  \"variables\": %zu,\n  \"clauses\": %zu,\n"
-                   "  \"steps\": %zu,\n  \"best_unsatisfied\": %zu\n}\n",
+                   "  \"steps\": %zu,\n  \"best_unsatisfied\": %zu,\n  \"assignment\": [",
                 cnf->n_vars, cnf->n_clauses, r->steps, r->best_unsatisfied);
+        for (size_t i = 0; i < r->n_vars; i++) fprintf(f, "%s%s", i ? ", " : "", r->assignment[i] ? "true" : "false");
+        fprintf(f, "]\n}\n");
     }
     if (fclose(f) != 0) return ERRF(ResultUnit, ERR_IO, "Cannot write result %s: %s", path, strerror(errno));
     return OK_UNIT(ResultUnit);
@@ -521,9 +536,12 @@ static ResultInt solve_and_report(const Cnf *cnf, const Cli *cli) {
         fprintf(stderr, "Warning: input contains clauses longer than 3 literals; solving general CNF instead of strict 3-SAT.\n");
     if (cli->groups_mode) return solve_groups_and_report(cnf, cli);
     Solver *solver = TRY(ResultInt, solver_new(cnf, cli->cfg.seed));
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     ResultSolve rs = solver_solve(solver, &cli->cfg);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
     solver_free(solver);
     SolveResult res = TRY(ResultInt, rs);
+    double elapsed = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
 
     if (res.status == SOLVE_SAT && !verify(cnf, res.assignment, res.n_vars)) {
         solve_result_free(&res);
@@ -534,16 +552,16 @@ static ResultInt solve_and_report(const Cnf *cnf, const Cli *cli) {
 
     int code;
     if (res.status == SOLVE_SAT) {
-        printf("SAT (%zu steps, restart %zu) \xe2\x80\x94 %s\n", res.steps, res.restart, cli->output);
+        printf("SAT (%zu steps, restart %zu, %.3fs) \xe2\x80\x94 %s\n", res.steps, res.restart, elapsed, cli->output);
         code = 0;
     } else if (res.status == SOLVE_UNSAT) {
-        printf("UNSAT (%zu contradiction%s) \xe2\x80\x94 %s\n",
-               res.n_contradictions, res.n_contradictions == 1 ? "" : "s", cli->output);
+        printf("UNSAT (%zu contradiction%s, %.3fs) \xe2\x80\x94 %s\n",
+               res.n_contradictions, res.n_contradictions == 1 ? "" : "s", elapsed, cli->output);
         for (size_t i = 0; i < res.n_contradictions; i++)
             printf("  clause %zu == not clause %zu\n", res.contradictions[i].b, res.contradictions[i].a);
         code = 4;
     } else {
-        printf("UNKNOWN (%zu steps, best %zu unsatisfied) \xe2\x80\x94 %s\n", res.steps, res.best_unsatisfied, cli->output);
+        printf("UNKNOWN (%zu steps, best %zu unsatisfied, %.3fs) \xe2\x80\x94 %s\n", res.steps, res.best_unsatisfied, elapsed, cli->output);
         code = 3;
     }
     solve_result_free(&res);
