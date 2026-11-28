@@ -412,7 +412,10 @@ SolverConfig solver_config_default(void) {
         .knots_mono = false,
         .knots_reverse = false,
         .knots_keep_bad = 0,
+        .north_max_dive = 8,
         .path_rider = 0,
+        .m_tables = 1,
+        .timeout_n_rerun_ms = 0,
         .on_progress = NULL, .progress_ctx = NULL, .progress_every = 0,
     };
 }
@@ -1828,15 +1831,18 @@ static bool cnf_build_reduced(const Cnf *src, const size_t *map, const bool *neg
 }
 
 static ResultSolve solver_solve_path_rider(Solver *s, const SolverConfig *cfg){
-    const Cnf *cnf=s->cnf; size_t p=cfg->path_rider;
+    const Cnf *cnf=s->cnf; size_t p=cfg->path_rider; size_t mt=cfg->m_tables?cfg->m_tables:1;
     if(p<2 || p>cnf->n_vars) return ERRF(ResultSolve, ERR_USAGE, "-path-rider P requires 2 <= P <= n_vars");
-    if(p-1 >= sizeof(size_t)*8) return ERRF(ResultSolve, ERR_USAGE, "-path-rider too large");
-    size_t combos = (size_t)1 << (p-1);
+    if(mt<1) return ERRF(ResultSolve, ERR_USAGE, "-m-tables requires >= 1");
+    size_t total = p*mt;
+    if(total>cnf->n_vars) return ERRF(ResultSolve, ERR_USAGE, "-path-rider P * -m-tables M must be <= n_vars");
+    if((p-1)*mt >= sizeof(size_t)*8) return ERRF(ResultSolve, ERR_USAGE, "-path-rider/-m-tables too large");
+    size_t combos = (size_t)1 << ((p-1)*mt);
     Rng rng = rng_new(cfg->seed);
-    size_t *pick=malloc(p*sizeof*pick);
+    size_t *pick=malloc(total*sizeof*pick);
     bool *used=calloc(cnf->n_vars?cnf->n_vars:1,1);
     if(!pick||!used){ free(pick); free(used); return ERRF(ResultSolve, ERR_NOMEM, "out of memory"); }
-    for(size_t i=0;i<p;i++){
+    for(size_t i=0;i<total;i++){
         size_t v;
         do { v = rng_index(&rng, cnf->n_vars); } while(used[v]);
         used[v]=true; pick[i]=v;
@@ -1849,11 +1855,14 @@ static ResultSolve solver_solve_path_rider(Solver *s, const SolverConfig *cfg){
     size_t best_unsat=SIZE_MAX; size_t best_steps=0;
     for(size_t mask=0; mask<combos; mask++){
         for(size_t v=0;v<cnf->n_vars;v++){ map[v]=SIZE_MAX; neg[v]=false; }
-        size_t base=pick[0];
-        for(size_t i=1;i<p;i++){ map[pick[i]]=base; neg[pick[i]] = ((mask>>(i-1))&1u)!=0; }
+        size_t bit=0;
+        for(size_t t=0;t<mt;t++){
+            size_t base=pick[t*p];
+            for(size_t i=1;i<p;i++,bit++){ map[pick[t*p+i]]=base; neg[pick[t*p+i]] = ((mask>>bit)&1u)!=0; }
+        }
         Cnf red={0};
         if(!cnf_build_reduced(cnf,map,neg,&red)){ free(pick); free(map); free(neg); free(best_a); return ERRF(ResultSolve, ERR_NOMEM, "out of memory"); }
-        SolverConfig sc=*cfg; sc.path_rider=0;
+        SolverConfig sc=*cfg; sc.path_rider=0; sc.m_tables=1;
         Solver *ss=TRY(ResultSolve, solver_new(&red, cfg->seed + mask + 1));
         ResultSolve rs=solver_solve(ss, &sc);
         if(!rs.ok){ solver_free(ss); cnf_free(&red); free(pick); free(map); free(neg); free(best_a); return rs; }
@@ -1875,7 +1884,6 @@ static ResultSolve solver_solve_path_rider(Solver *s, const SolverConfig *cfg){
             return OK(ResultSolve, ((SolveResult){ SOLVE_SAT, full, cnf->n_vars, best_steps, 0, 0, NULL, 0 }));
         }
         if(r.status==SOLVE_UNKNOWN && r.best_unsatisfied < best_unsat){ best_unsat=r.best_unsatisfied; best_steps=r.steps; }
-        /* keep no best assignment for now */
         solve_result_free(&r); solver_free(ss); cnf_free(&red);
     }
     free(pick); free(map); free(neg); free(best_a);
@@ -1906,7 +1914,7 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
     PickFn pick = cfg->pick ? cfg->pick : pick_ranked;
     size_t total = 0, best = SIZE_MAX;
     for (size_t restart = 0; restart <= cfg->restarts; restart++) {
-        if (restart == 0 && cfg->initial) {
+        if (restart == 0 && cfg->initial && cfg->init != INIT_KNOTS && cfg->init != INIT_NORTH) {
             if (cnf->n_vars) memcpy(s->assignment, cfg->initial, cnf->n_vars);
             rebuild_counts(s);
         } else if (restart == 0 && cfg->init == INIT_RAREST) {
@@ -1915,8 +1923,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_glowest(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_YANUS) {
             if (!solver_init_yanus(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
-        } else if (restart == 0 && cfg->init == INIT_KNOTS) {
-            bool kok = solver_init_knots(s, cfg);
+        } else if (restart == 0 && (cfg->init == INIT_KNOTS || cfg->init == INIT_NORTH)) {
+            bool kok = (cfg->init == INIT_NORTH) ? solver_init_north(s, cfg) : solver_init_knots(s, cfg);
             if (cfg->knots_glowest || cfg->knots_terminator || cfg->knots_likho || cfg->knots_yanus || cfg->knots_gob_recult) {
                 if (cfg->knots_glowest) solver_init_glowest(s);
                 if (cfg->knots_terminator) solver_terminator(s, cfg->terminator_rounds, cfg->terminator_order);
@@ -2032,6 +2040,8 @@ ResultSolve solver_solve(Solver *s, const SolverConfig *cfg) {
             if (!solver_init_neighborhood(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_NEIGHBORHOOD0) {
             if (!solver_init_neighborhood0(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
+        } else if (restart == 0 && cfg->init == INIT_M_PLUS) {
+            if (!solver_init_m_plus(s)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else if (restart == 0 && cfg->init == INIT_LIKHO) {
             if (!solver_likho(s, cfg)) return ERRF(ResultSolve, ERR_NOMEM, "out of memory");
         } else {

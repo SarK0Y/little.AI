@@ -1,6 +1,9 @@
 #include <ctype.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 
@@ -15,6 +18,8 @@ typedef struct {
     SolverConfig cfg;
     bool groups_mode;      /* --mode groups: sequential rogue groups + neutral merge */
     GroupConfig gcfg;
+    bool warmup_m_plus;
+    bool warmup_baddymove;
 } Cli;
 
 typedef RESULT(int) ResultInt;
@@ -81,6 +86,16 @@ static ResultUnit opt_mode(Cli *cli, const char *flag, const char *value) {
     else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected plain|groups)", flag, value);
     return OK_UNIT(ResultUnit);
 }
+static ResultUnit opt_warmup_m_plus(Cli *cli, const char *flag, const char *value) {
+    (void)flag; (void)value;
+    cli->warmup_m_plus = true;
+    return OK_UNIT(ResultUnit);
+}
+static ResultUnit opt_warmup_baddymove(Cli *cli, const char *flag, const char *value) {
+    (void)flag; (void)value;
+    cli->warmup_baddymove = true;
+    return OK_UNIT(ResultUnit);
+}
 static ResultUnit opt_max_groups(Cli *cli, const char *flag, const char *value) {
     size_t v;
     TRY0(ResultUnit, parse_size(flag, value, &v));
@@ -116,7 +131,9 @@ static ResultUnit opt_init(Cli *cli, const char *flag, const char *value) {
     else if (strcmp(value, "neighborhood0") == 0) cli->cfg.init = INIT_NEIGHBORHOOD0;
     else if (strcmp(value, "yanus") == 0) cli->cfg.init = INIT_YANUS;
     else if (strcmp(value, "knots") == 0) cli->cfg.init = INIT_KNOTS;
-    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|cascade|neighborhood|neighborhood0|yanus|knots)", flag, value);
+    else if (strcmp(value, "north") == 0) cli->cfg.init = INIT_NORTH;
+    else if (strcmp(value, "m-plus") == 0) cli->cfg.init = INIT_M_PLUS;
+    else return ERRF(ResultUnit, ERR_USAGE, "Invalid value for %s: `%s` (expected majority|rarest|glowest|min-overlapping|gob|gob-sign|gob-square|gob-recult|reverse-rarest|reverse-glowest|reverse-min-overlapping|likho|terminator|baddymove|cascade|neighborhood|neighborhood0|yanus|knots|north|m-plus)", flag, value);
     return OK_UNIT(ResultUnit);
 }
 static ResultUnit opt_pre_cook(Cli *cli, const char *flag, const char *value) {
@@ -278,6 +295,12 @@ static ResultUnit opt_knots_sort_dyn(Cli *cli, const char *flag, const char *val
 static ResultUnit opt_path_rider(Cli *cli, const char *flag, const char *value) {
     return parse_size(flag, value, &cli->cfg.path_rider);
 }
+static ResultUnit opt_m_tables(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->cfg.m_tables);
+}
+static ResultUnit opt_timeout_n_rerun(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->cfg.timeout_n_rerun_ms);
+}
 static ResultUnit opt_knots_mono(Cli *cli, const char *flag, const char *value) {
     (void)flag; (void)value;
     cli->cfg.knots_mono = true;
@@ -290,6 +313,9 @@ static ResultUnit opt_knots_reverse(Cli *cli, const char *flag, const char *valu
 }
 static ResultUnit opt_knots_keep_bad(Cli *cli, const char *flag, const char *value) {
     return parse_size(flag, value, &cli->cfg.knots_keep_bad);
+}
+static ResultUnit opt_north_max_dive(Cli *cli, const char *flag, const char *value) {
+    return parse_size(flag, value, &cli->cfg.north_max_dive);
 }
 static ResultUnit opt_knots_mode(Cli *cli, const char *flag, const char *value) {
     (void)flag;
@@ -349,11 +375,16 @@ static const OptSpec OPTS[] = {
     { "-sort", opt_knots_sort },               { "--sort", opt_knots_sort },
     { "-sorted-dyn", opt_knots_sort_dyn },     { "--sorted-dyn", opt_knots_sort_dyn },
     { "-path-rider", opt_path_rider },         { "--path-rider", opt_path_rider },
+    { "-m-tables", opt_m_tables },             { "--m-tables", opt_m_tables },
+    { "-timeout-n-rerun", opt_timeout_n_rerun }, { "--timeout-n-rerun", opt_timeout_n_rerun },
+    { "-warmup-m-plus", opt_warmup_m_plus },   { "--warmup-m-plus", opt_warmup_m_plus },
+    { "-warmup-baddymove", opt_warmup_baddymove }, { "--warmup-baddymove", opt_warmup_baddymove },
     { "-knots-mode", opt_knots_mode },         { "--knots-mode", opt_knots_mode },
     { "-mono", opt_knots_mono },               { "--mono", opt_knots_mono },
     { "-reverse", opt_knots_reverse },         { "--reverse", opt_knots_reverse },
     { "-keep-bad", opt_knots_keep_bad },       { "--keep-bad", opt_knots_keep_bad },
     { "-saturation", opt_knots_saturation },   { "--saturation", opt_knots_saturation },
+    { "-max-dive", opt_north_max_dive },       { "--max-dive", opt_north_max_dive },
 };
 
 static void usage(void) {
@@ -376,11 +407,16 @@ static void usage(void) {
         "                      [-sorted desc|asc|-sort desc|asc] (Knots: clause order by var popularity)\n"
         "                      [-sorted-dyn desc|asc] (Knots: dynamic popularity per step)\n"
         "                      [-path-rider P] (Knots: try 2^P random var-equality assignments)\n"
+        "                      [-m-tables M] (Knots: M independent path-rider tables, default 1)\n"
+        "                      [-timeout-n-rerun MS] (cancel and re-init after MS, 0=off)\n"
+        "                      [-warmup-m-plus] (run M+ first, feed assignment to solver)\n"
+        "                      [-warmup-baddymove] (run BaddyMove first, feed assignment to solver)\n"
         "                      [-knots-mode glowest|terminator|likho|yanus|gob-recult|combo] (Knots post-process)\n"
         "                      [-mono] (Knots: block diagnostics on fail)\n"
         "                      [-reverse] (Knots: negate every literal in each clause)\n"
         "                      [-keep-bad S] (Knots: keep bad variant for S hits before killing)\n"
-        "                      [-saturation] (Knots: process most-saturated mono blocks first)\n");
+        "                      [-saturation] (Knots: process most-saturated mono blocks first)\n"
+        "                      [-max-dive N] (North: max backjump depth before killing bad variant, default 8)\n");
 }
 
 static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
@@ -397,7 +433,7 @@ static ResultUnit parse_args(int argc, char **argv, Cli *cli) {
         for (size_t k = 0; k < sizeof OPTS / sizeof OPTS[0]; k++)
             if (strcmp(OPTS[k].flag, argv[i]) == 0) { spec = &OPTS[k]; break; }
         if (!spec) return ERRF(ResultUnit, ERR_USAGE, "Unknown option: %s", argv[i]);
-        if (spec->apply == opt_knots_mono || spec->apply == opt_knots_reverse || spec->apply == opt_knots_saturation) { TRY0(ResultUnit, spec->apply(cli, argv[i], "1")); i -= 1; continue; }
+        if (spec->apply == opt_knots_mono || spec->apply == opt_knots_reverse || spec->apply == opt_knots_saturation || spec->apply == opt_warmup_m_plus || spec->apply == opt_warmup_baddymove) { TRY0(ResultUnit, spec->apply(cli, argv[i], "1")); i -= 1; continue; }
         if (i + 1 >= argc) return ERRF(ResultUnit, ERR_USAGE, "Missing value for %s", argv[i]);
         TRY0(ResultUnit, spec->apply(cli, argv[i], argv[i + 1]));
     }
@@ -531,22 +567,30 @@ static ResultInt solve_groups_and_report(const Cnf *cnf, const Cli *cli) {
 
 /* ---- run --------------------------------------------------------------- */
 
-static ResultInt solve_and_report(const Cnf *cnf, const Cli *cli) {
-    if (!cnf_is_3sat(cnf))
-        fprintf(stderr, "Warning: input contains clauses longer than 3 literals; solving general CNF instead of strict 3-SAT.\n");
+static ResultInt solve_once(const Cnf *cnf, const Cli *cli) {
     if (cli->groups_mode) return solve_groups_and_report(cnf, cli);
-    Solver *solver = TRY(ResultInt, solver_new(cnf, cli->cfg.seed));
-    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-    ResultSolve rs = solver_solve(solver, &cli->cfg);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    solver_free(solver);
-    SolveResult res = TRY(ResultInt, rs);
-    double elapsed = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
-
-    if (res.status == SOLVE_SAT && !verify(cnf, res.assignment, res.n_vars)) {
-        solve_result_free(&res);
-        return ERRF(ResultInt, ERR_VERIFY, "Internal verification failed");
+    bool *warm = NULL;
+    if (cli->warmup_m_plus || cli->warmup_baddymove) {
+        Solver *ws = TRY(ResultInt, solver_new(cnf, cli->cfg.seed));
+        bool ok = cli->warmup_m_plus ? solver_init_m_plus(ws) : solver_init_baddymove(ws, &cli->cfg);
+        if (!ok) { solver_free(ws); return ERRF(ResultInt, ERR_NOMEM, "out of memory"); }
+        warm = malloc((cnf->n_vars?cnf->n_vars:1));
+        if (!warm) { solver_free(ws); return ERRF(ResultInt, ERR_NOMEM, "out of memory"); }
+        memcpy(warm, solver_assignment(ws), cnf->n_vars?cnf->n_vars:1);
+        solver_free(ws);
     }
+    Solver *s = TRY(ResultInt, solver_new(cnf, cli->cfg.seed));
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    SolverConfig cfg2 = cli->cfg;
+    if (warm) cfg2.initial = warm;
+    ResultSolve rs = solver_solve(s, &cfg2);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    solver_free(s);
+    free(warm);
+    if (!rs.ok) return ERR(ResultInt, rs.err);
+    SolveResult res = rs.val;
     ResultUnit w = write_json(cli->output, cnf, &res);
     if (!w.ok) { solve_result_free(&res); return ERR(ResultInt, w.err); }
 
@@ -568,9 +612,44 @@ static ResultInt solve_and_report(const Cnf *cnf, const Cli *cli) {
     return OK(ResultInt, code);
 }
 
+static ResultInt solve_and_report(const Cnf *cnf, const Cli *cli) {
+    size_t budget = cli->cfg.timeout_n_rerun_ms;
+    if (budget == 0 || cli->groups_mode) return solve_once(cnf, cli);
+    for (;;) {
+        pid_t pid = fork();
+        if (pid < 0) return ERRF(ResultInt, ERR_IO, "fork failed: %s", strerror(errno));
+        if (pid == 0) {
+            ResultInt r = solve_once(cnf, cli);
+            if (r.ok) _exit(r.val);
+            fprintf(stderr, "%s\n", r.err.msg);
+            _exit(r.err.kind == ERR_USAGE ? 2 : 1);
+        }
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        int st = 0;
+        bool timed_out = false;
+        for (;;) {
+            pid_t w = waitpid(pid, &st, WNOHANG);
+            if (w == pid) break;
+            if (w < 0) { if (errno == EINTR) continue; kill(pid, SIGKILL); waitpid(pid, &st, 0); return ERRF(ResultInt, ERR_IO, "waitpid failed: %s", strerror(errno)); }
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            size_t ms = (size_t)((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000);
+            if (ms >= budget) { timed_out = true; kill(pid, SIGKILL); waitpid(pid, &st, 0); break; }
+            struct timespec sl = {0, 10000000}; nanosleep(&sl, NULL);
+        }
+        if (timed_out) { fprintf(stderr, "timeout-n-rerun: %zums exceeded, re-init\n", budget); continue; }
+        if (WIFEXITED(st)) {
+            int code = WEXITSTATUS(st);
+            if (code == 0 || code == 3 || code == 4) return OK(ResultInt, code);
+            return ERRF(ResultInt, ERR_IO, "solver child exited with code %d", code);
+        }
+        if (WIFSIGNALED(st)) return ERRF(ResultInt, ERR_IO, "solver child killed by signal %d", WTERMSIG(st));
+        return ERRF(ResultInt, ERR_IO, "solver child ended unexpectedly");
+    }
+}
+
 static ResultInt run(int argc, char **argv) {
     Cli cli = { .input = NULL, .output = DEFAULT_OUT, .cfg = solver_config_default(),
-                .groups_mode = false, .gcfg = group_config_default() };
+                .groups_mode = false, .gcfg = group_config_default(), .warmup_m_plus = false, .warmup_baddymove = false };
     TRY0(ResultInt, parse_args(argc, argv, &cli));
     Cnf cnf = TRY_CTX(ResultInt, cnf_from_dimacs_file(cli.input), "Failed to load CNF");
     ResultInt r = solve_and_report(&cnf, &cli);

@@ -120,6 +120,8 @@ typedef enum {
     INIT_NEIGHBORHOOD0, /* full neighborhood search per spec */
     INIT_YANUS,     /* random x = y_a OR y_b expansions, glowest, map back */
     INIT_KNOTS,     /* pool-based clause solver, see notes/knots.txt */
+    INIT_NORTH,     /* Knots-based North: direct/indirect pools, max-dive backjump */
+    INIT_M_PLUS,    /* CNF->LP relaxation, minimize slacks, round to 0/1 */
     INIT_ZERO       /* all false; Likho's phase 1, not selectable via --init */
 } InitMode;
 
@@ -171,7 +173,10 @@ typedef struct {
     bool knots_mono;            /* Knots: mono-block diagnostics */
     bool knots_reverse;         /* Knots: negate every literal */
     size_t knots_keep_bad;      /* Knots: keep bad variant for S hits before killing */
+    size_t north_max_dive;      /* North: max backjump depth before killing bad variant */
     size_t path_rider;          /* -path-rider P: enumerate 2^P var assignments */
+    size_t m_tables;            /* -m-tables M: M independent path-rider tables */
+    size_t timeout_n_rerun_ms;  /* -timeout-n-rerun MS: cancel and re-init after MS (0=off) */
     ProgressFn on_progress;
     void *progress_ctx;
     size_t progress_every;
@@ -237,6 +242,8 @@ bool solver_init_glowest(Solver *s);
 bool solver_init_yanus(Solver *s, const SolverConfig *cfg);
 /* Knots: pool-based solver. true on SAT/assignment, false on logical fail or OOM. */
 bool solver_init_knots(Solver *s, const SolverConfig *cfg);
+bool solver_init_north(Solver *s, const SolverConfig *cfg);
+bool solver_init_m_plus(Solver *s);
 /* Same constructive value rule, but the order is: first the most frequent
  * variable (glowest's pick, ties by id), then at every step the unset variable
  * with the smallest share of its occurrences already in satisfied clauses

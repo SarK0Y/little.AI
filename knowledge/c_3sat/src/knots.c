@@ -579,6 +579,24 @@ bool solver_init_knots(Solver *s, const SolverConfig *cfg){
     for(size_t v=0;v<k.nvrs;v++){ k.val[v]=-1; k.owner[v]=SIZE_MAX; k.var_pool[v]=SIZE_MAX; }
     for(size_t i=0;i<k.ncls;i++){ build_variants(&k,i); if(!attach_pool(&k,i)) goto oom; }
     build_order(&k, cfg ? cfg->knots_sort : KNOTS_SORT_NONE);
+    if(cfg && cfg->initial){
+        for(size_t pi=0; pi<k.ncls; pi++){
+            size_t ci=k.order[pi];
+            if(clause_sat(&k,ci)) continue;
+            const Lit*cl=cnf_clause(k.cnf,ci); size_t n=cnf_clause_len(k.cnf,ci);
+            size_t pick=SIZE_MAX;
+            for(size_t vi=0;vi<k.vn[ci];vi++){
+                if(k.vs[ci][vi].dead) continue;
+                uint8_t m=k.vs[ci][vi].mask; bool okv=true;
+                for(size_t i=0;i<n;i++){ int want=lit_want(&k,cl[i].positive,(m>>i)&1u); int cur=k.val[cl[i].var]>=0 ? (int)k.val[cl[i].var] : (cfg->initial[cl[i].var]?1:0); if(want!=cur){okv=false;break;} }
+                if(okv){ pick=vi; break; }
+            }
+            if(pick==SIZE_MAX) continue;
+            if(!push_dec(&k,ci,pick)) goto oom;
+            Dec*d=&k.stk[k.sp-1]; int ar=apply_variant(&k,ci,pick,d);
+            if(ar<=0){ k.sp--; undo_dec(&k,d); }
+        }
+    }
     bool ok=false;
     size_t rounds = (cfg && cfg->knots_rounds) ? cfg->knots_rounds : 1;
     if(!k.random_mode) rounds = 1;
